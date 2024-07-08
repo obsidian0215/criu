@@ -699,6 +699,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
+		BOOL_OPT("dry-run", &opts.dry_run),
+		BOOL_OPT("use-dirty-log",&opts.use_dirty_log),
+		{ "dirty-log-dir", required_argument, 0, 1200 },
 		{},
 	};
 
@@ -1034,6 +1037,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
+		case 1200:
+			SET_CHAR_OPTS(dirty_log_dir, optarg);
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -1117,6 +1123,17 @@ int check_options(void)
 
 	if (check_namespace_opts()) {
 		pr_err("Error: namespace flags conflict\n");
+		return 1;
+	}
+
+	if (opts.dry_run && opts.mode != CR_PRE_DUMP) {
+		pr_err("Option --dry-run is only valid on pre-dump\n");
+		return 1;
+	}
+
+	if (opts.use_dirty_log && 
+			!(opts.mode == CR_PRE_DUMP || opts.mode == CR_DUMP)) {
+		pr_err("Option --use-dirty-log is only valid on pre-dump or dump\n");
 		return 1;
 	}
 

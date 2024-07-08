@@ -209,6 +209,11 @@ struct cr_options {
 	enum criu_mode mode;
 
 	int mntns_compat_mode;
+
+	/* use for adaptive live migration */
+	int dry_run;
+	int use_dirty_log;
+	char* dirty_log_dir;
 };
 
 extern struct cr_options opts;

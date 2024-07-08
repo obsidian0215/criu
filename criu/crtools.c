@@ -190,6 +190,9 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (opts.work_dir == NULL)
 		SET_CHAR_OPTS(work_dir, opts.imgs_dir);
+	
+	if (opts.dirty_log_dir == NULL)
+		SET_CHAR_OPTS(dirty_log_dir, "./dirty_log");
 
 	has_sub_command = (argc - optind) > 1;
 
@@ -263,6 +266,14 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (check_options())
 		return 1;
+
+	if (opts.dry_run || opts.use_dirty_log) {
+		if (NULL == opendir(opts.dirty_log_dir)) {
+			mkdir(opts.dirty_log_dir, 0775);
+			pr_warn("dirty_log_dir %s is not within memory file system", opts.dirty_log_dir);
+		} else
+			pr_info("dirty log will be from %s", opts.dirty_log_dir);
+	}
 
 	if (fault_injected(FI_CANNOT_MAP_VDSO))
 		kdat.can_map_vdso = 0;
@@ -535,7 +546,10 @@ usage:
 	       "                        will be punched from the image\n"
 	       "  --pre-dump-mode       splice - parasite based pre-dumping (default)\n"
 	       "                        read   - process_vm_readv syscall based pre-dumping\n"
-	       "\n"
+	       "  --dry-run             turn on dirty-track and do not act actual page dump\n"
+		   "  --use-dirty-log       use some files to extract the vma and corresponding dirty log\n"
+		   "  --dirty-log-dir       the directory of dirty log files, default \"./dirty_log\"\n"
+		   "\n"
 	       "Page/Service server options:\n"
 	       "  --address ADDR        address of server or service\n"
 	       "  --port PORT           port of page server\n"
