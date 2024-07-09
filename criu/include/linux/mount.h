@@ -28,6 +28,8 @@ enum fsconfig_command {
 };
 #endif // FSOPEN_CLOEXEC
 
+#define FSOPEN_CLOEXEC 0x00000001
+
 #ifndef MS_MGC_VAL
 /* Magic mount flag number. Has to be or-ed to the flag values.  */
 #define MS_MGC_VAL 0xc0ed0000 /* Magic flag number to indicate "new" flags */
