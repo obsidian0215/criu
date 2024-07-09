@@ -1,6 +1,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
-// #include <sys/mount.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -11,7 +11,6 @@
 #include "fcntl.h"
 #include "log.h"
 #include "util-pie.h"
-#include "linux/mount.h"
 
 #ifdef CR_NOGLIBC
 #include <compel/plugins/std/syscall.h>

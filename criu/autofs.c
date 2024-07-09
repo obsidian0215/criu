@@ -1,7 +1,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stdarg.h>
-// #include <sys/mount.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
 
 #include "int.h"
@@ -15,7 +15,6 @@
 #include "pipes.h"
 #include "crtools.h"
 #include "util.h"
-#include "linux/mount.h"
 
 #include "images/autofs.pb-c.h"
 
