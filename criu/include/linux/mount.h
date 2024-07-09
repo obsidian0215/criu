@@ -34,4 +34,17 @@ enum fsconfig_command {
 #define MS_MGC_MSK 0xffff0000 /* Magic flag number mask */
 #endif
 
+/* Possible value for FLAGS parameter of `umount2'.  */
+enum
+{
+  MNT_FORCE = 1,		/* Force unmounting.  */
+#define MNT_FORCE MNT_FORCE
+  MNT_DETACH = 2,		/* Just detach from the tree.  */
+#define MNT_DETACH MNT_DETACH
+  MNT_EXPIRE = 4,		/* Mark for expiry.  */
+#define MNT_EXPIRE MNT_EXPIRE
+  UMOUNT_NOFOLLOW = 8		/* Don't follow symlink on umount.  */
+#define UMOUNT_NOFOLLOW UMOUNT_NOFOLLOW
+};
+
 #endif
