@@ -47,4 +47,19 @@ enum
 #define UMOUNT_NOFOLLOW UMOUNT_NOFOLLOW
 };
 
+__BEGIN_DECLS
+
+/* Mount a filesystem.  */
+extern int mount (const char *__special_file, const char *__dir,
+		  const char *__fstype, unsigned long int __rwflag,
+		  const void *__data) __THROW;
+
+/* Unmount a filesystem.  */
+extern int umount (const char *__special_file) __THROW;
+
+/* Unmount a filesystem.  Force unmounting if FLAGS is set to MNT_FORCE.  */
+extern int umount2 (const char *__special_file, int __flags) __THROW;
+
+__END_DECLS
+
 #endif
