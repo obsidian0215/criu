@@ -1,6 +1,11 @@
 {
     "files.associations": {
         "syscall.h": "c",
-        "int.h": "c"
+        "int.h": "c",
+        "magic.h": "c",
+        "protobuf.h": "c",
+        "fcntl.h": "c",
+        "pidfd-store.h": "c",
+        "fault-injection.h": "c"
     }
 }

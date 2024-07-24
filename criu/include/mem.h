@@ -19,6 +19,9 @@ struct mem_dump_ctl {
 	bool lazy;
 	struct proc_pid_stat *stat;
 	InventoryEntry *parent_ie;
+	// [Obsidian0215]for dirty_log
+	bool dry_run;
+	bool dirty_log;
 };
 
 extern bool vma_has_guard_gap_hidden(struct vma_area *vma);

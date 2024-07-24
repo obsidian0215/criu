@@ -608,6 +608,34 @@ void close_image_dir(void)
 	close_service_fd(IMG_FD_OFF);
 }
 
+//[Obsidian0215]for dirty log, initial dirty-log-dir service fd for criu
+int open_dirty_log_dir(char *dir)
+{
+	int fd, ret;
+
+	fd = open(dir, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Can't open dir %s", dir);
+		return -1;
+	} else
+		pr_info("dirty log will be enabled in <%s>", opts.dirty_log_dir);
+
+	ret = install_service_fd(DIRTY_LOG_OFF, fd);
+	if (ret < 0) {
+		pr_err("install_service_fd failed.\n");
+		return -1;
+	}
+	fd = ret;
+
+	return 0;
+}
+
+//[Obsidian0215]for dirty log, kill dirty-log-dir service fd
+void close_dirty_log_dir(void)
+{
+	close_service_fd(DIRTY_LOG_OFF);
+}
+
 int open_parent(int dfd, int *pfd)
 {
 	struct stat st;

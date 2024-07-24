@@ -26,6 +26,7 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "dirty-log.h"
 
 static int page_server_sk = -1;
 

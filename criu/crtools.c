@@ -267,12 +267,13 @@ int main(int argc, char *argv[], char *envp[])
 	if (check_options())
 		return 1;
 
+	//[Obsidian0215]check dirty-log-dir is accessible
 	if (opts.dry_run || opts.use_dirty_log) {
-		if (NULL == opendir(opts.dirty_log_dir)) {
-			mkdir(opts.dirty_log_dir, 0775);
-			pr_warn("dirty_log_dir %s is not within memory file system", opts.dirty_log_dir);
-		} else
-			pr_info("dirty log will be from %s", opts.dirty_log_dir);
+		ret = open_dirty_log_dir(opts.dirty_log_dir);
+		if (ret < 0) {
+			pr_err("Couldn't open dirty log dir %s\n", opts.imgs_dir);
+			return 1;
+		}
 	}
 
 	if (fault_injected(FI_CANNOT_MAP_VDSO))

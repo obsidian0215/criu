@@ -119,4 +119,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 		.magic	= IRMAP_CACHE_MAGIC,
 		.oflags = O_SERVICE | O_FORCE_LOCAL,
 	},
+
+	//[Obsidian0215]dirty-log image template
+	FD_ENTRY(DIRTY_LOG, "dirtylog-%u"),
 };

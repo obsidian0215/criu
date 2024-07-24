@@ -34,6 +34,7 @@
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "dirty-log.h"
 
 static int task_reset_dirty_track(int pid)
 {
@@ -432,6 +433,227 @@ again:
 	return ret;
 }
 
+//[Obsidian0215]put pages into page-pipe with dirty-log, for dry-run
+static int dry_generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+			 bool has_parent, struct dirty_log *dl)
+{
+	u64 *at = &map[PAGE_PFN(*off)];
+	unsigned long pfn, nr_to_scan;
+	// unsigned long pages[3] = {};
+	int ret = 0;
+
+	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
+
+	for (pfn = 0; pfn < nr_to_scan; pfn++) {
+		unsigned long vaddr;
+		unsigned int ppb_flags = 0;
+		// int st;
+		struct page_dirty_map *pdm_tar;		//[Obsidian0215]temporarily save dirty map
+
+		if (!should_dump_page(vma->e, at[pfn]))
+			continue;
+
+		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
+
+		// if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+		// 	ppb_flags |= PPB_LAZY;
+
+		// /*
+		//  * If we're doing incremental dump (parent images
+		//  * specified) and page is not soft-dirty -- we dump
+		//  * hole and expect the parent images to contain this
+		//  * page. The latter would be checked in page-xfer.
+		//  */
+
+		// if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
+		// 	ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+		// 	st = 0;
+		// } else {
+		// 	ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+		// 	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+		// 		st = 1;
+		// 	else
+		// 		st = 2;
+		// }
+
+		if (ret) {
+			/* Do not do pfn++, just bail out */
+			pr_debug("Pagemap full\n");
+			break;
+		}
+
+		// pages[st]++;
+	}
+
+	*off += pfn * PAGE_SIZE;
+
+	// cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
+	// cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
+	// cnt_add(CNT_PAGES_LAZY, pages[1]);
+	// cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+
+	// pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
+	return ret;
+}
+
+static int dry_generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
+			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode, struct dirty_log *dl)
+{
+	u64 off = 0;
+	u64 *map;
+	int ret;
+
+	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return 0;
+
+	if (!(vma->e->prot & PROT_READ)) {
+		if (opts.pre_dump_mode == PRE_DUMP_READ && pre_dump)
+			return 0;
+		if ((parent_predump_mode == PRE_DUMP_READ && opts.pre_dump_mode == PRE_DUMP_SPLICE) || !pre_dump)
+			has_parent = false;
+	}
+
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+		if (pre_dump)
+			return 0;
+		has_parent = false;
+	}
+
+	map = pmc_get_map(pmc, vma);
+	if (!map)
+		return -1;
+
+	if (vma_area_is(vma, VMA_ANON_SHARED))
+		return add_shmem_area(item->pid->real, vma->e, map);
+
+again:
+	ret = generate_iovs_with_dirty_log(item, vma, pp, map, &off, has_parent, dl);
+	if (ret == -EAGAIN) {
+		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
+
+		ret = drain_pages(pp, ctl, args);
+		if (!ret)
+			ret = xfer_pages(pp, xfer);
+		if (!ret) {
+			page_pipe_reinit(pp);
+			goto again;
+		}
+	}
+
+	return ret;
+}
+
+//[Obsidian0215]put pages into page-pipe with dirty-log
+static int generate_iovs_with_dirty_log(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+			 bool has_parent, struct dirty_log *dl)
+{
+	u64 *at = &map[PAGE_PFN(*off)];
+	unsigned long pfn, nr_to_scan;
+	unsigned long pages[3] = {};
+	int ret = 0;
+
+	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
+
+	for (pfn = 0; pfn < nr_to_scan; pfn++) {
+		unsigned long vaddr;
+		unsigned int ppb_flags = 0;
+		int st;
+
+		if (!should_dump_page(vma->e, at[pfn]))
+			continue;
+
+		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
+
+		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+			ppb_flags |= PPB_LAZY;
+
+		/*
+		 * If we're doing incremental dump (parent images
+		 * specified) and page is not soft-dirty -- we dump
+		 * hole and expect the parent images to contain this
+		 * page. The latter would be checked in page-xfer.
+		 */
+
+		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
+			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+			st = 0;
+		} else {
+			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+				st = 1;
+			else
+				st = 2;
+		}
+
+		if (ret) {
+			/* Do not do pfn++, just bail out */
+			pr_debug("Pagemap full\n");
+			break;
+		}
+
+		pages[st]++;
+	}
+
+	*off += pfn * PAGE_SIZE;
+
+	cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
+	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
+	cnt_add(CNT_PAGES_LAZY, pages[1]);
+	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+
+	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
+	return ret;
+}
+
+static int generate_vma_iovs_with_dirty_log(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
+			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode, struct dirty_log *dl)
+{
+	u64 off = 0;
+	u64 *map;
+	int ret;
+
+	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return 0;
+
+	if (!(vma->e->prot & PROT_READ)) {
+		if (opts.pre_dump_mode == PRE_DUMP_READ && pre_dump)
+			return 0;
+		if ((parent_predump_mode == PRE_DUMP_READ && opts.pre_dump_mode == PRE_DUMP_SPLICE) || !pre_dump)
+			has_parent = false;
+	}
+
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+		if (pre_dump)
+			return 0;
+		has_parent = false;
+	}
+
+	map = pmc_get_map(pmc, vma);
+	if (!map)
+		return -1;
+
+	if (vma_area_is(vma, VMA_ANON_SHARED))
+		return add_shmem_area(item->pid->real, vma->e, map);
+
+again:
+	ret = generate_iovs_with_dirty_log(item, vma, pp, map, &off, has_parent, dl);
+	if (ret == -EAGAIN) {
+		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
+
+		ret = drain_pages(pp, ctl, args);
+		if (!ret)
+			ret = xfer_pages(pp, xfer);
+		if (!ret) {
+			page_pipe_reinit(pp);
+			goto again;
+		}
+	}
+
+	return ret;
+}
+
 static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasite_dump_pages_args *args,
 					struct vm_area_list *vma_area_list, struct mem_dump_ctl *mdc,
 					struct parasite_ctl *ctl)
@@ -440,6 +662,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
 	struct page_xfer xfer = { .parent = NULL };
+	struct dirty_log dl = INIT_PAGE_DIRTY_MAP;
 	int ret, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
@@ -474,12 +697,13 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (!pp)
 		goto out;
 
+
 	if (!mdc->pre_dump) {
 		/*
-		 * Regular dump -- create xfer object and send pages to it
-		 * right here. For pre-dumps the pp will be taken by the
-		 * caller and handled later.
-		 */
+		* Regular dump -- create xfer object and send pages to it
+		* right here. For pre-dumps the pp will be taken by the
+		* caller and handled later.
+		*/
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
 		if (ret < 0)
 			goto out_pp;
@@ -494,10 +718,18 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			xfer.parent = NULL + 1;
 	}
 
-	if (xfer.parent) {
-		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
-		if (possible_pid_reuse == -1)
-			goto out_xfer;
+		if (xfer.parent) {
+			possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
+			if (possible_pid_reuse == -1)
+				goto out_xfer;
+		}
+	}
+
+	//[Obsidian0215]initial pid's dirty log
+	if (mdc->dirty_log) {
+		ret = init_dirty_log_images(vpid(item), &dl);
+		if (ret < 0)
+			goto out_pp;
 	}
 
 	/*
@@ -509,10 +741,24 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
-		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode);
-		if (ret < 0)
-			goto out_xfer;
+		if (pdc->dirty_log)	{
+			if (pdc->dry_run) {
+				dry_generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+							parent_predump_mode, &dl);
+				if (ret < 0)
+					goto out_xfer;
+			} else {
+				ret = generate_vma_iovs_with_dirty_log(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+							parent_predump_mode, &dl);
+				if (ret < 0)
+					goto out_xfer;
+			}
+		} else {
+			ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+						parent_predump_mode);
+			if (ret < 0)
+				goto out_xfer;
+		}
 	}
 
 	if (mdc->lazy)
