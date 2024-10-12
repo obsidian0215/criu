@@ -26,8 +26,8 @@ struct dirty_log {
 	pdm_t *pdm;
 	
 	pdm_t **pdme;
-	int nr_pdms;;
-	int curr_pdm;jhjkhjk
+	int nr_pdms;
+	int curr_pdm;
 
 	struct list_head pdm_list;
 };
