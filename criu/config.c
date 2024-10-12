@@ -699,7 +699,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
-		BOOL_OPT("use-dirty-map",&opts.use_dirty_log),
+		BOOL_OPT("use-dirty-map",&opts.use_dirty_map),
 		{ "dirty-map-dir", required_argument, 0, 1200 },
 		{},
 	};
@@ -1037,7 +1037,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			}
 			break;
 		case 1200:
-			SET_CHAR_OPTS(dirty_log_dir, optarg);
+			SET_CHAR_OPTS(dirty_map_dir, optarg);
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
@@ -1125,7 +1125,7 @@ int check_options(void)
 		return 1;
 	}
 
-	if (opts.use_dirty_log && 
+	if (opts.use_dirty_map && 
 			!(opts.mode == CR_PRE_DUMP || opts.mode == CR_DUMP)) {
 		pr_err("Option --use-dirty-map is only valid on pre-dump or dump\n");
 		return 1;

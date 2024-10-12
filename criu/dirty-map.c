@@ -26,18 +26,18 @@ int init_dirty_map_images(pid_t pid, struct dirty_log *dl){
 	int dfd;
 
     dl->pid = pid;
-	//[Obsidian0215]load a previous dirtylog img or create a new img
-	pr_info("Try to load previous dirtylog images\n");
+	//[Obsidian0215]load a previous dirty-map img or create a new img
+	pr_info("Try to load previous dirty-map images\n");
 
 	dfd = get_service_fd(DIRTY_MAP_MAGIC);
 	dl->dli = open_image_at(dfd, CR_FD_DIRTY_MAP, O_RDWR, pid);
 
 	if (!dl->dli) {
-		pr_info("Falied to load previous dirtylog images, create a new image\n");
+		pr_info("Falied to load previous dirty-map images, create a new image\n");
 		dl->dli = open_image_at(dfd, CR_FD_DIRTY_MAP, O_WRONLY|O_CREAT, pid);
 		
 		if (!dli) {
-			pr_perror("Can't create a dirtylog image for %d", pid);
+			pr_perror("Can't create a dirty-map image for %d", pid);
 			return -1;
 		}
 

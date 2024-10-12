@@ -211,7 +211,6 @@ struct cr_options {
 	int mntns_compat_mode;
 
 	/* use for adaptive live migration */
-	int dry_run;
 	int use_dirty_map;
 	char* dirty_map_dir;
 };
