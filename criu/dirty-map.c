@@ -21,7 +21,7 @@
 struct list_head page_dirty_map_list LIST_HEAD_INIT(page_dirty_map_list);
 
 //[Obsidian0215]initial <pid>'s dirty-map
-int init_dirty_log_images(pid_t pid, struct dirty_log *dl){
+int init_dirty_map_images(pid_t pid, struct dirty_log *dl){
 
 	int dfd;
 
@@ -29,12 +29,12 @@ int init_dirty_log_images(pid_t pid, struct dirty_log *dl){
 	//[Obsidian0215]load a previous dirtylog img or create a new img
 	pr_info("Try to load previous dirtylog images\n");
 
-	dfd = get_service_fd(DIRTY_LOG);
-	dl->dli = open_image_at(dfd, CR_FD_DIRTY_LOG, O_RDWR, pid);
+	dfd = get_service_fd(DIRTY_MAP_MAGIC);
+	dl->dli = open_image_at(dfd, CR_FD_DIRTY_MAP, O_RDWR, pid);
 
 	if (!dl->dli) {
 		pr_info("Falied to load previous dirtylog images, create a new image\n");
-		dl->dli = open_image_at(dfd, CR_FD_DIRTY_LOG, O_WRONLY|O_CREAT, pid);
+		dl->dli = open_image_at(dfd, CR_FD_DIRTY_MAP, O_WRONLY|O_CREAT, pid);
 		
 		if (!dli) {
 			pr_perror("Can't create a dirtylog image for %d", pid);

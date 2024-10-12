@@ -130,6 +130,6 @@
 #define KDAT_MAGIC 0x57023458 /* Torzhok */
 
 //[Obsidian0215]magic for dirtylog images
-#define DIRTY_LOG_MAGIC 0x48504953    /* HPIS */
+#define DIRTY_MAP_MAGIC RAW_IMAGE_MAGIC
 
 #endif /* __CR_MAGIC_H__ */

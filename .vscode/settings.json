@@ -9,7 +9,8 @@
         "fault-injection.h": "c",
         "dirty-map.h": "c",
         "infect-util.h": "c",
-        "restorer.h": "c"
+        "restorer.h": "c",
+        "pagemap-cache.h": "c"
     },
     "makefile.configureOnOpen": false
 }

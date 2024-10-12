@@ -150,8 +150,8 @@ extern int open_image_dir(char *dir, int mode);
 extern void close_image_dir(void);
 
 // [Obsidian0215]for dirty-map-dir
-extern int open_dirty_log_dir(char *dir);
-extern void close_dirty_log_dir(void);
+extern int open_dirty_map_dir(char *dir);
+extern void close_dirty_map_dir(void);
 /*
  * Return -1 -- parent symlink points to invalid target
  * Return 0 && pfd < 0 -- parent symlink does not exist

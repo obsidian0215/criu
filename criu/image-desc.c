@@ -121,5 +121,5 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	},
 
 	//[Obsidian0215]dirty-map image template
-	FD_ENTRY(DIRTY_LOG, "dirtylog-%u"),
+	FD_ENTRY(DIRTY_MAP, "newest-%u"),
 };

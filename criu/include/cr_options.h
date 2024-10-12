@@ -212,8 +212,8 @@ struct cr_options {
 
 	/* use for adaptive live migration */
 	int dry_run;
-	int use_dirty_log;
-	char* dirty_log_dir;
+	int use_dirty_map;
+	char* dirty_map_dir;
 };
 
 extern struct cr_options opts;

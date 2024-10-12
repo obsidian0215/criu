@@ -191,8 +191,8 @@ int main(int argc, char *argv[], char *envp[])
 	if (opts.work_dir == NULL)
 		SET_CHAR_OPTS(work_dir, opts.imgs_dir);
 	
-	if (opts.dirty_log_dir == NULL)
-		SET_CHAR_OPTS(dirty_log_dir, "./dirty_log");
+	if (opts.dirty_map_dir == NULL)
+		SET_CHAR_OPTS(dirty_map_dir, "./dirty_map");
 
 	has_sub_command = (argc - optind) > 1;
 
@@ -268,10 +268,10 @@ int main(int argc, char *argv[], char *envp[])
 		return 1;
 
 	//[Obsidian0215]check dirty-map-dir is accessible
-	if (opts.dry_run || opts.use_dirty_log) {
-		ret = open_dirty_log_dir(opts.dirty_log_dir);
+	if (opts.use_dirty_map) {
+		ret = open_dirty_map_dir(opts.dirty_map_dir);
 		if (ret < 0) {
-			pr_err("Couldn't open dirty log dir %s\n", opts.imgs_dir);
+			pr_err("Couldn't open dirty-map dir %s\n", opts.dirty_map_dir);
 			return 1;
 		}
 	}

@@ -1,5 +1,5 @@
-#ifndef __CR_DIRTY_LOG_H__
-#define __CR_DIRTY_LOG_H__
+#ifndef __CR_DIRTY_MAP_H__
+#define __CR_DIRTY_MAP_H__
 
 #include <stdbool.h>
 #include <sys/types.h>
@@ -27,7 +27,7 @@ struct dirty_log {
 	
 	pdm_t **pdme;
 	int nr_pdms;
-	int curr_pdm;
+	int cur_pdm;
 
 	struct list_head pdm_list;
 };
@@ -40,7 +40,7 @@ struct dirty_log {
     .dirtymap = NULL; \
 }
 
-int init_dirty_log_images(pid_t pid, struct dirty_log *dl);
+int init_dirty_map_images(pid_t pid, struct dirty_log *dl);
 struct page_dirty_map *search_vaddr_in_range_dg(u64 vaddr, struct dirty_log *dl);
 int update_dirty_map(pdm_t *pdm);
 

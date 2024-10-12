@@ -139,8 +139,8 @@ message criu_opts {
 	optional criu_network_lock_method	network_lock		= 64 [default = IPTABLES];
 	optional bool			mntns_compat_mode	= 65;
 	optional bool           dry_run             = 66;
-	optional bool           use_dirty_log       = 67;
-	optional int32          dirty_log_dir_fd    = 68;
+	optional bool           use_dirty_map       = 67;
+	optional int32          dirty_map_dir_fd    = 68;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

@@ -434,7 +434,7 @@ again:
 }
 
 //[Obsidian0215]put pages into page-pipe with dirty-map
-static int generate_iovs_with_dirty_log(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
 			 bool has_parent, struct dirty_log *dl)
 {
 	u64 *at = &map[PAGE_PFN(*off)];
@@ -495,7 +495,7 @@ static int generate_iovs_with_dirty_log(struct pstree_item *item, struct vma_are
 	return ret;
 }
 
-static int generate_vma_iovs_with_dirty_log(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
+static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode, struct dirty_log *dl)
 {
@@ -527,7 +527,7 @@ static int generate_vma_iovs_with_dirty_log(struct pstree_item *item, struct vma
 		return add_shmem_area(item->pid->real, vma->e, map);
 
 again:
-	ret = generate_iovs_with_dirty_log(item, vma, pp, map, &off, has_parent, dl);
+	ret = generate_iovs_with_dirty_map(item, vma, pp, map, &off, has_parent, dl);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -614,9 +614,9 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		}
 	}
 
-	//[Obsidian0215]initial pid's dirty log
-	if (mdc->dirty_log) {
-		ret = init_dirty_log_images(vpid(item), &dl);
+	//[Obsidian0215]initial pid's dirty-map
+	if (mdc->use_dirty_map) {
+		ret = init_dirty_map_images(vpid(item), &dl);
 		if (ret < 0)
 			goto out_pp;
 	}
@@ -630,18 +630,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
-		if (pdc->dirty_log)	{
-			if (pdc->dry_run) {
-				dry_generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-							parent_predump_mode, &dl);
-				if (ret < 0)
-					goto out_xfer;
-			} else {
-				ret = generate_vma_iovs_with_dirty_log(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-							parent_predump_mode, &dl);
-				if (ret < 0)
-					goto out_xfer;
-			}
+		if (pdc->use_dirty_map)	{
+			ret = generate_vma_iovs_with_dirty_map(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+						parent_predump_mode, &dl);
+			if (ret < 0)
+				goto out_xfer;
 		} else {
 			ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
 						parent_predump_mode);
