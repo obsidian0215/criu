@@ -6,6 +6,10 @@
         "protobuf.h": "c",
         "fcntl.h": "c",
         "pidfd-store.h": "c",
-        "fault-injection.h": "c"
-    }
+        "fault-injection.h": "c",
+        "dirty-map.h": "c",
+        "infect-util.h": "c",
+        "restorer.h": "c"
+    },
+    "makefile.configureOnOpen": false
 }

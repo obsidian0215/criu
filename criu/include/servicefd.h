@@ -29,7 +29,7 @@ enum sfd_type {
 	TRANSPORT_FD_OFF, /* to transfer file descriptors */
 	RPC_SK_OFF,
 	FDSTORE_SK_OFF,
-	DIRTY_LOG_OFF, //[Obsidian0215]for dirty-log-dir
+	DIRTY_LOG_OFF, //[Obsidian0215]for dirty-map-dir
 
 	SERVICE_FD_MAX
 };

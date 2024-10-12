@@ -34,7 +34,7 @@
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
-#include "dirty-log.h"
+#include "dirty-map.h"
 
 static int task_reset_dirty_track(int pid)
 {
@@ -433,7 +433,7 @@ again:
 	return ret;
 }
 
-//[Obsidian0215]put pages into page-pipe with dirty-log, for dry-run
+//[Obsidian0215]put pages into page-pipe with dirty-map, for dry-run
 static int dry_generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
 			 bool has_parent, struct dirty_log *dl)
 {
@@ -544,7 +544,7 @@ again:
 	return ret;
 }
 
-//[Obsidian0215]put pages into page-pipe with dirty-log
+//[Obsidian0215]put pages into page-pipe with dirty-map
 static int generate_iovs_with_dirty_log(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
 			 bool has_parent, struct dirty_log *dl)
 {

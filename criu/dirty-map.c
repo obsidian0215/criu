@@ -14,13 +14,13 @@
 #include "rst-malloc.h"
 #include "page-xfer.h"
 
-#include "dirty-log.h"
+#include "dirty-map.h"
 #include "xmalloc.h"
 #include "protobuf.h"
 
 struct list_head page_dirty_map_list LIST_HEAD_INIT(page_dirty_map_list);
 
-//[Obsidian0215]initial <pid>'s dirty-log
+//[Obsidian0215]initial <pid>'s dirty-map
 int init_dirty_log_images(pid_t pid, struct dirty_log *dl){
 
 	int dfd;

@@ -608,7 +608,7 @@ void close_image_dir(void)
 	close_service_fd(IMG_FD_OFF);
 }
 
-//[Obsidian0215]for dirty log, initial dirty-log-dir service fd for criu
+//[Obsidian0215]for dirty log, initial dirty-map-dir service fd for criu
 int open_dirty_log_dir(char *dir)
 {
 	int fd, ret;
@@ -630,7 +630,7 @@ int open_dirty_log_dir(char *dir)
 	return 0;
 }
 
-//[Obsidian0215]for dirty log, kill dirty-log-dir service fd
+//[Obsidian0215]for dirty log, kill dirty-map-dir service fd
 void close_dirty_log_dir(void)
 {
 	close_service_fd(DIRTY_LOG_OFF);

@@ -267,7 +267,7 @@ int main(int argc, char *argv[], char *envp[])
 	if (check_options())
 		return 1;
 
-	//[Obsidian0215]check dirty-log-dir is accessible
+	//[Obsidian0215]check dirty-map-dir is accessible
 	if (opts.dry_run || opts.use_dirty_log) {
 		ret = open_dirty_log_dir(opts.dirty_log_dir);
 		if (ret < 0) {
@@ -547,9 +547,8 @@ usage:
 	       "                        will be punched from the image\n"
 	       "  --pre-dump-mode       splice - parasite based pre-dumping (default)\n"
 	       "                        read   - process_vm_readv syscall based pre-dumping\n"
-	       "  --dry-run             turn on dirty-track and do not act actual page dump\n"
-		   "  --use-dirty-log       use some files to extract the vma and corresponding dirty log\n"
-		   "  --dirty-log-dir       the directory of dirty log files, default \"./dirty_log\"\n"
+		   "  --use-dirty-map       use some files to extract the vma and corresponding dirty map\n"
+		   "  --dirty-map-dir       the directory of dirty-map files, default \"./dirty_map\"\n"
 		   "\n"
 	       "Page/Service server options:\n"
 	       "  --address ADDR        address of server or service\n"

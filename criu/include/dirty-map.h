@@ -26,11 +26,11 @@ struct dirty_log {
 	pdm_t *pdm;
 	
 	pdm_t **pdme;
-	int nr_pdms;
-	int curr_pdm;
+	int nr_pdms;;
+	int curr_pdm;jhjkhjk
 
 	struct list_head pdm_list;
-}
+};
 
 #define INIT_PAGE_DIRTY_MAP { \
     .dli = NULL, \
