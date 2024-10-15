@@ -30,6 +30,8 @@ struct pstree_item {
 		futex_t task_st;
 		unsigned long task_st_le_bits;
 	};
+	struct dirty_page *dirty_pages;  // 指向脏页数组的指针
+    size_t num_dirty_pages;          // 脏页数量
 };
 
 static inline pid_t vpid(const struct pstree_item *i)

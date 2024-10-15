@@ -86,7 +86,7 @@
 #include "pidfd-store.h"
 #include "apparmor.h"
 #include "asm/dump.h"
-
+#include "dirty-pages.h"
 /*
  * Architectures can overwrite this function to restore register sets that
  * are not covered by ptrace_set/get_regs().
@@ -1924,9 +1924,29 @@ int cr_pre_dump_tasks(pid_t pid)
 	/* Errors handled later in detect_pid_reuse */
 	parent_ie = get_parent_inventory();
 
-	for_each_pstree_item(item)
-		if (pre_dump_one_task(item, parent_ie))
-			goto err;
+	// 遍历每个 pstree_item，打开 dirtymap 文件
+	for_each_pstree_item(item) {
+	    // 构建 dirtymap 文件的完整路径
+	    if (opts.use_dirty_map) {
+	        char filepath[PATH_MAX];
+	        if (opts.dirty_map_dir[strlen(opts.dirty_map_dir) - 1] == '/') {
+	            snprintf(filepath, sizeof(filepath), "%sdirty_pages.img", opts.dirty_map_dir);
+	        } else {
+	        	snprintf(filepath, sizeof(filepath), "%sdirty_pages.img", opts.dirty_map_dir);
+	        }
+
+	        // 加载 dirtymap 文件
+	        if (load_dirty_pages(filepath, item) != 0) {
+	            fprintf(stderr, "Failed to load dirty pages for pid %d\n", item->pid->real);
+	            goto err;
+	        } else {
+	            printf("success open dirtymap!!\n");
+	         //  print_dirty_pages(item);
+	        }
+	    }
+
+	    if (pre_dump_one_task(item, parent_ie)) goto err;
+	}
 
 	if (parent_ie) {
 		inventory_entry__free_unpacked(parent_ie, NULL);
@@ -2247,3 +2267,6 @@ err:
 
 	return cr_dump_finish(ret);
 }
+
+
+
