@@ -18,7 +18,7 @@ struct dirty_log {
 };
 
 #define INIT_PAGE_DIRTY_MAP { \
-    .dirtymap = NULL; \
+    .dirtymap = NULL, \
 }
 
 int init_dirty_map_images(pid_t pid, struct dirty_log *dl);
