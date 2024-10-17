@@ -629,7 +629,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
-		if (pdc->use_dirty_map)	{
+		if (mdc->use_dirty_map)	{
 			ret = generate_vma_iovs_with_dirty_map(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
 						parent_predump_mode, &dl);
 			if (ret < 0)
