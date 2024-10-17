@@ -21,14 +21,6 @@
 struct list_head page_dirty_map_list LIST_HEAD_INIT(page_dirty_map_list);
 
 //[Obsidian0215]initial <pid>'s dirty-map
-int init_dirty_map_images(pid_t pid, struct dirty_log *dl){
-
-}
-
-int update_dirty_map(pdm_t *pdm) {
-
-}
-
-struct page_dirty_map *search_vaddr_in_range_dg(u64 vaddr, struct dirty_log *dl) {
-	
+int use_dirty_map(pid_t pid, struct dirty_log *dl){
+	return 0;
 }

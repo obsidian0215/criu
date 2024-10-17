@@ -5,23 +5,28 @@
 #include <sys/types.h>
 #include "int.h"
 #include "pid.h"
-#include "images/pagemap.pb-c.h"
 #include "page.h"
 #include "pagemap-cache.h"
 
+// 脏页信息
+struct __attribute__((__packed__)) dirty_page{
+	unsigned long address;
+    unsigned long write_count;
+    unsigned int page_type;
+};
 
 struct dirty_log {
     pid_t pid;
 	void *dirtymap;
-
+	unsigned long dirtymap_size;
 	struct list_head pdm_list;
 };
 
 #define INIT_PAGE_DIRTY_MAP { \
     .dirtymap = NULL, \
+	.dirtymap_size = 0, \
 }
 
-int init_dirty_map_images(pid_t pid, struct dirty_log *dl);
-struct page_dirty_map *search_vaddr_in_range_dg(u64 vaddr, struct dirty_log *dl);
+int use_dirty_map(pid_t pid, struct dirty_log *dl);
 
 #endif
