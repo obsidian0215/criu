@@ -605,7 +605,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 		if (ret)
 			xfer.parent = NULL + 1;
-	}
 
 		if (xfer.parent) {
 			possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
