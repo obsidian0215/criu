@@ -11,7 +11,8 @@
         "infect-util.h": "c",
         "restorer.h": "c",
         "pagemap-cache.h": "c",
-        "cr_options.h": "c"
+        "cr_options.h": "c",
+        "page.h": "c"
     },
     "makefile.configureOnOpen": false
 }
