@@ -21,7 +21,13 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 
-// [Obsidian0215]initial <pid>'s dirty-map
+/**
+ * @brief 为特定pid进程初始化其dirty_map
+ *
+ * @param item 指向per-process结构<pid>的指针
+ * @param dirty_map_dir dirty-map目录的字符串
+ * @return int 成功返回0，失败返回-1
+ */
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 	struct dirty_log *dl = &item->dirty_log;
 	pid_t pid = dl->pid;
@@ -73,6 +79,42 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     printf("[Obsidian0215] Successfully mapped dirty-map file %s (size: %lu bytes): 0x%p\n", filepath, dl->dirtymap_size, dl->dirtymap);
 
 	return 0;
+}
+
+/**
+ * @brief 遍历dirty_map，获取其中最大的write_count
+ *
+ * @param dl 指向dirty_log结构的指针
+ * @return int 成功返回0，失败返回-1
+ */
+int get_max_write_count(struct dirty_log *dl) {
+    unsigned long max_wc, current_wc, i = 0;
+	if (dl == NULL) {
+        fprintf(stderr, "Invalid arguments: dl must not be NULL\n");
+        return -1;
+    }
+
+    if (dl->dirtymap == NULL || dl->dirtymap_size == 0) {
+        fprintf(stderr, "Dirty-map is not initialized or empty\n");
+        return -1;
+    }
+
+    // 计算脏页的数量
+    unsigned long num_pages = dl->dirtymap_size / sizeof(struct dirty_page);
+    // if (num_pages == 0) {
+    //     fprintf(stderr, "No dirty pages found in dirtymap\n");
+    //     return -1;
+    // }
+
+    for (i = 0; i < num_pages; i++) {
+        current_wc = dl->dirtymap[i].write_count;
+        if (current_wc > max_wc) {
+            max_wc = current_wc;
+        }
+    }
+
+    dl->max_write_count = max_wc;
+    return 0;
 }
 
 // [Obsidian0215]use <pid>'s dirty-map
