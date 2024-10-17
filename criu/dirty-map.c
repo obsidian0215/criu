@@ -88,7 +88,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
  * @return int 成功返回0，失败返回-1
  */
 int get_max_write_count(struct dirty_log *dl) {
-    unsigned long max_wc, current_wc, i = 0;
+    unsigned long max_wc = 0, current_wc, i = 0, num_pages;
 	if (dl == NULL) {
         fprintf(stderr, "Invalid arguments: dl must not be NULL\n");
         return -1;
@@ -100,7 +100,7 @@ int get_max_write_count(struct dirty_log *dl) {
     }
 
     // 计算脏页的数量
-    unsigned long num_pages = dl->dirtymap_size / sizeof(struct dirty_page);
+    num_pages = dl->dirtymap_size / sizeof(struct dirty_page);
     // if (num_pages == 0) {
     //     fprintf(stderr, "No dirty pages found in dirtymap\n");
     //     return -1;
