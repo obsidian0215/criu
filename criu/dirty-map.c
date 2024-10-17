@@ -25,26 +25,28 @@
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 	struct dirty_log *dl = &item->dirty_log;
 	pid_t pid = dl->pid;
+    char filepath[PATH_MAX];
+	int ret, fd;
+    struct stat st;
+	void *mapped;
 
 	printf("[Obsidian0215] init dirty-log for pid: %d\n", pid);
 	
 	// 打开<dirty_map_dir>/newest-<pid>.img
-    char filepath[PATH_MAX];
-    int ret = snprintf(filepath, sizeof(filepath), "%s/newest-%d.img", dirty_map_dir, pid);
+    ret = snprintf(filepath, sizeof(filepath), "%s/newest-%d.img", dirty_map_dir, pid);
     if (ret < 0 || ret >= sizeof(filepath)) {
         fprintf(stderr, "Error constructing file path for pid %d\n", pid);
         return -1;
     }
-    int fd = open(filepath, O_RDONLY);
+    fd = open(filepath, O_RDONLY);
     if (fd == -1) {
-        perror("Error opening dirty map file");
+        fprintf(stderr, "Error opening dirty-map file\n");
         return -1;
     }
 
     // 获取dirty-map文件大小
-    struct stat st;
     if (fstat(fd, &st) == -1) {
-        perror("Error getting %s's size", filepath);
+        fprintf(stderr, "Error getting %s's size\n", filepath);
         close(fd);
         return -1;
     }
@@ -56,9 +58,9 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // 将dirty-map映射到criu的内存空间
-    void *mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
-        perror("Error mapping dirty-map file");
+        fprintf(stderr, "Error mapping dirty-map file\n");
         close(fd);
         return -1;
     }
