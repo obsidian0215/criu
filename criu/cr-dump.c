@@ -1662,6 +1662,19 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
+	// [Obsidian0215] init dirty map
+	if (opts.use_dirty_map)
+		mdc.use_dirty_map = true;
+	else
+		mdc.use_dirty_map = false;
+	
+	if (mdc.use_dirty_map) {
+		ret = init_dirty_map(item, opts.dirty_map_dir);
+		if (ret) {
+			pr_err("init dirty map failed\n");
+		}
+	}
+
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
 		goto err_cure;
