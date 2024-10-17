@@ -551,7 +551,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
 	struct page_xfer xfer = { .parent = NULL };
-	struct dirty_log dl = INIT_PAGE_DIRTY_MAP;
+	struct dirty_log dl = &item->dirty_log;
 	int ret, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
