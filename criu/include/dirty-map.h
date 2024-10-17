@@ -17,16 +17,17 @@ struct __attribute__((__packed__)) dirty_page{
 
 struct dirty_log {
     pid_t pid;
-	void *dirtymap;
+	struct dirty_page *dirtymap;
 	unsigned long dirtymap_size;
-	struct list_head pdm_list;
 };
 
 #define INIT_PAGE_DIRTY_MAP { \
+    .pid = -1,	\
     .dirtymap = NULL, \
 	.dirtymap_size = 0, \
 }
 
+int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
 int use_dirty_map(pid_t pid, struct dirty_log *dl);
 
 #endif

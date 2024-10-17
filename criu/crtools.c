@@ -269,7 +269,7 @@ int main(int argc, char *argv[], char *envp[])
 
 	//[Obsidian0215]check dirty-map-dir is accessible
 	if (opts.use_dirty_map) {
-		ret = open_dirty_map_dir(opts.dirty_map_dir);
+		ret = test_dirty_map_dir(opts.dirty_map_dir);
 		if (ret < 0) {
 			pr_err("Couldn't open dirty-map dir %s\n", opts.dirty_map_dir);
 			return 1;

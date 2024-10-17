@@ -214,6 +214,11 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 		vm_area_list_init(&rsti(item)->vmas);
 		INIT_LIST_HEAD(&rsti(item)->vma_io);
 		item->pid = (void *)item + sizeof(*item) + sizeof(struct rst_info);
+		
+		// [Obsidian0215] init dirty-log
+		item->dirty_log = INIT_PAGE_DIRTY_MAP;
+		item->dirty_log.pid = item->pid->real;
+		printf("[Obsidian0215] init dirty-log for pid: %d\n", item->dirty_log.pid);
 	}
 
 	INIT_LIST_HEAD(&item->children);
@@ -224,6 +229,9 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->pid->state = TASK_UNDEF;
 	item->born_sid = -1;
 	item->pid->item = item;
+	// [Obsidian0215] init dirty-log
+	item->dirty_log = INIT_PAGE_DIRTY_MAP;
+
 	futex_init(&item->task_st);
 
 	return item;

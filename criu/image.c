@@ -608,33 +608,33 @@ void close_image_dir(void)
 	close_service_fd(IMG_FD_OFF);
 }
 
-//[Obsidian0215]for dirty-track, initial dirty-map-dir service fd for criu
-int open_dirty_map_dir(char *dir)
+//[Obsidian0215]for dirty-track, test availability of dirty-map-dir
+int test_dirty_map_dir(char *dir)
 {
-	int fd, ret;
+	int fd, ret = 0;
 
 	fd = open(dir, O_RDONLY);
 	if (fd < 0) {
 		pr_perror("Can't open dir %s", dir);
-		return -1;
+		ret = -1;
 	} else
-		pr_info("dirty-map will be enabled in <%s>", opts.dirty_map_dir);
+		pr_info("dirty-map will be loaded from <%s>", opts.dirty_map_dir);
 
-	ret = install_service_fd(DIRTY_MAP_OFF, fd);
-	if (ret < 0) {
-		pr_err("install_service_fd failed.\n");
-		return -1;
-	}
-	fd = ret;
+	// ret = install_service_fd(DIRTY_MAP_OFF, fd);
+	// if (ret < 0) {
+	// 	pr_err("install_service_fd failed.\n");
+	// 	return -1;
+	// }
+	// fd = ret;
 
-	return 0;
+	return ret;
 }
 
-//[Obsidian0215]for dirty-track, kill dirty-map-dir service fd
-void close_dirty_map_dir(void)
-{
-	close_service_fd(DIRTY_MAP_OFF);
-}
+// //[Obsidian0215]for dirty-track, kill dirty-map-dir service fd
+// void close_dirty_map_dir(void)
+// {
+// 	close_service_fd(DIRTY_MAP_OFF);
+// }
 
 int open_parent(int dfd, int *pfd)
 {

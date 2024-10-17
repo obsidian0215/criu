@@ -10,7 +10,8 @@
         "dirty-map.h": "c",
         "infect-util.h": "c",
         "restorer.h": "c",
-        "pagemap-cache.h": "c"
+        "pagemap-cache.h": "c",
+        "cr_options.h": "c"
     },
     "makefile.configureOnOpen": false
 }

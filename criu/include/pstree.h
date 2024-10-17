@@ -6,6 +6,7 @@
 #include "pid.h"
 #include "xmalloc.h"
 #include "images/core.pb-c.h"
+#include "dirty-map.h"
 
 /*
  * That's the init process which usually inherit
@@ -30,6 +31,7 @@ struct pstree_item {
 		futex_t task_st;
 		unsigned long task_st_le_bits;
 	};
+	struct dirty_log dirty_log;
 };
 
 static inline pid_t vpid(const struct pstree_item *i)
