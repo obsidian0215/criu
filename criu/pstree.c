@@ -230,7 +230,9 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->born_sid = -1;
 	item->pid->item = item;
 	// [Obsidian0215] init dirty-log
-	item->dirty_log = INIT_PAGE_DIRTY_MAP;
+	item->dirty_log.dirtymap = NULL;
+	item->dirty_log.dirtymap_size = 0;
+	item->dirty_log.pid = item->pid->real;
 
 	futex_init(&item->task_st);
 
