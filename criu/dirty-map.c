@@ -24,6 +24,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 	struct dirty_log *dl = &item->dirty_log;
 	pid_t pid = dl->pid;
 
+	printf("[Obsidian0215] init dirty-log for pid: %d\n", pid);
+
 	return 0;
 }
 

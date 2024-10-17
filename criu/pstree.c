@@ -218,7 +218,6 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 		// [Obsidian0215] init dirty-log
 		item->dirty_log = INIT_PAGE_DIRTY_MAP;
 		item->dirty_log.pid = item->pid->real;
-		printf("[Obsidian0215] init dirty-log for pid: %d\n", item->dirty_log.pid);
 	}
 
 	INIT_LIST_HEAD(&item->children);
