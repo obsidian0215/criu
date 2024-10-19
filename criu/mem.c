@@ -481,67 +481,12 @@ again:
 }
 
 //[Obsidian0215]put pages into page-pipe with dirty-map
-static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
 			 bool has_parent)
 {
-	u64 *at = &map[PAGE_PFN(*off)];
-	unsigned long pfn, nr_to_scan;
-	unsigned long pages[3] = {};
 	int ret = 0;
-	struct dirty_log *dl = &item->dirty_log;
+	// struct dirty_log *dl = &item->dirty_log;
 
-	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
-
-	for (pfn = 0; pfn < nr_to_scan; pfn++) {
-		unsigned long vaddr;
-		unsigned int ppb_flags = 0;
-		int st;
-
-		if (!should_dump_page(vma->e, at[pfn]))
-			continue;
-
-		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
-
-		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
-			ppb_flags |= PPB_LAZY;
-
-		/*
-		 * If we're doing incremental dump (parent images
-		 * specified) and page is not soft-dirty -- we dump
-		 * hole and expect the parent images to contain this
-		 * page. The latter would be checked in page-xfer.
-		 */
-
-		// [Obsidian0215] check the page is in dirty-map or not
-
-		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
-			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-			st = 0;
-		} else {
-			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-				st = 1;
-			else
-				st = 2;
-		}
-
-		if (ret) {
-			/* Do not do pfn++, just bail out */
-			pr_debug("Pagemap full\n");
-			break;
-		}
-
-		pages[st]++;
-	}
-
-	*off += pfn * PAGE_SIZE;
-
-	cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
-	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
-	cnt_add(CNT_PAGES_LAZY, pages[1]);
-	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
-
-	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
 	return ret;
 }
 
@@ -549,11 +494,13 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
 {
-	u64 off = 0;
-	u64 *map;
+	u64 vaddr;
 	int ret;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return 0;
+
+	if (vma_entry_is(vma->e, VMA_AREA_VVAR))
 		return 0;
 
 	if (!(vma->e->prot & PROT_READ)) {
@@ -563,21 +510,28 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 			has_parent = false;
 	}
 
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+	/*
+	 * We want to completely ignore these VMA types on the pre-dump:
+	 * 1. VMA_AREA_AIORING because it is not soft-dirty trackable (kernel writes)
+	 * 2. MAP_HUGETLB mappings because they are not premapped and we can't use
+	 * parent images from pre-dump stages. Instead, the content is restored from
+	 * the parasite context using full memory image.
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;
 	}
 
-	map = pmc_get_map(pmc, vma);
-	if (!map)
+	if (pmc_get_map(pmc, vma))
 		return -1;
 
 	if (vma_area_is(vma, VMA_ANON_SHARED))
-		return add_shmem_area(item->pid->real, vma->e, map);
+		return add_shmem_area(item->pid->real, vma->e, pmc);
+	vaddr = vma->e->start;
 
 again:
-	ret = generate_iovs_with_dirty_map(item, vma, pp, map, &off, has_parent);
+	ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
