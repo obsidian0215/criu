@@ -435,12 +435,13 @@ again:
 
 //[Obsidian0215]put pages into page-pipe with dirty-map
 static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
-			 bool has_parent, struct dirty_log *dl)
+			 bool has_parent)
 {
 	u64 *at = &map[PAGE_PFN(*off)];
 	unsigned long pfn, nr_to_scan;
 	unsigned long pages[3] = {};
 	int ret = 0;
+	struct dirty_log *dl = &item->dirty_log;
 
 	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
 
@@ -463,6 +464,8 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		 * hole and expect the parent images to contain this
 		 * page. The latter would be checked in page-xfer.
 		 */
+
+		// [Obsidian0215] check the page is in dirty-map or not
 
 		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
@@ -497,7 +500,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 
 static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
-			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode, struct dirty_log *dl)
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
 {
 	u64 off = 0;
 	u64 *map;
@@ -527,7 +530,7 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 		return add_shmem_area(item->pid->real, vma->e, map);
 
 again:
-	ret = generate_iovs_with_dirty_map(item, vma, pp, map, &off, has_parent, dl);
+	ret = generate_iovs_with_dirty_map(item, vma, pp, map, &off, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -551,7 +554,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
 	struct page_xfer xfer = { .parent = NULL };
-	struct dirty_log dl = item->dirty_log;
 	int ret, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
@@ -615,7 +617,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	//[Obsidian0215]initial pid's dirty-map
 	if (mdc->use_dirty_map) {
-		ret = use_dirty_map(vpid(item), &dl);
+		ret = use_dirty_map(vpid(item), &item->dl);
 		if (ret < 0)
 			goto out_pp;
 	}
@@ -631,7 +633,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		if (mdc->use_dirty_map)	{
 			ret = generate_vma_iovs_with_dirty_map(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-						parent_predump_mode, &dl);
+						parent_predump_mode);
 			if (ret < 0)
 				goto out_xfer;
 		} else {

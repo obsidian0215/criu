@@ -8,6 +8,12 @@
 #include "page.h"
 #include "pagemap-cache.h"
 
+// 定义页修改频率的比例阈值
+#define WRITE_RATIO_COLD 0.05  	// 冷页阈值：< 5%
+#define WRITE_RATIO_WARM 0.25  	// 温页阈值：>= 5% 且 < 25%
+#define WRITE_RATIO_HOT 0.3   	// 热页阈值：>= 25% 且 < 30%
+#define WRITE_RATIO_MAX 0.1   	// 最大阈值：<= 100%
+
 // 脏页信息
 struct __attribute__((__packed__)) dirty_page{
 	unsigned long address;
