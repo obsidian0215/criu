@@ -170,6 +170,7 @@ extern pid_t fork_and_ptrace_attach(int (*child_setup)(void));
 extern int cr_daemon(int nochdir, int noclose, int close_fd);
 extern int status_ready(void);
 extern int is_root_user(void);
+extern int close_fds(int minfd);
 
 extern int set_proc_self_fd(int fd);
 
@@ -263,6 +264,10 @@ bool is_path_prefix(const char *path, const char *prefix);
 FILE *fopenat(int dirfd, char *path, char *cflags);
 void split(char *str, char token, char ***out, int *n);
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid);
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode);
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags);
+
 int fd_has_data(int lfd);
 
 int make_yard(char *path);
@@ -274,8 +279,6 @@ static inline int sk_wait_data(int sk)
 }
 
 void fd_set_nonblocking(int fd, bool on);
-void tcp_nodelay(int sk, bool on);
-void tcp_cork(int sk, bool on);
 
 const char *ns_to_string(unsigned int ns);
 
@@ -384,7 +387,14 @@ static inline void print_stack_trace(pid_t pid)
 
 extern int mount_detached_fs(const char *fsname);
 
-extern char *get_legacy_iptables_bin(bool ipv6);
+extern int cr_fsopen(const char *fsname, unsigned int flags);
+extern int cr_fsconfig(int fd, unsigned int cmd, const char *key, const char *value, int aux);
+extern int cr_fsmount(int fd, unsigned int flags, unsigned int attr_flags);
+extern void fsfd_dump_messages(int fd);
+
+extern char *get_legacy_iptables_bin(bool ipv6, bool restore);
+
+extern int set_opts_cap_eff(void);
 
 extern ssize_t read_all(int fd, void *buf, size_t size);
 extern ssize_t write_all(int fd, const void *buf, size_t size);
@@ -406,5 +416,7 @@ extern uint64_t criu_run_id;
 extern void util_init(void);
 
 extern char *resolve_mountpoint(char *path);
+
+extern int cr_close_range(unsigned int fd, unsigned int max_fd, unsigned int flags);
 
 #endif /* __CR_UTIL_H__ */

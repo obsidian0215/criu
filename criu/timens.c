@@ -5,6 +5,7 @@
 #include "proc_parse.h"
 #include "namespaces.h"
 #include "timens.h"
+#include "cr_options.h"
 
 #include "protobuf.h"
 #include "images/timens.pb-c.h"
@@ -57,6 +58,9 @@ int prepare_timens(int id)
 	struct timespec ts;
 	struct timespec prev_moff = {}, prev_boff = {};
 
+	if (opts.unprivileged)
+		return 0;
+
 	img = open_image(CR_FD_TIMENS, O_RSTR, id);
 	if (!img)
 		return -1;
@@ -92,8 +96,8 @@ int prepare_timens(int id)
 	ts.tv_nsec = te->monotonic->tv_nsec - ts.tv_nsec;
 	normalize_timespec(&ts);
 
-	pr_debug("timens: monotonic %ld %ld\n", ts.tv_sec, ts.tv_nsec);
-	if (dprintf(fd, "%d %ld %ld\n", CLOCK_MONOTONIC, ts.tv_sec, ts.tv_nsec) < 0) {
+	pr_debug("timens: monotonic %" PRId64 " %ld\n", (int64_t)ts.tv_sec, ts.tv_nsec);
+	if (dprintf(fd, "%d %" PRId64 " %ld\n", CLOCK_MONOTONIC, (int64_t)ts.tv_sec, ts.tv_nsec) < 0) {
 		pr_perror("Unable to set a monotonic clock offset");
 		goto err;
 	}
@@ -107,8 +111,8 @@ int prepare_timens(int id)
 	ts.tv_nsec = te->boottime->tv_nsec - ts.tv_nsec;
 	normalize_timespec(&ts);
 
-	pr_debug("timens: boottime %ld %ld\n", ts.tv_sec, ts.tv_nsec);
-	if (dprintf(fd, "%d %ld %ld\n", CLOCK_BOOTTIME, ts.tv_sec, ts.tv_nsec) < 0) {
+	pr_debug("timens: boottime %" PRId64 " %ld\n", (int64_t)ts.tv_sec, ts.tv_nsec);
+	if (dprintf(fd, "%d %" PRId64 " %ld\n", CLOCK_BOOTTIME, (int64_t)ts.tv_sec, ts.tv_nsec) < 0) {
 		pr_perror("Unable to set a boottime clock offset");
 		goto err;
 	}

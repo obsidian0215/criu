@@ -221,7 +221,7 @@ int kerndat_socket_unix_file(void)
 	}
 	fd = ioctl(sk, SIOCUNIXFILE);
 	if (fd < 0 && errno != ENOENT) {
-		pr_warn("Unable to open a socket file: %m\n");
+		pr_warn("Unable to open a socket file: %s\n", strerror(errno));
 		kdat.sk_unix_file = false;
 		close(sk);
 		return 0;
@@ -497,9 +497,34 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 			goto err;
 		}
 
+		if (sk->wqlen != 0) {
+			/*
+			 * There's no known way to get data out of the write
+			 * queue of an icon socket. The only good solution for
+			 * now is to fail the migration.
+			 */
+			pr_err("Non-empty write queue on an in-flight socket %#x\n", ue->ino);
+			goto err;
+		}
+
 		ue->peer = e->sk_desc->sd.ino;
 
 		pr_debug("\t\tFixed inflight socket %u peer %u)\n", ue->ino, ue->peer);
+	} else if (ue->state == TCP_LISTEN) {
+		int i;
+
+		for (i = 0; i < sk->nr_icons; i++)
+			if (sk->icons[i] == 0) {
+				/*
+				 * Inode of an icon socket equal to 0 means
+				 * it's already been closed. That means we have
+				 * no simple way to check if it sent any data.
+				 * The only good solution for now is to fail
+				 * the migration.
+				 */
+				pr_err("Found a closed in-flight socket to %#x\n", ue->ino);
+				goto err;
+			}
 	}
 dump:
 	if (dump_socket_opts(lfd, skopts))
@@ -570,14 +595,14 @@ static int unix_resolve_name_old(int lfd, uint32_t id, struct unix_sk_desc *d, U
 	else
 		ns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
 	if (!ns) {
-		ret = -ENOENT;
-		goto out;
+		pr_err("Failed to lookup ns by mnt id %d\n", ue->mnt_id);
+		return -1;
 	}
 
 	mntns_root = mntns_get_root_fd(ns);
 	if (mntns_root < 0) {
-		ret = -ENOENT;
-		goto out;
+		pr_err("Failed to lookup mntns root for ns %d\n", ns->id);
+		return -1;
 	}
 
 	if (name[0] != '/') {
@@ -588,15 +613,15 @@ static int unix_resolve_name_old(int lfd, uint32_t id, struct unix_sk_desc *d, U
 
 		ret = resolve_rel_name(id, d, p, &ue->name_dir);
 		if (ret < 0)
-			goto out;
-		goto postprone;
+			return -1;
+		return 0;
 	}
 
 	snprintf(rpath, sizeof(rpath), ".%s", name);
 	if (fstatat(mntns_root, rpath, &st, 0)) {
 		if (errno != ENOENT) {
-			pr_warn("Can't stat socket %#" PRIx32 "(%s), skipping: %m (err %d)\n", id, rpath, errno);
-			goto skip;
+			pr_perror("Can't stat socket %#" PRIx32 "(%s)", id, rpath);
+			return -1;
 		}
 
 		pr_info("unix: Dropping path %s for unlinked sk %#x\n", name, id);
@@ -614,92 +639,77 @@ static int unix_resolve_name_old(int lfd, uint32_t id, struct unix_sk_desc *d, U
 
 	d->deleted = deleted;
 
-postprone:
 	return 0;
-
-out:
-	xfree(name);
-	return ret;
-skip:
-	ret = 1;
-	goto out;
 }
 
 static int unix_resolve_name(int lfd, uint32_t id, struct unix_sk_desc *d, UnixSkEntry *ue, const struct fd_parms *p)
 {
 	char *name = d->name;
-	char path[PATH_MAX], tmp[PATH_MAX];
+	char path[PATH_MAX];
 	struct stat st;
-	int fd, proc_fd, mnt_id, ret;
+	int fd, ret;
+	int exit_code = -1;
 
 	if (d->namelen == 0 || name[0] == '\0')
 		return 0;
 
-	if (kdat.sk_unix_file && (root_ns_mask & CLONE_NEWNS)) {
-		if (get_mnt_id(lfd, &mnt_id))
+	if (!kdat.sk_unix_file) {
+		pr_warn("Trying to resolve unix socket with obsolete method\n");
+		if (unix_resolve_name_old(lfd, id, d, ue, p)) {
+			pr_err("Unable to resolve unix socket name with obsolete method. "
+			       "Try a linux kernel newer than 4.10\n");
 			return -1;
-		ue->mnt_id = mnt_id;
-		ue->has_mnt_id = true;
+		}
+		return 0;
 	}
 
 	fd = ioctl(lfd, SIOCUNIXFILE);
 	if (fd < 0) {
-		pr_warn("Unable to get a socket file descriptor with SIOCUNIXFILE ioctl: %m\n");
-		goto fallback;
+		pr_perror("Unable to get a socket file descriptor with SIOCUNIXFILE ioctl");
+		return -1;
 	}
 
-	ret = fstat(fd, &st);
-	if (ret) {
+	if (root_ns_mask & CLONE_NEWNS) {
+		struct fdinfo_common fdinfo = { .mnt_id = -1 };
+
+		if (parse_fdinfo(fd, FD_TYPES__UND, &fdinfo))
+			goto out;
+
+		ue->mnt_id = fdinfo.mnt_id;
+		ue->has_mnt_id = true;
+	}
+
+	if (fstat(fd, &st)) {
 		pr_perror("Unable to fstat socket fd");
-		return -1;
+		goto out;
 	}
 	d->mode = st.st_mode;
 	d->uid = st.st_uid;
 	d->gid = st.st_gid;
 
-	proc_fd = get_service_fd(PROC_FD_OFF);
-	if (proc_fd < 0) {
-		pr_err("Unable to get service fd for proc\n");
-		return -1;
-	}
-
-	snprintf(tmp, sizeof(tmp), "self/fd/%d", fd);
-	ret = readlinkat(proc_fd, tmp, path, PATH_MAX);
-	if (ret < 0 && ret >= PATH_MAX) {
-		pr_perror("Unable to readlink %s", tmp);
+	ret = read_fd_link(fd, path, sizeof(path));
+	if (ret < 0)
 		goto out;
-	}
-	path[ret] = 0;
 
 	d->deleted = strip_deleted(path, ret);
 
 	if (name[0] != '/') {
-		ret = cut_path_ending(path, name);
-		if (ret) {
-			pr_err("Unable too resolve %s from %s\n", name, path);
+		if (cut_path_ending(path, name)) {
+			pr_err("Unable too cut %s from %s\n", name, path);
 			goto out;
 		}
 
 		ue->name_dir = xstrdup(path);
-		if (!ue->name_dir) {
-			ret = -ENOMEM;
+		if (!ue->name_dir)
 			goto out;
-		}
 
 		pr_debug("Resolved socket relative name %s to %s/%s\n", name, ue->name_dir, name);
 	}
 
-	ret = 0;
+	exit_code = 0;
 out:
 	close(fd);
-	return ret;
-
-fallback:
-	pr_warn("Trying to resolve unix socket with obsolete method\n");
-	ret = unix_resolve_name_old(lfd, id, d, ue, p);
-	if (ret < 0)
-		pr_err("Unable to resolve unix socket name with obsolete method. Try a linux kernel newer than 4.10\n");
-	return ret;
+	return exit_code;
 }
 
 /*
@@ -868,7 +878,8 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 
 	if (peer->type != SOCK_DGRAM) {
 		show_one_unix("Ext stream not supported", peer);
-		pr_err("Can't dump half of stream unix connection.\n");
+		pr_err("Can't dump half of stream unix connection. name: %s; peer name: %s\n",
+		       sk->name, peer->name);
 		return -1;
 	}
 
@@ -1021,8 +1032,8 @@ static struct unix_sk_info *find_queuer_for(int id)
 	struct unix_sk_info *ui;
 
 	list_for_each_entry(ui, &unix_sockets, list) {
-		if (ui->queuer && ui->queuer->ue->id == id)
-			return ui;
+		if (ui->queuer && ui->ue->id == id)
+			return ui->queuer;
 	}
 
 	return NULL;
@@ -1420,32 +1431,22 @@ err_revert_and_exit:
 
 static int restore_file_perms(struct unix_sk_info *ui)
 {
-	if (ui->ue->file_perms) {
-		FilePermsEntry *perms = ui->ue->file_perms;
-		char fname[PATH_MAX];
+	FilePermsEntry *perms = ui->ue->file_perms;
+	char fname[PATH_MAX];
 
-		if (ui->ue->name.len >= sizeof(fname)) {
-			pr_err("The file name is too long\n");
-			return -E2BIG;
-		}
+	if (!perms)
+		return 0;
 
-		memcpy(fname, ui->name, ui->ue->name.len);
-		fname[ui->ue->name.len] = '\0';
-
-		if (fchownat(AT_FDCWD, fname, perms->uid, perms->gid, 0) < 0) {
-			int errno_cpy = errno;
-			pr_perror("Unable to change file owner and group");
-			return -errno_cpy;
-		}
-
-		if (fchmodat(AT_FDCWD, fname, perms->mode, 0) < 0) {
-			int errno_cpy = errno;
-			pr_perror("Unable to change file mode bits");
-			return -errno_cpy;
-		}
+	if (ui->ue->name.len >= sizeof(fname)) {
+		pr_err("The file name is too long\n");
+		errno = -E2BIG;
+		return -1;
 	}
 
-	return 0;
+	memcpy(fname, ui->name, ui->ue->name.len);
+	fname[ui->ue->name.len] = '\0';
+
+	return cr_fchpermat(AT_FDCWD, fname, perms->uid, perms->gid, perms->mode, 0);
 }
 
 static int keep_deleted(struct unix_sk_info *ui)

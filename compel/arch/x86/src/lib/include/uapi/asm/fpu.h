@@ -21,7 +21,28 @@
 #define XSTATE_YMM 0x4
 
 #define FXSAVE_SIZE 512
-#define XSAVE_SIZE  4096
+/*
+ * This used to be 4096 (one page). There is a comment below concerning
+ * this size:
+ *  "One page should be enough for the whole xsave state ;-)"
+ * Which is kind of funny as it is no longer enough ;-)
+ *
+ * Older CPUs:
+ * # cpuid -1 -l 0xd -s 0
+ * ...
+ *     bytes required by XSAVE/XRSTOR area     = 0x00000988 (2440)
+ *
+ * Newer CPUs (Sapphire Rapids):
+ * # cpuid -1 -l 0xd -s 0
+ * ...
+ *     bytes required by XSAVE/XRSTOR area     = 0x00002b00 (11008)
+ *
+ * So one page is no longer enough... But:
+ *
+ * Four pages should be enough for the whole xsave state ;-)
+ */
+
+#define XSAVE_SIZE  4*4096
 
 #define XSAVE_HDR_SIZE	 64
 #define XSAVE_HDR_OFFSET FXSAVE_SIZE
@@ -225,6 +246,14 @@ struct pkru_state {
 } __packed;
 
 /*
+ * State component 11 is Control-flow Enforcement user states
+ */
+struct cet_user_state {
+	uint64_t cet;			/* user control-flow settings */
+	uint64_t ssp;			/* user shadow stack pointer */
+};
+
+/*
  * This is our most modern FPU state format, as saved by the XSAVE
  * and restored by the XRSTOR instructions.
  *
@@ -235,8 +264,11 @@ struct pkru_state {
  *
  *
  * One page should be enough for the whole xsave state ;-)
+ *
+ * Of course it was not ;-) Now using four pages...
+ *
  */
-#define EXTENDED_STATE_AREA_SIZE (4096 - sizeof(struct i387_fxsave_struct) - sizeof(struct xsave_hdr_struct))
+#define EXTENDED_STATE_AREA_SIZE (XSAVE_SIZE - sizeof(struct i387_fxsave_struct) - sizeof(struct xsave_hdr_struct) - sizeof(struct cet_user_state))
 
 /*
  * cpu requires it to be 64 byte aligned
@@ -252,6 +284,7 @@ struct xsave_struct {
 		struct ymmh_struct ymmh;
 		uint8_t extended_state_area[EXTENDED_STATE_AREA_SIZE];
 	};
+	struct cet_user_state cet;
 } __aligned(FP_MIN_ALIGN_BYTES) __packed;
 
 struct xsave_struct_ia32 {

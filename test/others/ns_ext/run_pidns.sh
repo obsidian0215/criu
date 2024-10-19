@@ -2,9 +2,6 @@
 
 set -e
 
-# CentOS 7 kernels do not have NSpid -> skip this test
-grep NSpid /proc/self/status || exit 0
-
 # This test creates a process in non-host pidns and then dumps it and restores
 # it into host pidns. We use pid >100000 in non-host pidns to make sure it does
 # not intersect with some host pid on restore but it is potentially racy so
@@ -36,7 +33,7 @@ mkdir -p images_pidns
 echo "$CRIU dump -v4 -o dump.log -t $PID -D images_pidns --external $PIDNS:exti"
 $CRIU dump -v4 -o dump.log -t $PID -D images_pidns --external $PIDNS:exti
 RESULT=$?
-cat images_pidns/dump.log | grep -B 5 Error || echo ok
+grep -B 5 Error images_pidns/dump.log || echo ok
 [ "$RESULT" != "0" ] && {
 	echo "CRIU dump failed"
 	echo FAIL
@@ -48,7 +45,7 @@ exec {pidns_fd}< /proc/self/ns/pid
 echo "$CRIU restore -v4 -o restore.log -D images_pidns --restore-detached --inherit-fd fd[$pidns_fd]:exti"
 $CRIU restore -v4 -o restore.log -D images_pidns --restore-detached --inherit-fd fd[$pidns_fd]:exti --pidfile test.pidfile
 RESULT=$?
-cat images_pidns/restore.log | grep -B 5 Error || echo ok
+grep -B 5 Error images_pidns/restore.log || echo ok
 [ "$RESULT" != "0" ] && {
 	echo "CRIU restore failed"
 	echo FAIL

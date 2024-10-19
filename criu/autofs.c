@@ -431,8 +431,7 @@ static int access_autofs_mount(struct mount_info *pm)
 		pr_err("failed to fork\n");
 		goto close_autofs_mnt;
 	case 0:
-		/* We don't care about results.
-			 * All we need is to "touch" */
+		/* We don't care about results, all we need is to "touch" */
 		/* coverity[check_return] */
 		openat(autofs_mnt, mnt_path, O_RDONLY | O_NONBLOCK | O_DIRECTORY);
 		_exit(0);
@@ -659,7 +658,7 @@ static int autofs_mnt_make_catatonic(const char *mnt_path, int mnt_fd)
 
 static int autofs_mnt_set_timeout(time_t timeout, const char *mnt_path, int mnt_fd)
 {
-	pr_info("%s: set timeout %ld for %s\n", __func__, timeout, mnt_path);
+	pr_info("%s: set timeout %" PRId64 " for %s\n", __func__, (int64_t)timeout, mnt_path);
 	return autofs_ioctl(mnt_path, mnt_fd, AUTOFS_IOC_SETTIMEOUT, &timeout);
 }
 
@@ -771,7 +770,7 @@ static int autofs_post_mount(const char *mnt_path, dev_t mnt_dev, time_t timeout
 	}
 
 	if (autofs_mnt_set_timeout(timeout, mnt_path, mnt_fd)) {
-		pr_err("Failed to set timeout %ld for %s\n", timeout, mnt_path);
+		pr_err("Failed to set timeout %" PRId64 " for %s\n", (int64_t)timeout, mnt_path);
 		return -1;
 	}
 

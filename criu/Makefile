@@ -85,7 +85,7 @@ $(obj)/%: pie
 
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
 
 UNIT-BUILTINS		+= $(obj)/util.o
 UNIT-BUILTINS		+= $(obj)/config.o
@@ -102,7 +102,7 @@ $(obj)/unittest/built-in.o: .FORCE
 
 $(obj)/unittest/unittest: $(UNIT-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) -rdynamic -o $@
 
 unittest: $(obj)/unittest/unittest
 	$(Q) $(obj)/unittest/$@
@@ -145,10 +145,8 @@ install: $(obj)/criu
 	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/criu/
 	$(Q) mkdir -p $(DESTDIR)$(LIBEXECDIR)/criu/scripts
 	$(Q) install -m 755 scripts/systemd-autofs-restart.sh $(DESTDIR)$(LIBEXECDIR)/criu/scripts
-ifeq ($(PYTHON),python3)
 	$(E) "  INSTALL " scripts/criu-ns
 	$(Q) install -m 755 scripts/criu-ns $(DESTDIR)$(SBINDIR)
-endif
 .PHONY: install
 
 uninstall:

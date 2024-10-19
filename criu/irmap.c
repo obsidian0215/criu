@@ -67,6 +67,7 @@ static struct irmap hints[] = {
 		.path = "/var/log",
 		.nr_kids = -1,
 	},
+	{ .path = "/usr/share/dbus-1/services", .nr_kids = -1 },
 	{ .path = "/usr/share/dbus-1/system-services", .nr_kids = -1 },
 	{ .path = "/var/lib/polkit-1/localauthority", .nr_kids = -1 },
 	{ .path = "/usr/share/polkit-1/actions", .nr_kids = -1 },
@@ -101,7 +102,7 @@ static int irmap_update_stat(struct irmap *i)
 
 	pr_debug("Refresh stat for %s\n", i->path);
 	if (fstatat(mntns_root, i->path + 1, &st, AT_SYMLINK_NOFOLLOW)) {
-		pr_perror("Can't stat %s", i->path);
+		pr_pwarn("Can't stat %s", i->path);
 		return -1;
 	}
 
@@ -136,7 +137,7 @@ static int irmap_update_dir(struct irmap *t)
 	pr_debug("Refilling %s dir\n", t->path);
 	fd = openat(mntns_root, t->path + 1, O_RDONLY);
 	if (fd < 0) {
-		pr_perror("Can't open %s", t->path);
+		pr_pwarn("Can't open %s", t->path);
 		return -1;
 	}
 
@@ -499,8 +500,13 @@ int irmap_scan_path_add(char *path)
 		return -1;
 	}
 
-	o->ir->path = path;
+	o->ir->path = xstrdup(path);
+	if (!o->ir->path) {
+		xfree(o->ir);
+		xfree(o);
+		return -1;
+	}
 	o->ir->nr_kids = -1;
-	list_add(&o->node, &opts.irmap_scan_paths);
+	list_add_tail(&o->node, &opts.irmap_scan_paths);
 	return 0;
 }

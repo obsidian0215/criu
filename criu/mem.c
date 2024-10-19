@@ -100,7 +100,7 @@ static inline bool __page_in_parent(bool dirty)
 	return opts.track_mem && opts.img_parent && !dirty;
 }
 
-bool should_dump_page(VmaEntry *vmae, u64 pme)
+static bool should_dump_entire_vma(VmaEntry *vmae)
 {
 	/*
 	 * vDSO area must be always dumped because on restore
@@ -108,28 +108,51 @@ bool should_dump_page(VmaEntry *vmae, u64 pme)
 	 */
 	if (vma_entry_is(vmae, VMA_AREA_VDSO))
 		return true;
-	/*
-	 * In turn VVAR area is special and referenced from
-	 * vDSO area by IP addressing (at least on x86) thus
-	 * never ever dump its content but always use one provided
-	 * by the kernel on restore, ie runtime VVAR area must
-	 * be remapped into proper place..
-	 */
-	if (vma_entry_is(vmae, VMA_AREA_VVAR))
-		return false;
-
-	/*
-	 * Optimisation for private mapping pages, that haven't
-	 * yet being COW-ed
-	 */
-	if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE))
-		return false;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
-		return true;
-	if ((pme & (PME_PRESENT | PME_SWAP)) && !__page_is_zero(pme))
 		return true;
 
 	return false;
+}
+
+/*
+ * should_dump_page returns vaddr if an addressed page has to be dumped.
+ * Otherwise, it returns an address that has to be inspected next.
+ */
+u64 should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, bool *softdirty)
+{
+	if (vaddr >= pmc->end && pmc_fill(pmc, vaddr, vmae->end))
+		return -1;
+
+	if (pmc->regs) {
+		while (1) {
+			if (pmc->regs_idx == pmc->regs_len)
+				return pmc->end;
+			if (vaddr < pmc->regs[pmc->regs_idx].end)
+				break;
+			pmc->regs_idx++;
+		}
+		if (vaddr < pmc->regs[pmc->regs_idx].start)
+			return pmc->regs[pmc->regs_idx].start;
+		if (softdirty)
+			*softdirty = pmc->regs[pmc->regs_idx].categories & PAGE_IS_SOFT_DIRTY;
+		return vaddr;
+	} else {
+		u64 pme = pmc->map[PAGE_PFN(vaddr - pmc->start)];
+
+		/*
+		 * Optimisation for private mapping pages, that haven't
+		 * yet being COW-ed
+		 */
+		if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE))
+			return vaddr + PAGE_SIZE;
+		if ((pme & (PME_PRESENT | PME_SWAP)) && !__page_is_zero(pme)) {
+			if (softdirty)
+				*softdirty = pme & PME_SOFT_DIRTY;
+			return vaddr;
+		}
+
+		return vaddr + PAGE_SIZE;
+	}
 }
 
 bool page_is_zero(u64 pme)
@@ -162,28 +185,33 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * put the memory into the page-pipe's pipe.
  *
  * "Holes" in page-pipe are regions, that should be dumped, but
- * the memory contents is present in the pagent image set.
+ * the memory contents is present in the parent image set.
  */
 
-static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
 			 bool has_parent)
 {
-	u64 *at = &map[PAGE_PFN(*off)];
-	unsigned long pfn, nr_to_scan;
+	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
+	unsigned long vaddr;
+	bool dump_all_pages;
 	int ret = 0;
 
-	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
+	dump_all_pages = should_dump_entire_vma(vma->e);
 
-	for (pfn = 0; pfn < nr_to_scan; pfn++) {
-		unsigned long vaddr;
+	nr_scanned = 0;
+	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
 		unsigned int ppb_flags = 0;
+		bool softdirty = false;
+		u64 next;
 		int st;
 
-		if (!should_dump_page(vma->e, at[pfn]))
+		/* If dump_all_pages is true, should_dump_page is called to get pme. */
+		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
+		if (!dump_all_pages && next != vaddr) {
+			vaddr = next - PAGE_SIZE;
 			continue;
-
-		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
+		}
 
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
@@ -195,7 +223,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * page. The latter would be checked in page-xfer.
 		 */
 
-		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
+		if (has_parent && page_in_parent(softdirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
@@ -215,9 +243,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		pages[st]++;
 	}
 
-	*off += pfn * PAGE_SIZE;
-
-	cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
+	*pvaddr = vaddr;
+	cnt_add(CNT_PAGES_SCANNED, nr_scanned);
 	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
@@ -246,6 +273,12 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * so we ignore them at pre-dump.
 		 */
 		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
+			continue;
+		/*
+		 * We totally ignore MAP_HUGETLB on pre-dump.
+		 * See also generate_vma_iovs() comment.
+		 */
+		if ((vma->e->flags & MAP_HUGETLB) && skip_non_trackable)
 			continue;
 		if (vma->e->prot & PROT_READ)
 			continue;
@@ -351,11 +384,19 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
 {
-	u64 off = 0;
-	u64 *map;
+	u64 vaddr;
 	int ret;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return 0;
+	/*
+	 * In turn VVAR area is special and referenced from
+	 * vDSO area by IP addressing (at least on x86) thus
+	 * never ever dump its content but always use one provided
+	 * by the kernel on restore, ie runtime VVAR area must
+	 * be remapped into proper place..
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_VVAR))
 		return 0;
 
 	/*
@@ -403,21 +444,27 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			has_parent = false;
 	}
 
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+	/*
+	 * We want to completely ignore these VMA types on the pre-dump:
+	 * 1. VMA_AREA_AIORING because it is not soft-dirty trackable (kernel writes)
+	 * 2. MAP_HUGETLB mappings because they are not premapped and we can't use
+	 * parent images from pre-dump stages. Instead, the content is restored from
+	 * the parasite context using full memory image.
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;
 	}
 
-	map = pmc_get_map(pmc, vma);
-	if (!map)
+	if (pmc_get_map(pmc, vma))
 		return -1;
 
 	if (vma_area_is(vma, VMA_ANON_SHARED))
-		return add_shmem_area(item->pid->real, vma->e, map);
-
+		return add_shmem_area(item->pid->real, vma->e, pmc);
+	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, map, &off, has_parent);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -823,6 +870,8 @@ int prepare_mm_pid(struct pstree_item *i)
 			ri->vmas.rst_priv_size += vma_area_len(vma);
 			if (vma_has_guard_gap_hidden(vma))
 				ri->vmas.rst_priv_size += PAGE_SIZE;
+			if (vma_area_is(vma, VMA_AREA_SHSTK))
+				ri->vmas.rst_priv_size += PAGE_SIZE;
 		}
 
 		pr_info("vma 0x%" PRIx64 " 0x%" PRIx64 "\n", vma->e->start, vma->e->end);
@@ -964,6 +1013,14 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		vma->e->start -= PAGE_SIZE;
 
 	size = vma_entry_len(vma->e);
+
+	/*
+	 * map an extra page for shadow stack VMAs, it will be used as a
+	 * temporary shadow stack
+	 */
+	if (vma_area_is(vma, VMA_AREA_SHSTK))
+		size += PAGE_SIZE;
+
 	if (!vma_inherited(vma)) {
 		int flag = 0;
 		/*
@@ -1039,6 +1096,15 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 
 static inline bool vma_force_premap(struct vma_area *vma, struct list_head *head)
 {
+	/*
+	 * Shadow stack VMAs cannot be mmap()ed, they must be created using
+	 * map_shadow_stack() system call.
+	 * Premap them to reserve virtual address space and populate them
+	 * to have there contents available for later copying.
+	 */
+	if (vma_area_is(vma, VMA_AREA_SHSTK))
+		return true;
+
 	/*
 	 * On kernels with 4K guard pages, growsdown VMAs
 	 * always have one guard page at the
@@ -1120,7 +1186,7 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 			do {
 				if (pr->pe->vaddr + pr->pe->nr_pages * PAGE_SIZE <= vma->e->start)
 					continue;
-				if (pr->pe->vaddr > vma->e->end)
+				if (pr->pe->vaddr >= vma->e->end)
 					vma->e->status |= VMA_NO_PROT_WRITE;
 				break;
 			} while (pr->advance(pr));
@@ -1150,6 +1216,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_shared = 0;
 	unsigned int nr_dropped = 0;
 	unsigned int nr_compared = 0;
+	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
 	unsigned long va;
 
@@ -1225,7 +1292,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				len >>= PAGE_SHIFT;
 				nr_restored += len;
 				i += len - 1;
-				pr_debug("Enqueue page-read\n");
+
+				nr_enqueued++;
 				continue;
 			}
 
@@ -1321,7 +1389,8 @@ err_read:
 
 	pr_info("nr_restored_pages: %d\n", nr_restored);
 	pr_info("nr_shared_pages:   %d\n", nr_shared);
-	pr_info("nr_dropped_pages:   %d\n", nr_dropped);
+	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
+	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
 
 	return 0;
@@ -1333,8 +1402,6 @@ err_addr:
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 {
-	MmEntry *mm = rsti(t)->mm;
-
 	/*
 	 * There is no need to disable it if the page read doesn't
 	 * have parent. In this case VMA will be empty until
@@ -1357,8 +1424,6 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 		pr_perror("Cannot disable THP");
 		return -1;
 	}
-	if (!(mm->has_thp_disabled && mm->thp_disabled))
-		rsti(t)->has_thp_enabled = true;
 
 	return 0;
 }

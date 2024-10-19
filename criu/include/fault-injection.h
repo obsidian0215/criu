@@ -19,19 +19,15 @@ enum faults {
 	FI_HUGE_ANON_SHMEM_ID = 132,
 	FI_CANNOT_MAP_VDSO = 133,
 	FI_CORRUPT_EXTREGS = 134,
+	FI_DONT_USE_PAGEMAP_SCAN = 135,
+	FI_DUMP_CRASH = 136,
+	FI_DISABLE_FREEZE_CGROUP = 137,
+	FI_PLUGIN_CUDA_FORCE_ENABLE = 138,
 	FI_MAX,
 };
 
 static inline bool __fault_injected(enum faults f, enum faults fi_strategy)
 {
-	/*
-	 * Temporary workaround for Xen guests. Breakpoints degrade
-	 * performance linearly, so until we find out the reason,
-	 * let's disable them.
-	 */
-	if (f == FI_NO_BREAKPOINTS)
-		return true;
-
 	return fi_strategy == f;
 }
 

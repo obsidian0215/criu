@@ -1,11 +1,11 @@
 #!/bin/bash
 
 set -x
-# shellcheck disable=SC1091
+# shellcheck source=test/others/env.sh
 source ../env.sh || exit 1
 
 function gen_imgs {
-	PID=$(../loop)
+	PID=$(../loop with a very very very very very very very very very very very very long cmdline)
 	if ! $CRIU dump -v4 -o dump.log -D ./ -t "$PID"; then
 		echo "Failed to checkpoint process $PID"
 		cat dump.log
@@ -42,6 +42,14 @@ function run_test {
 
 	echo "= done"
 }
+
+UNAME_M=$(uname -m)
+
+if [ "$UNAME_M" != "x86_64" ]; then
+	# the criu-coredump script is only x86_64 aware
+	echo "criu-coredump only support x86_64. skipping."
+	exit 0
+fi
 
 gen_imgs
 run_test

@@ -17,6 +17,7 @@ int main(int argc, char **argv)
 	unsigned long orig_flags = 0, new_flags = 0;
 	unsigned long orig_madv = 0, new_madv = 0;
 	void *area;
+	int ret;
 
 	test_init(argc, argv);
 
@@ -35,8 +36,45 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
+	ret = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+	if (ret < 0) {
+		pr_perror("Getting THP-disabled flag failed");
+		return -1;
+	}
+	if (ret != 1) {
+		errno = 0;
+		fail("prctl(GET_THP_DISABLE) returned unexpected value: %d != 1", ret);
+		return -1;
+	}
+
+	test_msg("Fetch pre-migration flags/adv\n");
+	if (get_smaps_bits((unsigned long)area, &new_flags, &new_madv))
+		return -1;
+
+	errno = 0;
+	if (orig_flags != new_flags) {
+		fail("Flags changed %lx -> %lx", orig_flags, new_flags);
+		return -1;
+	}
+
+	if (orig_madv != new_madv) {
+		fail("Madvs changed %lx -> %lx", orig_madv, new_madv);
+		return -1;
+	}
+
 	test_daemon();
 	test_waitsig();
+
+	ret = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+	if (ret < 0) {
+		pr_perror("Getting post-migration THP-disabled flag failed");
+		return -1;
+	}
+	if (ret != 1) {
+		errno = 0;
+		fail("post-migration prctl(GET_THP_DISABLE) returned unexpected value: %d != 1", ret);
+		return -1;
+	}
 
 	if (prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0)) {
 		pr_perror("Enabling THP failed");
@@ -47,15 +85,14 @@ int main(int argc, char **argv)
 	if (get_smaps_bits((unsigned long)area, &new_flags, &new_madv))
 		return -1;
 
+	errno = 0;
 	if (orig_flags != new_flags) {
-		pr_err("Flags are changed %lx -> %lx\n", orig_flags, new_flags);
-		fail();
+		fail("Flags changed %lx -> %lx", orig_flags, new_flags);
 		return -1;
 	}
 
 	if (orig_madv != new_madv) {
-		pr_err("Madvs are changed %lx -> %lx\n", orig_madv, new_madv);
-		fail();
+		fail("Madvs changed %lx -> %lx", orig_madv, new_madv);
 		return -1;
 	}
 

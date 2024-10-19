@@ -26,6 +26,16 @@
 #ifndef NT_X86_XSTATE
 #define NT_X86_XSTATE 0x202 /* x86 extended state using xsave */
 #endif
+
+#ifndef NT_X86_SHSTK
+#define NT_X86_SHSTK 0x204	/* x86 shstk state */
+#endif
+
+#ifndef ARCH_SHSTK_STATUS
+#define ARCH_SHSTK_STATUS	0x5005
+#define ARCH_SHSTK_SHSTK	(1ULL << 0)
+#endif
+
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1 /* Contains copy of prstatus struct */
 #endif
@@ -220,6 +230,16 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *sigframe, struct rt_sigfr
 #define get_signed_user_reg(pregs, name) \
 	((user_regs_native(pregs)) ? (int64_t)((pregs)->native.name) : (int32_t)((pregs)->compat.name))
 
+static int get_task_fpregs(pid_t pid, user_fpregs_struct_t *xsave)
+{
+	if (ptrace(PTRACE_GETFPREGS, pid, NULL, xsave)) {
+		pr_perror("Can't obtain FPU registers for %d", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int get_task_xsave(pid_t pid, user_fpregs_struct_t *xsave)
 {
 	struct iovec iov;
@@ -232,17 +252,73 @@ static int get_task_xsave(pid_t pid, user_fpregs_struct_t *xsave)
 		return -1;
 	}
 
-	return 0;
-}
+	if ((xsave->xsave_hdr.xstate_bv & 3) != 3) {
+		// Due to init-optimisation [1] x87 FPU or SSE state may not be filled in.
+		// Since those are restored unconditionally, make sure the init values are
+		// filled by retrying with old PTRACE_GETFPREGS.
+		//
+		// [1] Intel® 64 and IA-32 Architectures Software Developer's
+		//     Manual Volume 1: Basic Architecture
+		//     Section 13.6: Processor tracking of XSAVE-managed state
+		if (get_task_fpregs(pid, xsave))
+			return -1;
+	}
 
-static int get_task_fpregs(pid_t pid, user_fpregs_struct_t *xsave)
-{
-	if (ptrace(PTRACE_GETFPREGS, pid, NULL, xsave)) {
-		pr_perror("Can't obtain FPU registers for %d", pid);
-		return -1;
+	/*
+	 * xsave may be on stack, if we don't clear it explicitly we get
+	 * funky shadow stack state
+	 */
+	memset(&xsave->cet, 0, sizeof(xsave->cet));
+	if (compel_cpu_has_feature(X86_FEATURE_SHSTK)) {
+		unsigned long ssp = 0;
+		unsigned long features = 0;
+
+		if (ptrace(PTRACE_ARCH_PRCTL, pid, (unsigned long)&features, ARCH_SHSTK_STATUS)) {
+			/*
+			 * kernels that don't support shadow stack return
+			 * -EINVAL
+			 */
+			if (errno == EINVAL)
+				return 0;
+
+			pr_perror("shstk: can't get shadow stack status for %d", pid);
+			return -1;
+		}
+
+		if (!(features & ARCH_SHSTK_SHSTK))
+			return 0;
+
+		iov.iov_base = &ssp;
+		iov.iov_len = sizeof(ssp);
+
+		if (ptrace(PTRACE_GETREGSET, pid, (unsigned int)NT_X86_SHSTK, &iov) < 0) {
+			/* ENODEV means CET is not supported by the CPU  */
+			if (errno != ENODEV) {
+				pr_perror("shstk: can't get SSP for %d", pid);
+				return -1;
+			}
+		}
+
+		xsave->cet.cet = features;
+		xsave->cet.ssp = ssp;
+
+		pr_debug("%d: shstk: cet: %lx ssp: %lx\n", pid, xsave->cet.cet, xsave->cet.ssp);
 	}
 
 	return 0;
+}
+
+static inline void fixup_mxcsr(struct xsave_struct *xsave)
+{
+	/*
+	 * Right now xsave->i387.mxcsr filled with the random garbage,
+	 * let's make it valid by applying mask which allows all
+	 * features, except the denormals-are-zero feature bit.
+	 *
+	 * See also fpu__init_system_mxcsr function:
+	 * https://github.com/torvalds/linux/blob/8cb1ae19/arch/x86/kernel/fpu/init.c#L117
+	 */
+	xsave->i387.mxcsr &= 0x0000ffbf;
 }
 
 /* See arch/x86/kernel/fpu/xstate.c */
@@ -272,17 +348,6 @@ static void validate_random_xstate(struct xsave_struct *xsave)
 
 	/* No reserved bits may be set */
 	memset(&hdr->reserved, 0, sizeof(hdr->reserved));
-
-	/*
-	 * While using PTRACE_SETREGSET the kernel checks that
-	 * "Reserved bits in MXCSR must be zero."
-	 * if (mxcsr[0] & ~mxcsr_feature_mask)
-	 *	return -EINVAL;
-	 *
-	 * As the mxcsr_feature_mask depends on the CPU the easiest solution for
-	 * this error injection test is to set mxcsr just to zero.
-	 */
-	xsave->i387.mxcsr = 0;
 }
 
 /*
@@ -309,6 +374,8 @@ static int corrupt_extregs(pid_t pid)
 	 */
 	pr_err("Corrupting %s for %d, seed %u\n", use_xsave ? "xsave" : "fpuregs", pid, init_seed);
 
+	fixup_mxcsr(&ext_regs);
+
 	if (!use_xsave) {
 		if (ptrace(PTRACE_SETFPREGS, pid, NULL, &ext_regs)) {
 			pr_perror("Can't set FPU registers for %d", pid);
@@ -330,10 +397,9 @@ static int corrupt_extregs(pid_t pid)
 	return 0;
 }
 
-int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *ext_regs, save_regs_t save,
+int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *xs, save_regs_t save,
 			 void *arg, unsigned long flags)
 {
-	user_fpregs_struct_t xsave = {}, *xs = ext_regs ? ext_regs : &xsave;
 	int ret = -1;
 
 	pr_info("Dumping general registers for %d in %s mode\n", pid, user_regs_native(regs) ? "native" : "compat");
@@ -584,6 +650,7 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 
 int ptrace_set_breakpoint(pid_t pid, void *addr)
 {
+	k_rtsigset_t block;
 	int ret;
 
 	/* Set a breakpoint */
@@ -599,6 +666,16 @@ int ptrace_set_breakpoint(pid_t pid, void *addr)
 		return -1;
 	}
 
+	/*
+	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
+	 * will be reset to the default one.
+	 */
+	ksigfillset(&block);
+	ksigdelset(&block, SIGTRAP);
+	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
+		pr_perror("Can't block signals for %d", pid);
+		return -1;
+	}
 	ret = ptrace(PTRACE_CONT, pid, NULL, NULL);
 	if (ret) {
 		pr_perror("Unable to restart the  stopped tracee process %d", pid);
@@ -671,4 +748,60 @@ int ptrace_set_regs(pid_t pid, user_regs_struct_t *regs)
 unsigned long compel_task_size(void)
 {
 	return TASK_SIZE;
+}
+
+bool __compel_shstk_enabled(user_fpregs_struct_t *ext_regs)
+{
+	if (!compel_cpu_has_feature(X86_FEATURE_SHSTK))
+		return false;
+
+	if (ext_regs->cet.cet & ARCH_SHSTK_SHSTK)
+		return true;
+
+	return false;
+}
+
+int parasite_setup_shstk(struct parasite_ctl *ctl, user_fpregs_struct_t *ext_regs)
+{
+	pid_t pid = ctl->rpid;
+	unsigned long sa_restorer = ctl->parasite_ip;
+	unsigned long long ssp;
+	unsigned long token;
+	struct iovec iov;
+
+	if (!compel_shstk_enabled(ext_regs))
+		return 0;
+
+	iov.iov_base = &ssp;
+	iov.iov_len = sizeof(ssp);
+	if (ptrace(PTRACE_GETREGSET, pid, (unsigned int)NT_X86_SHSTK, &iov) < 0) {
+		/* ENODEV means CET is not supported by the CPU  */
+		if (errno != ENODEV) {
+			pr_perror("shstk: %d: cannot get SSP", pid);
+			return -1;
+		}
+	}
+
+	/* The token is for 64-bit */
+	token = ALIGN_DOWN(ssp, 8);
+	token |= (1UL << 63);
+	ssp = ALIGN_DOWN(ssp, 8) - 8;
+	if (ptrace(PTRACE_POKEDATA, pid, (void *)ssp, token)) {
+		pr_perror("shstk: %d: failed to inject shadow stack token", pid);
+		return -1;
+	}
+
+	ssp = ssp - sizeof(uint64_t);
+	if (ptrace(PTRACE_POKEDATA, pid, (void *)ssp, sa_restorer)) {
+		pr_perror("shstk: %d: failed to inject restorer address", pid);
+		return -1;
+	}
+
+	ssp = ssp + sizeof(uint64_t);
+	if (ptrace(PTRACE_SETREGSET, pid, (unsigned int)NT_X86_SHSTK, &iov) < 0) {
+		pr_perror("shstk: %d: cannot write SSP", pid);
+		return -1;
+	}
+
+	return 0;
 }

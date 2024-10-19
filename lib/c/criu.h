@@ -50,6 +50,7 @@ enum criu_cg_mode {
 enum criu_network_lock_method {
 	CRIU_NETWORK_LOCK_IPTABLES = 1,
 	CRIU_NETWORK_LOCK_NFTABLES = 2,
+	CRIU_NETWORK_LOCK_SKIP = 3,
 };
 
 enum criu_pre_dump_mode { CRIU_PRE_DUMP_SPLICE = 1, CRIU_PRE_DUMP_READ = 2 };
@@ -78,6 +79,8 @@ void criu_set_tcp_close(bool tcp_close);
 void criu_set_weak_sysctls(bool val);
 void criu_set_evasive_devices(bool evasive_devices);
 void criu_set_shell_job(bool shell_job);
+void criu_set_skip_file_rwx_check(bool skip_file_rwx_check);
+void criu_set_unprivileged(bool unprivileged);
 void criu_set_orphan_pts_master(bool orphan_pts_master);
 void criu_set_file_locks(bool file_locks);
 void criu_set_track_mem(bool track_mem);
@@ -238,6 +241,7 @@ void criu_local_set_tcp_close(criu_opts *opts, bool tcp_close);
 void criu_local_set_weak_sysctls(criu_opts *opts, bool val);
 void criu_local_set_evasive_devices(criu_opts *opts, bool evasive_devices);
 void criu_local_set_shell_job(criu_opts *opts, bool shell_job);
+void criu_local_set_skip_file_rwx_check(criu_opts *opts, bool skip_file_rwx_check);
 void criu_local_set_orphan_pts_master(criu_opts *opts, bool orphan_pts_master);
 void criu_local_set_file_locks(criu_opts *opts, bool file_locks);
 void criu_local_set_track_mem(criu_opts *opts, bool track_mem);
@@ -318,6 +322,9 @@ struct criu_feature_check {
 
 int criu_feature_check(struct criu_feature_check *features, size_t size);
 int criu_local_feature_check(criu_opts *opts, struct criu_feature_check *features, size_t size);
+
+void criu_local_set_empty_ns(criu_opts *opts, int namespaces);
+void criu_set_empty_ns(int namespaces);
 
 #ifdef __GNUG__
 }

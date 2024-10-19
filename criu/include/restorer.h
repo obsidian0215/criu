@@ -56,6 +56,10 @@ struct restore_posix_timer {
 	int overrun;
 };
 
+#ifndef rst_shstk_info
+struct rst_shstk_info {};
+#endif
+
 /*
  * We should be able to construct fpu sigframe in sigreturn_prep_fpu_frame,
  * so the mem_zone.rt_sigframe should be 64-bytes aligned. To make things
@@ -72,7 +76,6 @@ struct thread_creds_args {
 	u32 cap_eff[CR_CAP_SIZE];
 	u32 cap_bnd[CR_CAP_SIZE];
 
-	unsigned int secbits;
 	char *lsm_profile;
 	unsigned int *groups;
 	char *lsm_sockcreate;
@@ -120,7 +123,11 @@ struct thread_restore_args {
 	unsigned int seccomp_filters_n;
 	bool seccomp_force_tsync;
 
+	struct rst_shstk_info shstk;
+
 	char comm[TASK_COMM_LEN];
+	int cg_set;
+	int cgroupd_sk;
 } __aligned(64);
 
 typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
@@ -142,7 +149,7 @@ struct task_restore_args {
 	struct timeval logstart;
 
 	int uffd;
-	bool has_thp_enabled;
+	bool thp_disabled;
 
 	/* threads restoration */
 	int nr_threads;				 /* number of threads */
@@ -228,6 +235,7 @@ struct task_restore_args {
 #endif
 	int lsm_type;
 	int child_subreaper;
+	int membarrier_registration_mask;
 	bool has_clone3_set_tid;
 
 	/*
@@ -235,6 +243,11 @@ struct task_restore_args {
 	 * unregister it before memory restoration procedure
 	 */
 	struct rst_rseq_param libc_rseq;
+
+	uid_t uid;
+	u32 cap_eff[CR_CAP_SIZE];
+
+	struct rst_shstk_info shstk;
 } __aligned(64);
 
 /*
@@ -325,5 +338,21 @@ enum {
 
 #define __r_sym(name)		  restorer_sym##name
 #define restorer_sym(rblob, name) (void *)(rblob + __r_sym(name))
+
+#ifndef arch_shstk_switch_to_restorer
+static inline int arch_shstk_switch_to_restorer(struct rst_shstk_info *shstk)
+{
+	return 0;
+}
+#define arch_shstk_switch_to_restorer arch_shstk_switch_to_restorer
+#endif
+
+#ifndef arch_shstk_restore
+static inline int arch_shstk_restore(struct rst_shstk_info *shstk)
+{
+	return 0;
+}
+#define arch_shstk_restore arch_shstk_restore
+#endif
 
 #endif /* __CR_RESTORER_H__ */

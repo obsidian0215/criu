@@ -26,8 +26,12 @@ enum fsconfig_command {
 	FSCONFIG_CMD_RECONFIGURE = 7, /* Invoke superblock reconfiguration */
 #define FSCONFIG_CMD_RECONFIGURE FSCONFIG_CMD_RECONFIGURE
 };
+
 #endif // FSOPEN_CLOEXEC
 
+/* fsopen flags. With the redundant definition, we check if the kernel,
+ * glibc value and our value still match.
+ */
 #define FSOPEN_CLOEXEC 0x00000001
 
 #ifndef MS_MGC_VAL

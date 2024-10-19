@@ -4,6 +4,9 @@ import ctypes.util
 import errno
 import sys
 import os
+import fcntl
+import termios
+import time
 
 # <sched.h> constants for unshare
 CLONE_NEWNS = 0x00020000
@@ -68,7 +71,19 @@ def _wait_for_process_status(criu_pid):
         try:
             (pid, status) = os.wait()
             if pid == criu_pid:
-                return os.waitstatus_to_exitcode(status)
+                # The following code block is based on
+                # os.waitstatus_to_exitcode() introduced in Python 3.9
+                # and we implement this for comparability with older
+                # versions of Python.
+                if os.WIFSIGNALED(status):
+                    return os.WTERMSIG(status)
+                elif os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                elif os.WIFSTOPPED(status):
+                    return os.WSTOPSIG(status)
+                else:
+                    raise Exception("CRIU was terminated by an "
+                                    "unidentified reason")
         except OSError:
             return -251
 
@@ -78,8 +93,21 @@ def run_criu(args):
     Spawn CRIU binary
     """
     print(sys.argv)
-    os.execlp('criu', *['criu'] + args)
-    raise OSError(errno.ENOENT, "No such command")
+
+    if "--criu-binary" in args:
+        try:
+            opt_index = args.index("--criu-binary")
+            path = args[opt_index + 1]
+            del args[opt_index:opt_index + 2]
+            args.insert(0, "criu")
+            os.execv(path, args)
+            raise OSError(errno.ENOENT, "No such command")
+        except (ValueError, IndexError, FileNotFoundError):
+            raise OSError(errno.ENOENT, "--criu-binary missing argument")
+    else:
+        args.insert(0, "criu")
+        os.execvp("criu", args)
+        raise OSError(errno.ENOENT, "No such command")
 
 
 # pidns_holder creates a process that is reparented to the init.
@@ -108,8 +136,8 @@ def wrap_restore():
     if '--restore-sibling' in restore_args:
         raise OSError(errno.EINVAL, "--restore-sibling is not supported")
 
-    # Unshare pid and mount namespaces
-    if _unshare(CLONE_NEWNS | CLONE_NEWPID) != 0:
+    # Unshare pid namespace
+    if _unshare(CLONE_NEWPID) != 0:
         _errno = ctypes.get_errno()
         raise OSError(_errno, errno.errorcode[_errno])
 
@@ -121,11 +149,64 @@ def wrap_restore():
         restore_detached = True
         restore_args.remove('--restore-detached')
 
+    restore_pidfile = None
+    if '--pidfile' in restore_args:
+        try:
+            opt_index = restore_args.index('--pidfile')
+            restore_pidfile = restore_args[opt_index + 1]
+            del restore_args[opt_index:opt_index + 2]
+        except (ValueError, IndexError, FileNotFoundError):
+            raise OSError(errno.ENOENT, "--pidfile missing argument")
+
+        if not restore_pidfile.startswith('/'):
+            for base_dir_opt in ['--work-dir', '-W', '--images-dir', '-D']:
+                if base_dir_opt in restore_args:
+                    try:
+                        opt_index = restore_args.index(base_dir_opt)
+                        restore_pidfile = os.path.join(restore_args[opt_index + 1], restore_pidfile)
+                        break
+                    except (ValueError, IndexError, FileNotFoundError):
+                        raise OSError(errno.ENOENT, base_dir_opt + " missing argument")
+
     criu_pid = os.fork()
     if criu_pid == 0:
+        # Unshare mount namespace
+        if _unshare(CLONE_NEWNS) != 0:
+            _errno = ctypes.get_errno()
+            raise OSError(_errno, errno.errorcode[_errno])
+
         os.setsid()
+        # Set stdin tty to be a controlling tty of our new session, this is
+        # required by --shell-job option, as for it CRIU would try to set a
+        # process group of restored root task to be a foreground group on the
+        # terminal.
+        if '--shell-job' in restore_args or '-j' in restore_args:
+            if os.isatty(sys.stdin.fileno()):
+                fcntl.ioctl(sys.stdin.fileno(), termios.TIOCSCTTY, 1)
+            else:
+                raise OSError(errno.EINVAL, 'The stdin is not a tty for a --shell-job')
+
         _mount_new_proc()
         run_criu(restore_args)
+
+    if restore_pidfile:
+        restored_pid = None
+        retry = 5
+
+        while not restored_pid and retry:
+            with open('/proc/%d/task/%d/children' % (criu_pid, criu_pid)) as f:
+                line = f.readline().strip()
+                if len(line):
+                    restored_pid = line
+                    break
+            retry -= 1
+            time.sleep(1)
+
+        if restored_pid:
+            with open(restore_pidfile, 'w+') as f:
+                f.write(restored_pid)
+        else:
+            print("Warn: Search of restored pid for --pidfile option timeouted")
 
     if restore_detached:
         return 0
@@ -135,7 +216,7 @@ def wrap_restore():
 
 def get_varg(args):
     for i in range(1, len(sys.argv)):
-        if not sys.argv[i] in args:
+        if sys.argv[i] not in args:
             continue
 
         if i + 1 >= len(sys.argv):
@@ -153,9 +234,9 @@ def _set_namespace(fd):
         raise OSError(_errno, errno.errorcode[_errno])
 
 
-def is_my_namespace(fd):
+def is_my_namespace(fd, ns):
     """Returns True if fd refers to current namespace"""
-    return os.stat('/proc/self/ns/pid').st_ino != os.fstat(fd).st_ino
+    return os.stat('/proc/self/ns/%s' % ns).st_ino == os.fstat(fd).st_ino
 
 
 def set_pidns(tpid, pid_idx):
@@ -165,7 +246,7 @@ def set_pidns(tpid, pid_idx):
     pid namespace.
     """
     ns_fd = os.open('/proc/%s/ns/pid' % tpid, os.O_RDONLY)
-    if is_my_namespace(ns_fd):
+    if not is_my_namespace(ns_fd, "pid"):
         for line in open('/proc/%s/status' % tpid):
             if not line.startswith('NSpid:'):
                 continue
@@ -190,7 +271,7 @@ def set_mntns(tpid):
     will be the same in target mntns.
     """
     ns_fd = os.open('/proc/%s/ns/mnt' % tpid, os.O_RDONLY)
-    if is_my_namespace(ns_fd):
+    if not is_my_namespace(ns_fd, "mnt"):
         root_st = os.stat('/')
         cwd_st = os.stat('.')
         cwd_path = os.path.realpath('.')

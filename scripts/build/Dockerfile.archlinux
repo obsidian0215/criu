@@ -2,6 +2,9 @@ FROM docker.io/library/archlinux:latest
 
 ARG CC=gcc
 
+# Initialize machine ID
+RUN systemd-machine-id-setup
+
 RUN pacman -Syu --noconfirm \
 	$CC \
 	bash \
@@ -28,9 +31,10 @@ RUN pacman -Syu --noconfirm \
 	bash \
 	go \
 	python-yaml \
-	flake8 \
 	asciidoctor \
 	python-junit-xml \
+	python-importlib-metadata \
+	libdrm \
 	diffutils
 
 COPY . /criu

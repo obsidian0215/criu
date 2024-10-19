@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <sched.h>
+#include <sys/prctl.h>
 
 #include "version.h"
 #include "crtools.h"
@@ -239,6 +240,49 @@ int send_criu_rpc_script(enum script_actions act, char *name, int sk, int fd)
 	return 0;
 }
 
+int exec_rpc_query_external_files(char *name, int sk)
+{
+	int i, ret;
+	CriuNotify cn = CRIU_NOTIFY__INIT;
+	CriuResp msg = CRIU_RESP__INIT;
+	CriuReq *req;
+
+	cn.script = name;
+
+	msg.type = CRIU_REQ_TYPE__NOTIFY;
+	msg.success = true;
+	msg.notify = &cn;
+
+	ret = send_criu_msg_with_fd(sk, &msg, -1);
+	if (ret < 0)
+		return ret;
+
+	ret = recv_criu_msg(sk, &req);
+	if (ret < 0)
+		return ret;
+
+	if (req->type != CRIU_REQ_TYPE__NOTIFY || !req->notify_success) {
+		pr_err("RPC client reported script error\n");
+		return -1;
+	}
+
+	ret = 0;
+	if (req->opts)
+		for (i = 0; i < req->opts->n_external; i++) {
+			char *key = req->opts->external[i];
+			pr_info("Adding external object: %s\n", key);
+			if (add_external(key)) {
+				pr_err("Failed to add external object: %s\n", key);
+				ret = -1;
+			}
+		}
+	else
+		pr_info("RPC NOTIFY %s: no `opts` returned.\n", name);
+
+	criu_req__free_unpacked(req, NULL);
+	return ret;
+}
+
 static char images_dir[PATH_MAX];
 
 static int setup_opts_from_req(int sk, CriuOpts *req)
@@ -338,8 +382,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 */
 	if (imgs_changed_by_rpc_conf)
 		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
-	else
+	else if (req->images_dir_fd != -1)
 		sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd);
+	else if (req->images_dir)
+		strncpy(images_dir_path, req->images_dir, PATH_MAX - 1);
+	else {
+		pr_err("Neither images_dir_fd nor images_dir was passed by RPC client.\n");
+		goto err;
+	}
 
 	if (req->parent_img)
 		SET_CHAR_OPTS(img_parent, req->parent_img);
@@ -393,6 +443,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 
 		SET_CHAR_OPTS(output, req->log_file);
+	} else if (req->has_log_to_stderr && req->log_to_stderr && !output_changed_by_rpc_conf) {
+		xfree(opts.output);
+		opts.output = NULL;
 	} else if (!opts.output) {
 		SET_CHAR_OPTS(output, DEFAULT_LOG_FILENAME);
 	}
@@ -409,6 +462,12 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		pr_debug("Would overwrite RPC settings with values from %s\n", req->config_file);
 	}
 
+	if (req->has_unprivileged)
+		opts.unprivileged = req->unprivileged;
+
+	if (check_caps())
+		return 1;
+
 	if (kerndat_init())
 		return 1;
 
@@ -420,6 +479,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	/* checking flags from client */
 	if (req->has_leave_running && req->leave_running)
 		opts.final_state = TASK_ALIVE;
+
+	if (req->has_leave_stopped && req->leave_stopped)
+		opts.final_state = TASK_STOPPED;
 
 	if (!req->has_pid) {
 		req->has_pid = true;
@@ -463,6 +525,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_shell_job)
 		opts.shell_job = req->shell_job;
+
+	if (req->has_skip_file_rwx_check)
+		opts.skip_file_rwx_check = req->skip_file_rwx_check;
 
 	if (req->has_file_locks)
 		opts.handle_file_locks = req->file_locks;
@@ -509,6 +574,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			break;
 		case CRIU_NETWORK_LOCK_METHOD__NFTABLES:
 			opts.network_lock_method = NETWORK_LOCK_NFTABLES;
+			break;
+		case CRIU_NETWORK_LOCK_METHOD__SKIP:
+			opts.network_lock_method = NETWORK_LOCK_SKIP;
 			break;
 		default:
 			goto err;
@@ -710,6 +778,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->orphan_pts_master)
 		opts.orphan_pts_master = true;
 
+	if (req->has_display_stats)
+		opts.display_stats = req->display_stats;
+
 	/* Evaluate additional configuration file a second time to overwrite
 	 * all RPC settings. */
 	if (req->config_file) {
@@ -742,7 +813,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
+	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
 	if (init_pidfd_store_hash())
 		goto pidfd_store_err;
@@ -785,7 +856,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("restore --rpc -D %s", images_dir);
+	__setproctitle("restore --rpc -D %s", images_dir);
 
 	if (cr_restore_tasks())
 		goto exit;
@@ -831,7 +902,7 @@ static int check(int sk, CriuOpts *req)
 	}
 
 	if (pid == 0) {
-		setproctitle("check --rpc");
+		__setproctitle("check --rpc");
 
 		opts.mode = CR_CHECK;
 		if (setup_opts_from_req(sk, req))
@@ -869,7 +940,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 		if (setup_opts_from_req(sk, req))
 			goto cout;
 
-		setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
+		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
 
 		if (init_pidfd_store_hash())
 			goto pidfd_store_err;
@@ -947,7 +1018,7 @@ static int start_page_server_req(int sk, CriuOpts *req, bool daemon_mode)
 		if (setup_opts_from_req(sk, req))
 			goto out_ch;
 
-		setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
+		__setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
 
 		pr_debug("Starting page server\n");
 
@@ -1107,7 +1178,7 @@ static int handle_feature_check(int sk, CriuReq *msg)
 		if (kerndat_init())
 			exit(1);
 
-		setproctitle("feature-check --rpc");
+		__setproctitle("feature-check --rpc");
 
 		if ((msg->features->has_mem_track == 1) && (msg->features->mem_track == true))
 			feat.mem_track = kdat.has_dirty_track;
@@ -1194,8 +1265,8 @@ static int handle_cpuinfo(int sk, CriuReq *msg)
 		if (setup_opts_from_req(sk, msg->opts))
 			goto cout;
 
-		setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
-			     images_dir);
+		__setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
+			       images_dir);
 
 		if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP)
 			ret = cpuinfo_dump();

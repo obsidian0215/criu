@@ -18,6 +18,7 @@ extern int __must_check compel_interrupt_task(int pid);
 struct seize_task_status {
 	unsigned long long sigpnd;
 	unsigned long long shdpnd;
+	unsigned long long sigblk;
 	char state;
 	int vpid;
 	int ppid;
@@ -30,7 +31,9 @@ extern int __must_check compel_wait_task(int pid, int ppid,
 					 struct seize_task_status *st, void *data);
 
 extern int __must_check compel_stop_task(int pid);
+extern int __must_check compel_parse_stop_signo(int pid);
 extern int compel_resume_task(pid_t pid, int orig_state, int state);
+extern int compel_resume_task_sig(pid_t pid, int orig_state, int state, int stop_signo);
 
 struct parasite_ctl;
 struct parasite_thread_ctl;
@@ -38,9 +41,12 @@ struct parasite_thread_ctl;
 extern struct parasite_ctl __must_check *compel_prepare(int pid);
 extern struct parasite_ctl __must_check *compel_prepare_noctx(int pid);
 extern int __must_check compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned long args_size);
+extern int __must_check compel_infect_no_daemon(struct parasite_ctl *ctl, unsigned long nr_threads,
+						unsigned long args_size);
 extern struct parasite_thread_ctl __must_check *compel_prepare_thread(struct parasite_ctl *ctl, int pid);
 extern void compel_release_thread(struct parasite_thread_ctl *);
 
+extern int __must_check compel_start_daemon(struct parasite_ctl *ctl);
 extern int __must_check compel_stop_daemon(struct parasite_ctl *ctl);
 extern int __must_check compel_cure_remote(struct parasite_ctl *ctl);
 extern int __must_check compel_cure_local(struct parasite_ctl *ctl);
@@ -77,9 +83,9 @@ enum trace_flags {
 	TRACE_EXIT,
 };
 
-extern int __must_check compel_stop_on_syscall(int tasks, int sys_nr, int sys_nr_compat, enum trace_flags trace);
+extern int __must_check compel_stop_on_syscall(int tasks, int sys_nr, int sys_nr_compat);
 
-extern int __must_check compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp);
+extern int __must_check compel_stop_pie(pid_t pid, void *addr, bool no_bp);
 
 extern int __must_check compel_unmap(struct parasite_ctl *ctl, unsigned long addr);
 
@@ -114,6 +120,7 @@ struct infect_ctx {
 	open_proc_fn open_proc;
 
 	int log_fd; /* fd for parasite code to send messages to */
+	unsigned long remote_map_addr; /* User-specified address where to mmap parasitic code, default not set */
 };
 
 extern struct infect_ctx *compel_infect_ctx(struct parasite_ctl *);
@@ -173,5 +180,24 @@ extern uint64_t compel_get_thread_ip(struct parasite_thread_ctl *tctl);
 
 void compel_set_leader_ip(struct parasite_ctl *ctl, uint64_t v);
 void compel_set_thread_ip(struct parasite_thread_ctl *tctl, uint64_t v);
+
+extern void compel_get_stack(struct parasite_ctl *ctl, void **rstack, void **r_thread_stack);
+
+#ifndef compel_shstk_enabled
+static inline bool compel_shstk_enabled(user_fpregs_struct_t *ext_regs)
+{
+	return false;
+}
+#define compel_shstk_enabled
+#endif
+
+#ifndef parasite_setup_shstk
+static inline int parasite_setup_shstk(struct parasite_ctl *ctl,
+				       user_fpregs_struct_t *ext_regs)
+{
+	return 0;
+}
+#define parasite_setup_shstk parasite_setup_shstk
+#endif
 
 #endif

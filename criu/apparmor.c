@@ -108,7 +108,7 @@ static int collect_profile(char *path, int offset, char *dir, AaNamespace *ns)
 		return -1;
 	aa_policy__init(cur);
 
-	strlcat(path + my_offset, "name", PATH_MAX - my_offset);
+	__strlcat(path + my_offset, "name", PATH_MAX - my_offset);
 	f = fopen(path, "r");
 	if (!f) {
 		xfree(cur);
@@ -124,7 +124,7 @@ static int collect_profile(char *path, int offset, char *dir, AaNamespace *ns)
 		return -1;
 	}
 
-	strlcpy(path + my_offset, "raw_data", PATH_MAX - my_offset);
+	__strlcpy(path + my_offset, "raw_data", PATH_MAX - my_offset);
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
 		pr_perror("failed to open aa policy %s", path);
@@ -207,8 +207,6 @@ static int by_time(const struct dirent **de1, const struct dirent **de2)
 	} else {
 		if (sb1.st_mtim.tv_sec < sb2.st_mtim.tv_sec)
 			return -1;
-		if (sb1.st_mtim.tv_sec == sb2.st_mtim.tv_sec)
-			return 0;
 		return 1;
 	}
 }
@@ -471,6 +469,7 @@ static void *get_suspend_policy(char *name, off_t *len)
 	ret = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (ret == MAP_FAILED) {
 		pr_perror("mmap of %s failed", file);
+		ret = NULL;
 		goto out;
 	}
 
@@ -520,13 +519,13 @@ static int write_aa_policy(AaNamespace *ns, char *path, int offset, char *rewrit
 
 			tmp = *end;
 			*end = 0;
-			strlcpy(namespace, rewrite_pos + 1, sizeof(namespace));
+			__strlcpy(namespace, rewrite_pos + 1, sizeof(namespace));
 			*end = tmp;
 
 			break;
 		}
 		default:
-			strlcpy(namespace, ns->name, sizeof(namespace));
+			__strlcpy(namespace, ns->name, sizeof(namespace));
 			for (i = 0; i < ns->n_policies; i++) {
 				if (strcmp(ns->policies[i]->name, rewrite_pos))
 					pr_warn("binary rewriting of apparmor policies not supported right now, not renaming %s to %s\n",
@@ -551,8 +550,8 @@ static int write_aa_policy(AaNamespace *ns, char *path, int offset, char *rewrit
 			goto fail;
 	}
 
-	ret = snprintf(path + offset + my_offset, sizeof(path) - offset - my_offset, "/.replace");
-	if (ret < 0 || ret >= sizeof(path) - offset - my_offset) {
+	ret = snprintf(path + offset + my_offset, PATH_MAX - offset - my_offset, "/.replace");
+	if (ret < 0 || ret >= PATH_MAX - offset - my_offset) {
 		pr_err("snprintf failed\n");
 		goto fail;
 	}

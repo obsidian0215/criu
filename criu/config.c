@@ -430,6 +430,7 @@ void init_opts(void)
 	opts.pre_dump_mode = PRE_DUMP_SPLICE;
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
+	opts.ghost_fiemap = FIEMAP_DEFAULT;
 }
 
 bool deprecated_ok(char *what)
@@ -696,15 +697,21 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "cgroup-yard", required_argument, 0, 1096 },
 		{ "pre-dump-mode", required_argument, 0, 1097 },
 		{ "file-validation", required_argument, 0, 1098 },
+		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
+		BOOL_OPT("unprivileged", &opts.unprivileged),
+		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT("use-dirty-map",&opts.use_dirty_map),
 		{ "dirty-map-dir", required_argument, 0, 1200 },
 		{},
 	};
 
 #undef BOOL_OPT
+
+	if (argv && argv[0])
+		SET_CHAR_OPTS(argv_0, argv[0]);
 
 	ret = pre_parse(argc, argv, usage_error, &no_default_config, &cfg_file);
 
@@ -1031,6 +1038,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				opts.network_lock_method = NETWORK_LOCK_IPTABLES;
 			} else if (!strcmp("nftables", optarg)) {
 				opts.network_lock_method = NETWORK_LOCK_NFTABLES;
+			} else if (!strcmp("skip", optarg) || !strcmp("none", optarg)) {
+				opts.network_lock_method = NETWORK_LOCK_SKIP;
 			} else {
 				pr_err("Invalid value for --network-lock: %s\n", optarg);
 				return 1;
@@ -1118,6 +1127,11 @@ int check_options(void)
 			pr_debug("Mount engine fallback to --mntns-compat-mode mode\n");
 			opts.mntns_compat_mode = true;
 		}
+	}
+
+	if (opts.track_mem && !kdat.has_dirty_track) {
+		pr_err("Tracking memory is not available. Consider omitting --track-mem option.\n");
+		return 1;
 	}
 
 	if (check_namespace_opts()) {

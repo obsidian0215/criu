@@ -35,13 +35,15 @@
  *  - stack
  *  	the memory area is used in application stack so we
  *  	should be careful about guard page here
+ *  - shadow stack
+ *      the memory area is used by shadow stack
  *  - vsyscall
  *  	special memory area injected into the task memory
  *  	space by the kernel itself, represent virtual syscall
  *  	implementation and it is specific to every kernel version,
  *  	its contents should not be dumped ever
  *  - vdso,vvar
- *  	the vDSO area, it might reqire additional memory
+ *  	the vDSO area, it might require additional memory
  *  	contents modification especially when tasks are
  *  	migrating between different kernel versions
  *  - heap
@@ -84,6 +86,7 @@
 #define VMA_AREA_VVAR	 (1 << 12)
 #define VMA_AREA_AIORING (1 << 13)
 #define VMA_AREA_MEMFD	 (1 << 14)
+#define VMA_AREA_SHSTK	 (1 << 15)
 
 #define VMA_EXT_PLUGIN	  (1 << 27)
 #define VMA_CLOSE	  (1 << 28)

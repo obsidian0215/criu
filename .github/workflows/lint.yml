@@ -2,6 +2,11 @@ name: Run code linter
 
 on: [push, pull_request]
 
+# Cancel any preceding run on the pull request.
+concurrency:
+  group: lint-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/criu-dev' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -9,9 +14,9 @@ jobs:
       image: registry.fedoraproject.org/fedora:latest
     steps:
     - name: Install tools
-      run: sudo dnf -y install git make python3-flake8 ShellCheck clang-tools-extra which findutils codespell
+      run: sudo dnf -y install git make ruff xz clang-tools-extra which codespell git-clang-format ShellCheck
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set git safe directory
       # https://github.com/actions/checkout/issues/760
@@ -21,13 +26,15 @@ jobs:
       run: make lint
 
     - name: Run make indent
-      run: >
-        make indent &&
-        STATUS=$(git status --porcelain) &&
-        if [ ! -z "$STATUS" ]; then
-          echo "FAIL: some files are not correctly formatted.";
-          echo "$STATUS"
-          git diff
-          echo "FAIL: please run 'make indent'";
-          exit 1;
+      continue-on-error: true
+      run: |
+        if [ -z "${{github.base_ref}}" ]; then
+          git fetch --deepen=1
+          make indent
+        else
+          git fetch origin ${{github.base_ref}}
+          make indent BASE=origin/${{github.base_ref}}
         fi
+    - name: Raise in-line make indent warnings
+      run: |
+        git diff | ./scripts/github-indent-warnings.py

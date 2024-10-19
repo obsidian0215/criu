@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <sys/prctl.h>
 #include <grp.h>
-#include <sys/socket.h>
 #include <sys/un.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -28,6 +27,7 @@
 #include "cgroup.h"
 #include "fdstore.h"
 #include "kerndat.h"
+#include "util-caps.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -284,7 +284,6 @@ int restore_ns(int rst, struct ns_desc *nd)
 
 int switch_mnt_ns(int pid, int *rst, int *cwd_fd)
 {
-	int ret;
 	int fd;
 
 	if (!cwd_fd)
@@ -293,13 +292,12 @@ int switch_mnt_ns(int pid, int *rst, int *cwd_fd)
 	fd = open(".", O_PATH);
 	if (fd < 0) {
 		pr_perror("unable to open current directory");
-		return fd;
+		return -1;
 	}
 
-	ret = switch_ns(pid, &mnt_ns_desc, rst);
-	if (ret < 0) {
+	if (switch_ns(pid, &mnt_ns_desc, rst)) {
 		close(fd);
-		return ret;
+		return -1;
 	}
 
 	*cwd_fd = fd;
@@ -308,23 +306,22 @@ int switch_mnt_ns(int pid, int *rst, int *cwd_fd)
 
 int restore_mnt_ns(int rst, int *cwd_fd)
 {
-	int ret = -1;
+	int exit_code = -1;
 
-	ret = restore_ns(rst, &mnt_ns_desc);
-	if (ret < 0)
+	if (restore_ns(rst, &mnt_ns_desc))
 		goto err_restore;
 
-	if (cwd_fd) {
-		ret = fchdir(*cwd_fd);
-		if (ret)
-			pr_perror("unable to restore current directory");
+	if (cwd_fd && fchdir(*cwd_fd)) {
+		pr_perror("Unable to restore current directory");
+		goto err_restore;
 	}
 
+	exit_code = 0;
 err_restore:
 	if (cwd_fd)
 		close_safe(cwd_fd);
 
-	return ret;
+	return exit_code;
 }
 
 struct ns_id *ns_ids = NULL;
@@ -1217,20 +1214,9 @@ static int write_id_map(pid_t pid, UidGidExtent **extents, int n, char *id_map)
 	return 0;
 }
 
-struct unsc_msg {
-	struct msghdr h;
-	/*
-	 * 0th is the call address
-	 * 1st is the flags
-	 * 2nd is the optional (NULL in response) arguments
-	 */
-	struct iovec iov[3];
-	char c[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(sizeof(int))];
-};
-
 static int usernsd_pid;
 
-static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd)
+inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
@@ -1268,7 +1254,10 @@ static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void
 	ch->cmsg_type = SCM_CREDENTIALS;
 
 	ucred = (struct ucred *)CMSG_DATA(ch);
-	ucred->pid = getpid();
+	if (pid)
+		ucred->pid = *pid;
+	else
+		ucred->pid = getpid();
 	ucred->uid = getuid();
 	ucred->gid = getgid();
 
@@ -1283,7 +1272,7 @@ static inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void
 	}
 }
 
-static void unsc_msg_pid_fd(struct unsc_msg *um, pid_t *pid, int *fd)
+void unsc_msg_pid_fd(struct unsc_msg *um, pid_t *pid, int *fd)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
@@ -1321,7 +1310,7 @@ static int usernsd(int sk)
 		int flags, fd, ret;
 		pid_t pid;
 
-		unsc_msg_init(&um, &call, &flags, msg, sizeof(msg), 0);
+		unsc_msg_init(&um, &call, &flags, msg, sizeof(msg), 0, NULL);
 		if (recvmsg(sk, &um.h, 0) <= 0) {
 			pr_perror("uns: recv req error");
 			return -1;
@@ -1366,7 +1355,7 @@ static int usernsd(int sk)
 		else
 			fd = -1;
 
-		unsc_msg_init(&um, &call, &ret, NULL, 0, fd);
+		unsc_msg_init(&um, &call, &ret, NULL, 0, fd, NULL);
 		if (sendmsg(sk, &um.h, 0) <= 0) {
 			pr_perror("uns: send resp error");
 			return -1;
@@ -1417,7 +1406,7 @@ int __userns_call(const char *func_name, uns_call_t call, int flags, void *arg, 
 
 	/* Send the request */
 
-	unsc_msg_init(&um, &call, &flags, arg, arg_size, fd);
+	unsc_msg_init(&um, &call, &flags, arg, arg_size, fd, NULL);
 	ret = sendmsg(sk, &um.h, 0);
 	if (ret <= 0) {
 		pr_perror("uns: send req error");
@@ -1432,7 +1421,7 @@ int __userns_call(const char *func_name, uns_call_t call, int flags, void *arg, 
 
 	/* Get the response back */
 
-	unsc_msg_init(&um, &call, &res, NULL, 0, 0);
+	unsc_msg_init(&um, &call, &res, NULL, 0, 0, NULL);
 	ret = recvmsg(sk, &um.h, 0);
 	if (ret <= 0) {
 		pr_perror("uns: recv resp error");
@@ -1453,13 +1442,10 @@ out:
 	return ret;
 }
 
-static int start_usernsd(void)
+int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk))
 {
 	int sk[2];
 	int one = 1;
-
-	if (!(root_ns_mask & CLONE_NEWUSER))
-		return 0;
 
 	/*
 	 * Seqpacket to
@@ -1468,7 +1454,7 @@ static int start_usernsd(void)
 	 *    each other easily. Stream socket require manual
 	 *    messages boundaries.
 	 *
-	 * b) Make callers note the damon death by seeing the
+	 * b) Make callers note the daemon death by seeing the
 	 *    disconnected socket. In case of dgram socket
 	 *    callers would just get stuck in receiving the
 	 *    response.
@@ -1489,24 +1475,39 @@ static int start_usernsd(void)
 		return -1;
 	}
 
-	usernsd_pid = fork();
-	if (usernsd_pid < 0) {
-		pr_perror("Can't fork usernsd");
+	*pid = fork();
+	if (*pid < 0) {
+		pr_perror("Can't unix daemon");
 		close(sk[0]);
 		close(sk[1]);
 		return -1;
 	}
 
-	if (usernsd_pid == 0) {
+	if (*pid == 0) {
 		int ret;
-
 		close(sk[0]);
-		ret = usernsd(sk[1]);
+		ret = daemon_func(sk[1]);
 		exit(ret);
 	}
-
 	close(sk[1]);
-	if (install_service_fd(USERNSD_SK, sk[0]) < 0) {
+
+	return sk[0];
+}
+
+static int start_usernsd(void)
+{
+	int sk;
+
+	if (!(root_ns_mask & CLONE_NEWUSER))
+		return 0;
+
+	sk = start_unix_cred_daemon(&usernsd_pid, usernsd);
+	if (sk < 0) {
+		pr_err("failed to start usernsd\n");
+		return -1;
+	}
+
+	if (install_service_fd(USERNSD_SK, sk) < 0) {
 		kill(usernsd_pid, SIGKILL);
 		waitpid(usernsd_pid, NULL, 0);
 		return -1;
@@ -1623,10 +1624,12 @@ int collect_namespaces(bool for_dump)
 
 int prepare_userns_creds(void)
 {
-	/* UID and GID must be set after restoring /proc/PID/{uid,gid}_maps */
-	if (setuid(0) || setgid(0) || setgroups(0, NULL)) {
-		pr_perror("Unable to initialize id-s");
-		return -1;
+	if (!opts.unprivileged || has_cap_setuid(opts.cap_eff)) {
+		/* UID and GID must be set after restoring /proc/PID/{uid,gid}_maps */
+		if (setuid(0) || setgid(0) || setgroups(0, NULL)) {
+			pr_perror("Unable to initialize id-s");
+			return -1;
+		}
 	}
 
 	/*

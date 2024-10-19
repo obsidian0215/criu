@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import sys
 import os
@@ -462,7 +462,7 @@ fail_desc = {
 
 
 def chk_real_state(st):
-    # Before enything else -- check that we still have
+    # Before anything else -- check that we still have
     # all the sockets at hands
     for sk in st.sockets:
         if not sk.visible:

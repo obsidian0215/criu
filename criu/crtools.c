@@ -127,7 +127,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	cr_pb_init();
-	setproctitle_init(argc, argv, envp);
+	__setproctitle_init(argc, argv, envp);
 
 	if (argc < 2)
 		goto usage;
@@ -184,6 +184,9 @@ int main(int argc, char *argv[], char *envp[])
 		opts.swrk_restore = true;
 		return cr_service_work(atoi(argv[optind + 1]));
 	}
+
+	if (check_caps())
+		return 1;
 
 	if (opts.imgs_dir == NULL)
 		SET_CHAR_OPTS(imgs_dir, ".");
@@ -423,9 +426,10 @@ usage:
 	       "  --mntns-compat-mode   Use mount engine in compatibility mode. By default criu\n"
 	       "                        tries to use mount-v2 mode with more reliable algorithm\n"
 	       "                        based on MOVE_MOUNT_SET_GROUP kernel feature\n"
-	       "  --network-lock METHOD\n"
-	       "                      network locking/unlocking method; argument\n"
-	       "                      can be 'nftables' or 'iptables' (default).\n"
+	       "  --network-lock METHOD network locking/unlocking method; argument\n"
+	       "                        can be 'nftables' or 'iptables' (default).\n"
+	       "  --unprivileged        accept limitations when running as non-root\n"
+	       "                        consult documentation for further details\n"
 	       "\n"
 	       "* External resources support:\n"
 	       "  --external RES        dump objects from this list as external resources:\n"
@@ -453,6 +457,7 @@ usage:
 	       "                        is inaccessible\n"
 	       "  --link-remap          allow one to link unlinked files back when possible\n"
 	       "  --ghost-limit size    limit max size of deleted file contents inside image\n"
+	       "  --ghost-fiemap        enable dumping of deleted files using fiemap\n"
 	       "  --action-script FILE  add an external action script\n"
 	       "  -j|--" OPT_SHELL_JOB "        allow one to dump and restore shell jobs\n"
 	       "  -l|--" OPT_FILE_LOCKS "       handle file locks, for safety, only used for container\n"
@@ -516,6 +521,9 @@ usage:
 	       "  --file-validation METHOD\n"
 	       "			pass the validation method to be used; argument\n"
 	       "			can be 'filesize' or 'buildid' (default).\n"
+	       "  --skip-file-rwx-check\n"
+	       "			Skip checking file permissions\n"
+	       "			(r/w/x for u/g/o) on restore.\n"
 	       "\n"
 	       "Check options:\n"
 	       "  Without options, \"criu check\" checks availability of absolutely required\n"

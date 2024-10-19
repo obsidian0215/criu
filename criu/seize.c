@@ -16,6 +16,7 @@
 #include "pstree.h"
 #include "criu-log.h"
 #include <compel/ptrace.h>
+#include "plugin.h"
 #include "proc_parse.h"
 #include "seccomp.h"
 #include "seize.h"
@@ -23,6 +24,62 @@
 #include "string.h"
 #include "xmalloc.h"
 #include "util.h"
+
+static bool freeze_cgroup_disabled;
+
+/*
+ * Disables the use of freeze cgroups for process seizing, even if explicitly
+ * requested via the --freeze-cgroup option. This is necessary for plugins
+ * (e.g., CUDA) that do not function correctly when processes are frozen using
+ * cgroups.
+ */
+void __attribute__((used)) dont_use_freeze_cgroup(void)
+{
+	freeze_cgroup_disabled = true;
+}
+
+char *task_comm_info(pid_t pid, char *comm, size_t size)
+{
+	bool is_read = false;
+
+	if (!pr_quelled(LOG_INFO)) {
+		int saved_errno = errno;
+		char path[32];
+		int fd;
+
+		snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+		fd = open(path, O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, comm, size);
+			if (n > 0) {
+				is_read = true;
+				/* Replace '\n' printed by kernel with '\0' */
+				comm[n - 1] = '\0';
+			} else {
+				pr_warn("Failed to read %s: %s\n", path, strerror(errno));
+			}
+			close(fd);
+		} else {
+			pr_warn("Failed to open %s: %s\n", path, strerror(errno));
+		}
+		errno = saved_errno;
+	}
+
+	if (!is_read)
+		comm[0] = '\0';
+
+	return comm;
+}
+
+/*
+ * NOTE: Don't run simultaneously, it uses local static buffer!
+ */
+char *__task_comm_info(pid_t pid)
+{
+	static char comm[32];
+
+	return task_comm_info(pid, comm, sizeof(comm));
+}
 
 #define NR_ATTEMPTS 5
 
@@ -146,12 +203,12 @@ static int freezer_write_state(int fd, enum freezer_state new_state)
 	if (new_state == THAWED) {
 		if (cgroup_v2)
 			state[0] = '0';
-		else if (strlcpy(state, thawed, sizeof(state)) >= sizeof(state))
+		else if (__strlcpy(state, thawed, sizeof(state)) >= sizeof(state))
 			return -1;
 	} else if (new_state == FROZEN) {
 		if (cgroup_v2)
 			state[0] = '1';
-		else if (strlcpy(state, frozen, sizeof(state)) >= sizeof(state))
+		else if (__strlcpy(state, frozen, sizeof(state)) >= sizeof(state))
 			return -1;
 	} else {
 		return -1;
@@ -249,13 +306,13 @@ static int seize_cgroup_tree(char *root_path, enum freezer_state state)
 		if (ret == 0)
 			continue;
 		if (errno != ESRCH) {
-			pr_perror("Unexpected error");
+			pr_perror("Unexpected error for pid %d (comm %s)", pid, __task_comm_info(pid));
 			fclose(f);
 			return -1;
 		}
 
 		if (!compel_interrupt_task(pid)) {
-			pr_debug("SEIZE %d: success\n", pid);
+			pr_debug("SEIZE %d (comm %s): success\n", pid, __task_comm_info(pid));
 			processes_to_wait++;
 		} else if (state == FROZEN) {
 			char buf[] = "/proc/XXXXXXXXXX/exe";
@@ -272,7 +329,7 @@ static int seize_cgroup_tree(char *root_path, enum freezer_state state)
 			 * before it compete exit procedure. The caller simply
 			 * should wait a bit and try freezing again.
 			 */
-			pr_err("zombie found while seizing\n");
+			pr_err("zombie %d (comm %s) found while seizing\n", pid, __task_comm_info(pid));
 			fclose(f);
 			return -EAGAIN;
 		}
@@ -353,7 +410,7 @@ static int freezer_detach(void)
 {
 	int i;
 
-	if (!opts.freeze_cgroup)
+	if (!opts.freeze_cgroup || freeze_cgroup_disabled)
 		return 0;
 
 	for (i = 0; i < processes_to_wait && processes_to_wait_pids; i++) {
@@ -448,6 +505,31 @@ static int log_unfrozen_stacks(char *root)
 	return 0;
 }
 
+static int check_freezer_cgroup(void)
+{
+	enum freezer_state state = THAWED;
+	int fd;
+
+	BUG_ON(!freeze_cgroup_disabled);
+
+	fd = freezer_open();
+	if (fd < 0)
+		return -1;
+
+	state = get_freezer_state(fd);
+	close(fd);
+	if (state == FREEZER_ERROR) {
+		return -1;
+	}
+
+	if (state != THAWED) {
+		pr_err("One or more plugins are incompatible with the freezer cgroup in the FROZEN state.\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int freeze_processes(void)
 {
 	int fd, exit_code = -1;
@@ -535,8 +617,10 @@ static int freeze_processes(void)
 	}
 
 err:
-	if (exit_code == 0 || origin_freezer_state == THAWED)
-		exit_code = freezer_write_state(fd, THAWED);
+	if (exit_code == 0 || origin_freezer_state == THAWED) {
+		if (freezer_write_state(fd, THAWED))
+			exit_code = -1;
+	}
 
 	if (close(fd)) {
 		pr_perror("Unable to thaw tasks");
@@ -592,7 +676,12 @@ static int collect_children(struct pstree_item *item)
 			goto free;
 		}
 
-		if (!opts.freeze_cgroup)
+		ret = run_plugins(PAUSE_DEVICES, pid);
+		if (ret < 0 && ret != -ENOTSUP) {
+			goto free;
+		}
+
+		if (!opts.freeze_cgroup || freeze_cgroup_disabled)
 			/* fails when meets a zombie */
 			__ignore_value(compel_interrupt_task(pid));
 
@@ -614,6 +703,9 @@ static int collect_children(struct pstree_item *item)
 			ret = TASK_DEAD;
 		else
 			processes_to_wait--;
+
+		if (ret == TASK_STOPPED)
+			c->pid->stop_signo = compel_parse_stop_signo(pid);
 
 		c->pid->real = pid;
 		c->parent = item;
@@ -646,7 +738,7 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
 	 * the item->state is the state task was in when we seized one.
 	 */
 
-	compel_resume_task(item->pid->real, item->pid->state, st);
+	compel_resume_task_sig(item->pid->real, item->pid->state, st, item->pid->stop_signo);
 
 	if (st == TASK_DEAD)
 		return;
@@ -777,7 +869,8 @@ static int collect_threads(struct pstree_item *item)
 
 		pr_info("\tSeizing %d's %d thread\n", item->pid->real, pid);
 
-		if (!opts.freeze_cgroup && compel_interrupt_task(pid))
+		if ((!opts.freeze_cgroup || freeze_cgroup_disabled) &&
+		    compel_interrupt_task(pid))
 			continue;
 
 		ret = compel_wait_task(pid, item_ppid(item), parse_pid_status, NULL, &t_creds.s, NULL);
@@ -833,7 +926,7 @@ static int collect_loop(struct pstree_item *item, int (*collect)(struct pstree_i
 {
 	int attempts = NR_ATTEMPTS, nr_inprogress = 1;
 
-	if (opts.freeze_cgroup)
+	if (opts.freeze_cgroup && !freeze_cgroup_disabled)
 		attempts = 1;
 
 	/*
@@ -918,6 +1011,7 @@ int collect_pstree(void)
 	pid_t pid = root_item->pid->real;
 	int ret = -1;
 	struct proc_status_creds creds;
+	struct pstree_item *iter;
 
 	timing_start(TIME_FREEZING);
 
@@ -928,17 +1022,26 @@ int collect_pstree(void)
 	 */
 	alarm(opts.timeout);
 
+	ret = run_plugins(PAUSE_DEVICES, pid);
+	if (ret < 0 && ret != -ENOTSUP) {
+		goto err;
+	}
+
 	if (opts.freeze_cgroup && cgroup_version())
 		goto err;
 
 	pr_debug("Detected cgroup V%d freezer\n", cgroup_v2 ? 2 : 1);
 
-	if (opts.freeze_cgroup && freeze_processes())
-		goto err;
-
-	if (!opts.freeze_cgroup && compel_interrupt_task(pid)) {
-		set_cr_errno(ESRCH);
-		goto err;
+	if (opts.freeze_cgroup && !freeze_cgroup_disabled) {
+		if (freeze_processes())
+			goto err;
+	} else {
+		if (opts.freeze_cgroup && check_freezer_cgroup())
+			goto err;
+		if (compel_interrupt_task(pid)) {
+			set_cr_errno(ESRCH);
+			goto err;
+		}
 	}
 
 	ret = compel_wait_task(pid, -1, parse_pid_status, NULL, &creds.s, NULL);
@@ -949,6 +1052,9 @@ int collect_pstree(void)
 		ret = TASK_DEAD;
 	else
 		processes_to_wait--;
+
+	if (ret == TASK_STOPPED)
+		root_item->pid->stop_signo = compel_parse_stop_signo(pid);
 
 	pr_info("Seized task %d, state %d\n", pid, ret);
 	root_item->pid->state = ret;
@@ -961,9 +1067,18 @@ int collect_pstree(void)
 	if (ret < 0)
 		goto err;
 
-	if (opts.freeze_cgroup && freezer_wait_processes()) {
+	if (opts.freeze_cgroup && !freeze_cgroup_disabled &&
+	    freezer_wait_processes()) {
 		ret = -1;
 		goto err;
+	}
+
+	for_each_pstree_item(iter) {
+		if (!task_alive(iter))
+			continue;
+		ret = run_plugins(CHECKPOINT_DEVICES, iter->pid->real);
+		if (ret < 0 && ret != -ENOTSUP)
+			goto err;
 	}
 
 	ret = 0;

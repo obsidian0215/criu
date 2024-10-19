@@ -226,8 +226,9 @@ int prepare_inventory(InventoryEntry *he)
 	if (get_task_ids(&crt.i))
 		return -1;
 
-	he->has_root_cg_set = true;
-	if (dump_task_cgroup(NULL, &he->root_cg_set, NULL))
+	if (!opts.unprivileged)
+		he->has_root_cg_set = true;
+	if (dump_thread_cgroup(NULL, &he->root_cg_set, NULL, -1))
 		return -1;
 
 	he->root_ids = crt.i.ids;

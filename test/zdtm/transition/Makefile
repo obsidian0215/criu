@@ -25,6 +25,7 @@ TST_NOFILE	=	\
 		pidfd_store_sk \
 		rseq01		\
 		rseq02		\
+		stack		\
 
 
 TST_FILE	=	\
@@ -83,7 +84,9 @@ ptrace:		LDFLAGS += -pthread
 fork2:		CFLAGS += -D FORK2
 thread-bomb.o:	CFLAGS += -pthread
 thread-bomb:	LDFLAGS += -pthread
+rseq01:		LDLIBS += -pthread
 rseq02:		CFLAGS += -D NORESTART
+rseq02:		LDLIBS += -pthread
 
 %: %.sh
 	cp $< $@

@@ -239,34 +239,37 @@ void test_init(int argc, char **argv)
 		exit(1);
 	}
 
-	val = getenv("ZDTM_GROUPS");
-	if (val) {
-		char *tok = NULL;
-		unsigned int size = 0, groups[NGROUPS_MAX];
+	val = getenv("ZDTM_ROOTLESS");
+	if (!val) {
+		val = getenv("ZDTM_GROUPS");
+		if (val) {
+			char *tok = NULL;
+			unsigned int size = 0, groups[NGROUPS_MAX];
 
-		tok = strtok(val, " ");
-		while (tok) {
-			size++;
-			groups[size - 1] = atoi(tok);
-			tok = strtok(NULL, " ");
+			tok = strtok(val, " ");
+			while (tok) {
+				size++;
+				groups[size - 1] = atoi(tok);
+				tok = strtok(NULL, " ");
+			}
+
+			if (setgroups(size, groups)) {
+				fprintf(stderr, "Can't set groups: %m");
+				exit(1);
+			}
 		}
 
-		if (setgroups(size, groups)) {
-			fprintf(stderr, "Can't set groups: %m");
+		val = getenv("ZDTM_GID");
+		if (val && (setgid(atoi(val)) == -1)) {
+			fprintf(stderr, "Can't set gid: %m");
 			exit(1);
 		}
-	}
 
-	val = getenv("ZDTM_GID");
-	if (val && (setgid(atoi(val)) == -1)) {
-		fprintf(stderr, "Can't set gid: %m");
-		exit(1);
-	}
-
-	val = getenv("ZDTM_UID");
-	if (val && (setuid(atoi(val)) == -1)) {
-		fprintf(stderr, "Can't set gid: %m");
-		exit(1);
+		val = getenv("ZDTM_UID");
+		if (val && (setuid(atoi(val)) == -1)) {
+			fprintf(stderr, "Can't set gid: %m");
+			exit(1);
+		}
 	}
 
 	if (prctl(PR_SET_DUMPABLE, 1)) {
@@ -403,7 +406,7 @@ pid_t sys_clone_unified(unsigned long flags, void *child_stack, void *parent_tid
 {
 #ifdef __x86_64__
 	return (pid_t)syscall(__NR_clone, flags, child_stack, parent_tid, child_tid, newtls);
-#elif (__i386__ || __arm__ || __aarch64__ || __powerpc64__ || __mips__)
+#elif (__i386__ || __arm__ || __aarch64__ || __powerpc64__ || __mips__ || __loongarch64)
 	return (pid_t)syscall(__NR_clone, flags, child_stack, parent_tid, newtls, child_tid);
 #elif __s390x__
 	return (pid_t)syscall(__NR_clone, child_stack, flags, parent_tid, child_tid, newtls);

@@ -18,6 +18,7 @@
 #include "common/scm.h"
 
 static const char *action_names[ACT_MAX] = {
+	[ACT_PRE_STREAM] = "pre-stream",
 	[ACT_PRE_DUMP] = "pre-dump",
 	[ACT_POST_DUMP] = "post-dump",
 	[ACT_PRE_RESTORE] = "pre-restore",
@@ -30,6 +31,7 @@ static const char *action_names[ACT_MAX] = {
 	[ACT_POST_RESUME] = "post-resume",
 	[ACT_ORPHAN_PTS_MASTER] = "orphan-pts-master",
 	[ACT_STATUS_READY] = "status-ready",
+	[ACT_QUERY_EXT_FILES] = "query-ext-files",
 };
 
 struct script {
@@ -50,6 +52,9 @@ static int run_shell_scripts(const char *action)
 
 #define ENV_IMGDIR  0x1
 #define ENV_ROOTPID 0x2
+
+	if (list_empty(&scripts))
+		return 0;
 
 	if (setenv("CRTOOLS_SCRIPT_ACTION", action, 1)) {
 		pr_perror("Can't set CRTOOLS_SCRIPT_ACTION=%s", action);
@@ -111,6 +116,20 @@ int rpc_send_fd(enum script_actions act, int fd)
 	return send_criu_rpc_script(act, (char *)action, rpc_sk, fd);
 }
 
+int rpc_query_external_files(void)
+{
+	int rpc_sk;
+
+	if (scripts_mode != SCRIPTS_RPC)
+		return 0;
+
+	rpc_sk = get_service_fd(RPC_SK_OFF);
+	if (rpc_sk < 0)
+		return -1;
+
+	return exec_rpc_query_external_files((char *)action_names[ACT_QUERY_EXT_FILES], rpc_sk);
+}
+
 int run_scripts(enum script_actions act)
 {
 	int ret = 0;
@@ -118,23 +137,24 @@ int run_scripts(enum script_actions act)
 
 	pr_debug("Running %s scripts\n", action);
 
-	if (scripts_mode == SCRIPTS_NONE)
+	switch (scripts_mode) {
+	case SCRIPTS_NONE:
 		return 0;
-
-	if (scripts_mode == SCRIPTS_RPC) {
+	case SCRIPTS_RPC:
 		ret = rpc_send_fd(act, -1);
-		goto out;
-	}
-
-	if (scripts_mode == SCRIPTS_SHELL) {
+		if (ret)
+			break;
+		/* Enable scripts from config file in RPC mode (fallthrough) */
+	case SCRIPTS_SHELL:
 		ret = run_shell_scripts(action);
-		goto out;
+		break;
+	default:
+		BUG();
 	}
 
-	BUG();
-out:
 	if (ret)
 		pr_err("One of more action scripts failed\n");
+
 	return ret;
 }
 
@@ -142,8 +162,9 @@ int add_script(char *path)
 {
 	struct script *script;
 
-	BUG_ON(scripts_mode == SCRIPTS_RPC);
-	scripts_mode = SCRIPTS_SHELL;
+	/* Set shell mode when a script is added but don't overwrite RPC mode */
+	if (scripts_mode == SCRIPTS_NONE)
+		scripts_mode = SCRIPTS_SHELL;
 
 	script = xmalloc(sizeof(struct script));
 	if (script == NULL)
@@ -169,7 +190,6 @@ int add_rpc_notify(int sk)
 		return -1;
 	}
 
-	BUG_ON(scripts_mode == SCRIPTS_SHELL);
 	scripts_mode = SCRIPTS_RPC;
 
 	if (install_service_fd(RPC_SK_OFF, fd) < 0)

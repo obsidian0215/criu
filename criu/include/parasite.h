@@ -118,6 +118,8 @@ static inline int posix_timers_dump_size(int timer_n)
  */
 
 struct parasite_dump_misc {
+	bool has_membarrier_get_registrations; /* this is sent from criu to parasite. */
+
 	unsigned long brk;
 
 	u32 pid;
@@ -128,6 +130,7 @@ struct parasite_dump_misc {
 	int dumpable;
 	int thp_disabled;
 	int child_subreaper;
+	int membarrier_registration_mask;
 };
 
 /*
@@ -148,6 +151,7 @@ struct parasite_dump_creds {
 
 	int uids[4];
 	int gids[4];
+	int no_new_privs;
 	unsigned int secbits;
 	unsigned int ngroups;
 	/*
@@ -241,7 +245,12 @@ struct parasite_dump_cgroup_args {
 	 *
 	 * The string is null terminated.
 	 */
-	char contents[1 << 12];
+	char contents[(1 << 12) - 32];
+	/*
+	 * Contains the path to thread cgroup procfs.
+	 * "self/task/<tid>/cgroup"
+	 */
+	char thread_cgrp[32];
 };
 
 #endif /* !__ASSEMBLY__ */

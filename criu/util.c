@@ -24,7 +24,6 @@
 #include <sys/resource.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sched.h>
 #include <ftw.h>
 #include <time.h>
@@ -40,7 +39,7 @@
 #include "mem.h"
 #include "namespaces.h"
 #include "criu-log.h"
-#include "syscall.h"
+#include "util-caps.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
@@ -54,6 +53,7 @@
 #include "action-scripts.h"
 
 #include "compel/infect-util.h"
+#include <compel/plugins/std/syscall-codes.h>
 
 #define VMA_OPT_LEN 128
 
@@ -518,11 +518,24 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[], unsigned 
 	return cr_system_userns(in, out, err, cmd, argv, flags, -1);
 }
 
-static int close_fds(int minfd)
+int cr_close_range(unsigned int fd, unsigned int max_fd, unsigned int flags)
+{
+	return syscall(__NR_close_range, fd, max_fd, flags);
+}
+
+int close_fds(int minfd)
 {
 	DIR *dir;
 	struct dirent *de;
 	int fd, ret, dfd;
+
+	if (kdat.has_close_range) {
+		if (cr_close_range(minfd, ~0, 0)) {
+			pr_perror("close_range failed");
+			return -1;
+		}
+		return 0;
+	}
 
 	dir = opendir("/proc/self/fd");
 	if (dir == NULL) {
@@ -661,38 +674,52 @@ out:
 	return ret;
 }
 
+struct child_args {
+	int *sk_pair;
+	int (*child_setup)(void);
+};
+
+static int child_func(void *_args)
+{
+	struct child_args *args = _args;
+	int sk, *sk_pair = args->sk_pair;
+	char c = 0;
+
+	sk = sk_pair[1];
+	close(sk_pair[0]);
+
+	if (args->child_setup && args->child_setup() != 0)
+		exit(1);
+
+	if (write(sk, &c, 1) != 1) {
+		pr_perror("write");
+		exit(1);
+	}
+
+	while (1)
+		sleep(1000);
+	exit(1);
+}
+
 pid_t fork_and_ptrace_attach(int (*child_setup)(void))
 {
 	pid_t pid;
 	int sk_pair[2], sk;
 	char c = 0;
+	struct child_args cargs = {
+		.sk_pair = sk_pair,
+		.child_setup = child_setup,
+	};
 
 	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
 		pr_perror("socketpair");
 		return -1;
 	}
 
-	pid = fork();
+	pid = clone_noasan(child_func, CLONE_UNTRACED | SIGCHLD, &cargs);
 	if (pid < 0) {
 		pr_perror("fork");
 		return -1;
-	}
-
-	if (pid == 0) {
-		sk = sk_pair[1];
-		close(sk_pair[0]);
-
-		if (child_setup && child_setup() != 0)
-			exit(1);
-
-		if (write(sk, &c, 1) != 1) {
-			pr_perror("write");
-			exit(1);
-		}
-
-		while (1)
-			sleep(1000);
-		exit(1);
 	}
 
 	sk = sk_pair[0];
@@ -951,6 +978,89 @@ FILE *fopenat(int dirfd, char *path, char *cflags)
 	return fdopen(tmp, cflags);
 }
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid)
+{
+	struct stat st;
+
+	if (!fchown(fd, new_uid, new_gid))
+		return 0;
+	if (errno != EPERM)
+		return -1;
+
+	if (fstat(fd, &st) < 0) {
+		pr_perror("fstat() after fchown() for fd %d", fd);
+		goto out_eperm;
+	}
+	pr_debug("fstat(%d): uid %u gid %u\n", fd, st.st_uid, st.st_gid);
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid)
+		goto out_eperm;
+
+	return 0;
+out_eperm:
+	errno = EPERM;
+	return -1;
+}
+
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags)
+{
+	struct stat st;
+	int ret;
+
+	if (fchownat(dirfd, path, new_uid, new_gid, flags) < 0 && errno != EPERM) {
+		int errno_cpy = errno;
+		pr_perror("Unable to change [%d]/%s ownership to (%d, %d)",
+			  dirfd, path, new_uid, new_gid);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (fstatat(dirfd, path, &st, flags) < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to stat [%d]/%s", dirfd, path);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid) {
+		errno = EPERM;
+		pr_perror("Unable to change [%d]/%s ownership (%d, %d) to (%d, %d)",
+			  dirfd, path, st.st_uid, st.st_gid, new_uid, new_gid);
+		errno = EPERM;
+		return -1;
+	}
+
+	if (new_mode == st.st_mode)
+		return 0;
+
+	if (S_ISLNK(st.st_mode)) {
+		/*
+		 * We have no lchmod() function, and fchmod() will fail on
+		 * O_PATH | O_NOFOLLOW fd. Yes, we have fchmodat()
+		 * function and flag AT_SYMLINK_NOFOLLOW described in
+		 * man 2 fchmodat, but it is not currently implemented. %)
+		 */
+		return 0;
+	}
+
+	if (!*path && flags & AT_EMPTY_PATH)
+		ret = fchmod(dirfd, new_mode);
+	else
+		ret = fchmodat(dirfd, path, new_mode, flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH));
+	if (ret < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to set perms %o on [%d]/%s", new_mode, dirfd, path);
+		errno = errno_cpy;
+	}
+
+	return ret;
+}
+
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode)
+{
+	return cr_fchpermat(fd, "", new_uid, new_gid, new_mode, AT_EMPTY_PATH);
+}
+
 void split(char *str, char token, char ***out, int *n)
 {
 	int i;
@@ -1069,20 +1179,6 @@ const char *ns_to_string(unsigned int ns)
 	default:
 		return NULL;
 	}
-}
-
-void tcp_cork(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_CORK, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_CORK (%d)", val);
-}
-
-void tcp_nodelay(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_NODELAY (%d)", val);
 }
 
 static int get_sockaddr_in(struct sockaddr_storage *addr, char *host, unsigned short port)
@@ -1426,6 +1522,9 @@ void rlimit_unlimit_nofile(void)
 {
 	struct rlimit new;
 
+	if (opts.unprivileged && !has_cap_sys_resource(opts.cap_eff))
+		return;
+
 	new.rlim_cur = kdat.sysctl_nr_open;
 	new.rlim_max = kdat.sysctl_nr_open;
 
@@ -1456,23 +1555,78 @@ void print_stack_trace(pid_t pid)
 }
 #endif
 
+int cr_fsopen(const char *fsname, unsigned int flags)
+{
+	return syscall(__NR_fsopen, fsname, flags);
+}
+
+int cr_fsconfig(int fd, unsigned int cmd, const char *key, const char *value, int aux)
+{
+	int ret = syscall(__NR_fsconfig, fd, cmd, key, value, aux);
+	if (ret)
+		fsfd_dump_messages(fd);
+	return ret;
+}
+
+int cr_fsmount(int fd, unsigned int flags, unsigned int attr_flags)
+{
+	int ret = syscall(__NR_fsmount, fd, flags, attr_flags);
+	if (ret)
+		fsfd_dump_messages(fd);
+	return ret;
+}
+
+void fsfd_dump_messages(int fd)
+{
+        char buf[4096];
+        int err, n;
+
+        err = errno;
+
+        for (;;) {
+                n = read(fd, buf, sizeof(buf) - 1);
+                if (n < 0) {
+			if (errno != ENODATA)
+				pr_perror("Unable to read from fs descriptor");
+                        break;
+		}
+		buf[n] = 0;
+
+                switch (buf[0]) {
+                case 'w':
+                        pr_warn("%s\n", buf);
+                        break;
+                case 'i':
+                        pr_info("%s\n", buf);
+                        break;
+                case 'e':
+			/* fallthrough */
+		default:
+                        pr_err("%s\n", buf);
+                        break;
+                }
+        }
+
+        errno = err;
+}
+
 int mount_detached_fs(const char *fsname)
 {
 	int fsfd, fd;
 
-	fsfd = sys_fsopen(fsname, 0);
+	fsfd = cr_fsopen(fsname, 0);
 	if (fsfd < 0) {
 		pr_perror("Unable to open the %s file system", fsname);
 		return -1;
 	}
 
-	if (sys_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
+	if (cr_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
 		pr_perror("Unable to create the %s file system", fsname);
 		close(fsfd);
 		return -1;
 	}
 
-	fd = sys_fsmount(fsfd, 0, 0);
+	fd = cr_fsmount(fsfd, 0, 0);
 	if (fd < 0)
 		pr_perror("Unable to mount the %s file system", fsname);
 	close(fsfd);
@@ -1562,7 +1716,7 @@ static int is_iptables_nft(char *bin)
 		goto err;
 	}
 
-	ret = cr_system(-1, pfd[1], -1, cmd[0], cmd, 0);
+	ret = cr_system(-1, pfd[1], -1, cmd[0], cmd, CRS_CAN_FAIL);
 	if (ret) {
 		pr_err("%s -V failed\n", cmd[0]);
 		goto err;
@@ -1590,44 +1744,46 @@ err:
 	return ret;
 }
 
-char *get_legacy_iptables_bin(bool ipv6)
+char *get_legacy_iptables_bin(bool ipv6, bool restore)
 {
-	static char iptables_bin[2][32];
+	static char iptables_bin[2][2][32];
 	/* 0  - means we don't know yet,
 	 * -1 - not present,
 	 * 1  - present.
 	 */
-	static int iptables_present[2] = { 0, 0 };
-	char bins[2][2][32] = { { "iptables-save", "iptables-legacy-save" },
-				{ "ip6tables-save", "ip6tables-legacy-save" } };
+	static int iptables_present[2][2] = { { 0, 0 }, { 0, 0 } };
+	char bins[2][2][2][32] = { { { "iptables-save", "iptables-legacy-save" },
+				     { "iptables-restore", "iptables-legacy-restore" } },
+				   { { "ip6tables-save", "ip6tables-legacy-save" },
+				     { "ip6tables-restore", "ip6tables-legacy-restore" } } };
 	int ret;
 
-	if (iptables_present[ipv6] == -1)
+	if (iptables_present[ipv6][restore] == -1)
 		return NULL;
 
-	if (iptables_present[ipv6] == 1)
-		return iptables_bin[ipv6];
+	if (iptables_present[ipv6][restore] == 1)
+		return iptables_bin[ipv6][restore];
 
-	memcpy(iptables_bin[ipv6], bins[ipv6][0], strlen(bins[ipv6][0]) + 1);
-	ret = is_iptables_nft(iptables_bin[ipv6]);
+	memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][0], strlen(bins[ipv6][restore][0]) + 1);
+	ret = is_iptables_nft(iptables_bin[ipv6][restore]);
 
 	/*
 	 * iptables on host uses nft backend (or not installed),
 	 * let's try iptables-legacy
 	 */
 	if (ret < 0 || ret == 1) {
-		memcpy(iptables_bin[ipv6], bins[ipv6][1], strlen(bins[ipv6][1]) + 1);
-		ret = is_iptables_nft(iptables_bin[ipv6]);
+		memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][1], strlen(bins[ipv6][restore][1]) + 1);
+		ret = is_iptables_nft(iptables_bin[ipv6][restore]);
 		if (ret < 0 || ret == 1) {
-			iptables_present[ipv6] = -1;
+			iptables_present[ipv6][restore] = -1;
 			return NULL;
 		}
 	}
 
 	/* we can come here with iptables-save or iptables-legacy-save */
-	iptables_present[ipv6] = 1;
+	iptables_present[ipv6][restore] = 1;
 
-	return iptables_bin[ipv6];
+	return iptables_bin[ipv6][restore];
 }
 
 /*
@@ -1872,13 +2028,18 @@ int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args)
 
 uint64_t criu_run_id;
 
-void util_init()
+void util_init(void)
 {
-	struct timespec tp;
+	struct stat statbuf;
 
-	clock_gettime(CLOCK_MONOTONIC, &tp);
-	criu_run_id = ((uint64_t)getpid() << 32) + tp.tv_sec + tp.tv_nsec;
+	criu_run_id = getpid();
+	if (!stat("/proc/self/ns/pid", &statbuf))
+		criu_run_id |= (uint64_t)statbuf.st_ino << 32;
+	else if (errno != ENOENT)
+		pr_perror("Can't stat /proc/self/ns/pid - CRIU run id might not be unique");
+
 	compel_run_id = criu_run_id;
+	pr_info("CRIU run id = %#" PRIx64 "\n", criu_run_id);
 }
 
 /*
@@ -2063,4 +2224,22 @@ out:
 	mp_path = xstrdup(mp_path);
 	xfree(free_path);
 	return mp_path;
+}
+
+int set_opts_cap_eff(void)
+{
+	struct __user_cap_header_struct cap_header;
+	struct __user_cap_data_struct cap_data[_LINUX_CAPABILITY_U32S_3];
+	int i;
+
+	cap_header.version = _LINUX_CAPABILITY_VERSION_3;
+	cap_header.pid = getpid();
+
+	if (capget(&cap_header, &cap_data[0]))
+		return -1;
+
+	for (i = 0; i < _LINUX_CAPABILITY_U32S_3; i++)
+		memcpy(&opts.cap_eff[i], &cap_data[i].effective, sizeof(u32));
+
+	return 0;
 }

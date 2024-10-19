@@ -33,7 +33,10 @@ static inline void *thread_pointer(void)
 static inline void unregister_old_rseq(void)
 {
 	/* unregister rseq */
-	syscall(__NR_rseq, (void *)((char *)thread_pointer() + __rseq_offset), __rseq_size, 1, RSEQ_SIG);
+	unsigned int size = __rseq_size;
+	if (__rseq_size < 32)
+		size = 32;
+	syscall(__NR_rseq, (void *)((char *)thread_pointer() + __rseq_offset), size, 1, RSEQ_SIG);
 }
 #else
 static inline void unregister_old_rseq(void)
@@ -86,7 +89,7 @@ struct rseq {
 #endif
 /* EOF */
 
-static volatile struct rseq *rseq_ptr;
+static __thread volatile struct rseq *rseq_ptr;
 static __thread volatile struct rseq __rseq_abi;
 
 static int sys_rseq(volatile struct rseq *rseq_abi, uint32_t rseq_len, int flags, uint32_t sig)
@@ -119,7 +122,7 @@ static void check_thread(void)
 
 #define rseq_after_asm_goto() asm volatile("" : : : "memory")
 
-static int rseq_addv(intptr_t *v, intptr_t count, int cpu)
+static int rseq_addv(intptr_t *v, intptr_t count, int cpu, bool ignore_abort, const char *id)
 {
 	double a = 10000000000000000.0;
 	double b = -1;
@@ -177,7 +180,7 @@ static int rseq_addv(intptr_t *v, intptr_t count, int cpu)
 	);
 	/* clang-format on */
 	rseq_after_asm_goto();
-	test_msg("exit %lx %lx %f %f\n", rseq_cs1, rseq_cs2, a, b);
+	test_msg("exit %s, %lx %lx %f %f\n", id, rseq_cs1, rseq_cs2, a, b);
 	if (rseq_cs1 != rseq_cs2) {
 		/*
 		 * It means that we finished critical section
@@ -192,16 +195,45 @@ static int rseq_addv(intptr_t *v, intptr_t count, int cpu)
 	return 0;
 abort:
 	rseq_after_asm_goto();
-	test_msg("abort %lx %lx %f %f\n", rseq_cs1, rseq_cs2, a, b);
+	test_msg("abort %s, %lx %lx %f %f\n", id, rseq_cs1, rseq_cs2, a, b);
+	if (ignore_abort)
+		return 0;
 	return -1;
+}
+
+static task_waiter_t waiter;
+static intptr_t *cpu_data;
+bool ignore_abort = true;
+int thread_ret;
+
+void *thread_routine(void *args)
+{
+	int cpu;
+
+	rseq_ptr = &__rseq_abi;
+	memset((void *)rseq_ptr, 0, sizeof(struct rseq));
+	register_thread();
+	task_waiter_complete(&waiter, 1);
+	task_waiter_wait4(&waiter, 2);
+
+	while (test_go()) {
+		cpu = RSEQ_ACCESS_ONCE(rseq_ptr->cpu_id_start);
+		thread_ret = rseq_addv(&cpu_data[cpu], 2, cpu, ignore_abort, "thread");
+
+		if (thread_ret)
+			break;
+	}
+
+	check_thread();
+	return NULL;
 }
 
 int main(int argc, char *argv[])
 {
 	int cpu = 0;
 	int ret;
-	intptr_t *cpu_data;
 	long nr_cpus;
+	pthread_t thread;
 
 	rseq_ptr = &__rseq_abi;
 	memset((void *)rseq_ptr, 0, sizeof(struct rseq));
@@ -225,31 +257,37 @@ int main(int argc, char *argv[])
 	 * https://github.com/torvalds/linux/blob/ce522ba9/kernel/rseq.c#L192
 	 */
 #ifdef NORESTART
+	ignore_abort = false;
 	rseq_ptr->flags = RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT | RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL |
 			  RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE;
 #endif
 
+	task_waiter_init(&waiter);
+	if (pthread_create(&thread, NULL, thread_routine, NULL)) {
+		fail("pthread_create");
+		exit(EXIT_FAILURE);
+	}
+	task_waiter_wait4(&waiter, 1);
+
 	test_daemon();
+	task_waiter_complete(&waiter, 2);
 
 	while (test_go()) {
 		cpu = RSEQ_ACCESS_ONCE(rseq_ptr->cpu_id_start);
-		ret = rseq_addv(&cpu_data[cpu], 2, cpu);
-
-/* NORESTART is NOT set */
-#ifndef NORESTART
-		/* just ignore abort */
-		ret = 0;
-#endif
+		ret = rseq_addv(&cpu_data[cpu], 2, cpu, ignore_abort, "task");
 
 		if (ret)
 			break;
 	}
 
-	test_waitsig();
-
 	check_thread();
 
-	if (ret)
+	if (pthread_join(thread, NULL)) {
+		fail("pthread_join");
+		exit(EXIT_FAILURE);
+	}
+
+	if (ret || thread_ret)
 		fail();
 	else
 		pass();

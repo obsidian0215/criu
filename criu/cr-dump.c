@@ -86,6 +86,8 @@
 #include "pidfd-store.h"
 #include "apparmor.h"
 #include "asm/dump.h"
+#include "timer.h"
+#include "sigact.h"
 #include "dirty-map.h"
 
 /*
@@ -159,6 +161,11 @@ static int dump_sched_info(int pid, ThreadCoreEntry *tc)
 	tc->has_sched_policy = true;
 	tc->sched_policy = ret;
 
+	/* The reset-on-fork flag might be used in combination
+	 * with SCHED_FIFO or SCHED_RR to reset the scheduling
+	 * policy/priority in child processes.
+	 */
+	ret &= ~SCHED_RESET_ON_FORK;
 	if ((ret == SCHED_RR) || (ret == SCHED_FIFO)) {
 		ret = syscall(__NR_sched_getparam, pid, &sp);
 		if (ret < 0) {
@@ -431,7 +438,7 @@ static int dump_filemap(struct vma_area *vma_area, int fd)
 	if (vma_area->aufs_rpath) {
 		struct fd_link aufs_link;
 
-		strlcpy(aufs_link.name, vma_area->aufs_rpath, sizeof(aufs_link.name));
+		__strlcpy(aufs_link.name, vma_area->aufs_rpath, sizeof(aufs_link.name));
 		aufs_link.len = strlen(aufs_link.name);
 		p.link = &aufs_link;
 	}
@@ -761,6 +768,7 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	pid_t pid = item->pid->real;
 	int ret = -1;
 	struct parasite_dump_cgroup_args cgroup_args, *info = NULL;
+	u32 *cg_set;
 
 	BUILD_BUG_ON(sizeof(cgroup_args) < PARASITE_ARG_SIZE_MIN);
 
@@ -771,17 +779,27 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	core->tc->child_subreaper = misc->child_subreaper;
 	core->tc->has_child_subreaper = true;
 
+	if (misc->membarrier_registration_mask) {
+		core->tc->membarrier_registration_mask = misc->membarrier_registration_mask;
+		core->tc->has_membarrier_registration_mask = true;
+	}
+
 	ret = get_task_personality(pid, &core->tc->personality);
 	if (ret < 0)
 		goto err;
 
-	strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
+	__strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
 	core->tc->task_state = item->pid->state;
 	core->tc->exit_code = 0;
 
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[0]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
+
+	if (core->tc->task_state == TASK_STOPPED) {
+		core->tc->has_stop_signo = true;
+		core->tc->stop_signo = item->pid->stop_signo;
+	}
 
 	ret = parasite_dump_thread_leader_seized(ctl, pid, core);
 	if (ret)
@@ -801,13 +819,15 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	 */
 	if (item->ids->has_cgroup_ns_id && !item->parent) {
 		info = &cgroup_args;
+		strcpy(cgroup_args.thread_cgrp, "self/cgroup");
 		ret = parasite_dump_cgroup(ctl, &cgroup_args);
 		if (ret)
 			goto err;
 	}
 
-	core->tc->has_cg_set = true;
-	ret = dump_task_cgroup(item, &core->tc->cg_set, info);
+	core->thread_core->has_cg_set = true;
+	cg_set = &core->thread_core->cg_set;
+	ret = dump_thread_cgroup(item, cg_set, info, -1);
 	if (ret)
 		goto err;
 
@@ -869,6 +889,72 @@ static int collect_file_locks(void)
 	return parse_file_locks();
 }
 
+static bool task_in_rseq(struct criu_rseq_cs *rseq_cs, uint64_t addr)
+{
+	return addr >= rseq_cs->start_ip && addr < rseq_cs->start_ip + rseq_cs->post_commit_offset;
+}
+
+static int fixup_thread_rseq(const struct pstree_item *item, int i)
+{
+	CoreEntry *core = item->core[i];
+	struct criu_rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
+	pid_t tid = item->threads[i].real;
+
+	if (!kdat.has_ptrace_get_rseq_conf)
+		return 0;
+
+	/* equivalent to (struct rseq)->rseq_cs is NULL */
+	if (!rseq_cs->start_ip)
+		return 0;
+
+	pr_debug(
+		"fixup_thread_rseq for %d: rseq_cs start_ip = %llx abort_ip = %llx post_commit_offset = %llx flags = %x version = %x; IP = %lx\n",
+		tid, rseq_cs->start_ip, rseq_cs->abort_ip, rseq_cs->post_commit_offset, rseq_cs->flags,
+		rseq_cs->version, (unsigned long)TI_IP(core));
+
+	if (rseq_cs->version != 0) {
+		pr_err("unsupported RSEQ ABI version = %d\n", rseq_cs->version);
+		return -1;
+	}
+
+	if (task_in_rseq(rseq_cs, TI_IP(core))) {
+		struct pid *tid = &item->threads[i];
+
+		/*
+		 * We need to fixup task instruction pointer from
+		 * the original one (which lays inside rseq critical section)
+		 * to rseq abort handler address. But we need to look on rseq_cs->flags
+		 * (please refer to struct rseq -> flags field description).
+		 * Naive idea of flags support may be like... let's change instruction pointer (IP)
+		 * to rseq_cs->abort_ip if !(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL).
+		 * But unfortunately, it doesn't work properly, because the kernel does
+		 * clean up of rseq_cs field in the struct rseq (modifies userspace memory).
+		 * So, we need to preserve original value of (struct rseq)->rseq_cs field in the
+		 * image and restore it's value before releasing threads (see restore_rseq_cs()).
+		 *
+		 * It's worth to mention that we need to fixup IP in CoreEntry
+		 * (used when full dump/restore is performed) and also in
+		 * the parasite regs storage (used if --leave-running option is used,
+		 * or if dump error occurred and process execution is resumed).
+		 */
+
+		if (!(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL)) {
+			pr_warn("The %d task is in rseq critical section. IP will be set to rseq abort handler addr\n",
+				tid->real);
+
+			TI_IP(core) = rseq_cs->abort_ip;
+
+			if (item->pid->real == tid->real) {
+				compel_set_leader_ip(dmpi(item)->parasite_ctl, rseq_cs->abort_ip);
+			} else {
+				compel_set_thread_ip(dmpi(item)->thread_ctls[i], rseq_cs->abort_ip);
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item, int id)
 {
 	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
@@ -892,6 +978,12 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[id]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
 
+	ret = fixup_thread_rseq(item, id);
+	if (ret) {
+		pr_err("Can't fixup rseq for pid %d\n", pid);
+		goto err;
+	}
+
 	img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
 	if (!img)
 		goto err;
@@ -900,6 +992,7 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 
 	close_image(img);
 err:
+	compel_release_thread(tctl);
 	pr_info("----------------------------------------\n");
 	return ret;
 }
@@ -914,7 +1007,7 @@ static int dump_one_zombie(const struct pstree_item *item, const struct proc_pid
 	if (!core)
 		return -1;
 
-	strlcpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
+	__strlcpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
 	core->tc->task_state = TASK_DEAD;
 	core->tc->exit_code = pps->exit_code;
 
@@ -1036,7 +1129,7 @@ static int dump_task_signals(pid_t pid, struct pstree_item *item)
 	return 0;
 }
 
-static int read_rseq_cs(pid_t tid, struct __ptrace_rseq_configuration *rseqc, struct rseq_cs *rseq_cs,
+static int read_rseq_cs(pid_t tid, struct __ptrace_rseq_configuration *rseqc, struct criu_rseq_cs *rseq_cs,
 			struct criu_rseq *rseq)
 {
 	int ret;
@@ -1067,10 +1160,11 @@ static int read_rseq_cs(pid_t tid, struct __ptrace_rseq_configuration *rseqc, st
 	if (!rseq->rseq_cs)
 		return 0;
 
-	ret = ptrace_peek_area(tid, rseq_cs, decode_pointer(rseq->rseq_cs), sizeof(struct rseq_cs));
+	ret = ptrace_peek_area(tid, rseq_cs, decode_pointer(rseq->rseq_cs), sizeof(struct criu_rseq_cs));
 	if (ret) {
 		pr_err("ptrace_peek_area(%d, %lx, %lx, %lx): fail to read rseq_cs struct\n", tid,
-		       (unsigned long)rseq_cs, (unsigned long)rseq->rseq_cs, (unsigned long)sizeof(struct rseq_cs));
+		       (unsigned long)rseq_cs, (unsigned long)rseq->rseq_cs,
+		       (unsigned long)sizeof(struct criu_rseq_cs));
 		return -1;
 	}
 
@@ -1085,7 +1179,7 @@ static int dump_thread_rseq(struct pstree_item *item, int i)
 	CoreEntry *core = item->core[i];
 	RseqEntry **rseqep = &core->thread_core->rseq_entry;
 	struct criu_rseq rseq = {};
-	struct rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
+	struct criu_rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
 	pid_t tid = item->threads[i].real;
 
 	/*
@@ -1151,7 +1245,7 @@ err:
 static int dump_task_rseq(pid_t pid, struct pstree_item *item)
 {
 	int i;
-	struct rseq_cs *thread_rseq_cs;
+	struct criu_rseq_cs *thread_rseq_cs;
 
 	/* if rseq() syscall isn't supported then nothing to dump */
 	if (!kdat.has_rseq)
@@ -1176,95 +1270,11 @@ free_rseq:
 	return -1;
 }
 
-static bool task_in_rseq(struct rseq_cs *rseq_cs, uint64_t addr)
-{
-	return addr >= rseq_cs->start_ip && addr < rseq_cs->start_ip + rseq_cs->post_commit_offset;
-}
-
-static int fixup_thread_rseq(struct pstree_item *item, int i)
-{
-	CoreEntry *core = item->core[i];
-	struct rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
-	pid_t tid = item->threads[i].real;
-
-	/* equivalent to (struct rseq)->rseq_cs is NULL */
-	if (!rseq_cs->start_ip)
-		return 0;
-
-	pr_debug(
-		"fixup_thread_rseq for %d: rseq_cs start_ip = %llx abort_ip = %llx post_commit_offset = %llx flags = %x version = %x; IP = %lx\n",
-		tid, rseq_cs->start_ip, rseq_cs->abort_ip, rseq_cs->post_commit_offset, rseq_cs->flags,
-		rseq_cs->version, (unsigned long)TI_IP(core));
-
-	if (rseq_cs->version != 0) {
-		pr_err("unsupported RSEQ ABI version = %d\n", rseq_cs->version);
-		return -1;
-	}
-
-	if (task_in_rseq(rseq_cs, TI_IP(core))) {
-		struct pid *tid = &item->threads[i];
-
-		/*
-		 * We need to fixup task instruction pointer from
-		 * the original one (which lays inside rseq critical section)
-		 * to rseq abort handler address. But we need to look on rseq_cs->flags
-		 * (please refer to struct rseq -> flags field description).
-		 * Naive idea of flags support may be like... let's change instruction pointer (IP)
-		 * to rseq_cs->abort_ip if !(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL).
-		 * But unfortunately, it doesn't work properly, because the kernel does
-		 * clean up of rseq_cs field in the struct rseq (modifies userspace memory).
-		 * So, we need to preserve original value of (struct rseq)->rseq_cs field in the
-		 * image and restore it's value before releasing threads (see restore_rseq_cs()).
-		 *
-		 * It's worth to mention that we need to fixup IP in CoreEntry
-		 * (used when full dump/restore is performed) and also in
-		 * the parasite regs storage (used if --leave-running option is used,
-		 * or if dump error occurred and process execution is resumed).
-		 */
-
-		if (!(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL)) {
-			pr_warn("The %d task is in rseq critical section. IP will be set to rseq abort handler addr\n",
-				tid->real);
-
-			TI_IP(core) = rseq_cs->abort_ip;
-
-			if (item->pid->real == tid->real) {
-				compel_set_leader_ip(dmpi(item)->parasite_ctl, rseq_cs->abort_ip);
-			} else {
-				compel_set_thread_ip(dmpi(item)->thread_ctls[i], rseq_cs->abort_ip);
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int fixup_task_rseq(pid_t pid, struct pstree_item *item)
-{
-	int ret = 0;
-	int i;
-
-	if (!kdat.has_ptrace_get_rseq_conf)
-		return 0;
-
-	for (i = 0; i < item->nr_threads; i++) {
-		if (fixup_thread_rseq(item, i)) {
-			ret = -1;
-			goto exit;
-		}
-	}
-
-exit:
-	xfree(dmpi(item)->thread_rseq_cs);
-	dmpi(item)->thread_rseq_cs = NULL;
-	return ret;
-}
-
 static struct proc_pid_stat pps_buf;
 
 static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
 {
-	int i;
+	int i, ret = 0;
 
 	for (i = 0; i < item->nr_threads; i++) {
 		/* Leader is already dumped */
@@ -1272,11 +1282,14 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pst
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		if (dump_task_thread(parasite_ctl, item, i))
-			return -1;
+		ret = dump_task_thread(parasite_ctl, item, i);
+		if (ret)
+			break;
 	}
 
-	return 0;
+	xfree(dmpi(item)->thread_rseq_cs);
+	dmpi(item)->thread_rseq_cs = NULL;
+	return ret;
 }
 
 /*
@@ -1405,6 +1418,39 @@ err:
 	return ret;
 }
 
+static int dump_task_cgroup(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+{
+	struct parasite_dump_cgroup_args cgroup_args, *info;
+	int i;
+
+	BUILD_BUG_ON(sizeof(cgroup_args) < PARASITE_ARG_SIZE_MIN);
+	for (i = 0; i < item->nr_threads; i++) {
+		CoreEntry *core = item->core[i];
+
+		/* Leader is already dumped */
+		if (item->pid->real == item->threads[i].real)
+			continue;
+
+		/* For now, we only need to dump the root task's cgroup ns, because we
+		 * know all the tasks are in the same cgroup namespace because we don't
+		 * allow nesting.
+		 */
+		info = NULL;
+		if (item->ids->has_cgroup_ns_id && !item->parent) {
+			info = &cgroup_args;
+			sprintf(cgroup_args.thread_cgrp, "self/task/%d/cgroup", item->threads[i].ns[0].virt);
+			if (parasite_dump_cgroup(parasite_ctl, &cgroup_args))
+				return -1;
+		}
+
+		core->thread_core->has_cg_set = true;
+		if (dump_thread_cgroup(item, &core->thread_core->cg_set, info, i))
+			return -1;
+	}
+
+	return 0;
+}
+
 static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
@@ -1417,7 +1463,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
-	pr_info("Pre-dumping task (pid: %d)\n", pid);
+	pr_info("Pre-dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	/*
@@ -1520,7 +1566,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
-	pr_info("Dumping task (pid: %d)\n", pid);
+	pr_info("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	if (item->pid->state == TASK_DEAD)
@@ -1580,7 +1626,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err;
 	}
 
-	ret = fixup_task_rseq(pid, item);
+	ret = fixup_thread_rseq(item, 0);
 	if (ret) {
 		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
@@ -1700,6 +1746,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	ret = dump_task_cgroup(parasite_ctl, item);
+	if (ret) {
+		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
@@ -2011,7 +2063,6 @@ static int cr_dump_finish(int ret)
 	if (bfd_flush_images())
 		ret = -1;
 
-	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 	cgp_fini();
 
 	if (!ret) {
@@ -2065,6 +2116,9 @@ static int cr_dump_finish(int ret)
 
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
+
+	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
@@ -2077,7 +2131,11 @@ static int cr_dump_finish(int ret)
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
 
-	if (ret) {
+	if (ret || post_dump_ret) {
+		if (fault_injected(FI_DUMP_CRASH)) {
+			pr_info("fault: CRIU dump crashed!\n");
+			abort();
+		}
 		pr_err("Dumping FAILED.\n");
 	} else {
 		write_stats(DUMP_STATS);
@@ -2095,7 +2153,7 @@ int cr_dump_tasks(pid_t pid)
 	int ret = -1;
 
 	pr_info("========================================\n");
-	pr_info("Dumping processes (pid: %d)\n", pid);
+	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	/*
@@ -2166,6 +2224,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (network_lock())
+		goto err;
+
+	if (rpc_query_external_files())
 		goto err;
 
 	if (collect_file_locks())

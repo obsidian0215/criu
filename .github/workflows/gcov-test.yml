@@ -2,12 +2,17 @@ name: Coverage Tests
 
 on: [push, pull_request]
 
+# Cancel any preceding run on the pull request.
+concurrency:
+  group: gcov-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/criu-dev' }}
+
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Run Coverage Tests
       run: sudo -E make -C scripts/ci local GCOV=1
     - name: Run gcov

@@ -155,6 +155,17 @@ not compatible with *--external* *dev*.
             notification message contains a file descriptor for
             the master pty
 
+        *query-ext-files*:::
+            called after the process tree is stopped and network is locked.
+            This hook is used only in the RPC mode. The notification reply
+            contains file ids to be added to external file list (may be empty).
+
+*--unprivileged*::
+    This option tells *criu* to accept the limitations when running
+    as non-root. Running as non-root requires *criu* at least to have
+    *CAP_SYS_ADMIN* or *CAP_CHECKPOINT_RESTORE*. For details about running
+    *criu* as non-root please consult the *NON-ROOT* section.
+
 *-V*, *--version*::
     Print program version and exit.
 
@@ -378,6 +389,13 @@ mount -t cgroup -o devices,freezer none devices,freezer
     'size' may be postfixed with a *K*, *M* or *G*, which stands for kilo-,
     mega, and gigabytes, accordingly.
 
+*--ghost-fiemap*::
+    Enable an optimization based on fiemap ioctl that can reduce the
+    number of system calls used when checkpointing highly sparse ghost
+    files. This option is enabled by default, and it can be disabled
+    with *--no-ghost-fiemap*. An automatic fallback to SEEK_HOLE/SEEK_DATA
+    is used when fiemap is not supported.
+
 *-j*, *--shell-job*::
     Allow one to dump shell jobs. This implies the restored task will
     inherit session and process group ID from the *criu* itself.
@@ -443,6 +461,9 @@ The 'mode' may be one of the following:
     This is the default if 'mode' is not specified.
 
     *nftables*::: Use nftables rules to drop the packets.
+
+    *skip*::: Don't lock the network. If *--tcp-close* is not used, the network
+    must be locked externally to allow CRIU to dump TCP connections.
 
 *restore*
 ~~~~~~~~~
@@ -668,6 +689,9 @@ The 'mode' may be one of the following:
                 build-ID cannot be obtained, 'chksm-first' method will be
                 used. This is the default if mode is unspecified.
 
+*--skip-file-rwx-check*::
+    Skip checking file permissions (r/w/x for u/g/o) on restore.
+
 *check*
 ~~~~~~~
 Checks whether the kernel supports the features needed by *criu* to
@@ -873,6 +897,42 @@ via "req.opts.config_file = '/path/to/file'". The values from this
 configuration file will overwrite all other configuration file settings
 or RPC options. *This can lead to undesired behavior of criu and
 should only be used carefully.*
+
+NON-ROOT
+--------
+*criu* can be used as non-root with either the *CAP_SYS_ADMIN* capability
+or with the *CAP_CHECKPOINT_RESTORE* capability introduces in Linux kernel 5.9.
+*CAP_CHECKPOINT_RESTORE* is the minimum that is required.
+
+*criu* also needs either *CAP_SYS_PTRACE* or a value of 0 in
+*/proc/sys/kernel/yama/ptrace_scope* (see *ptrace*(2)) to be able to interrupt
+the process for dumping.
+
+Running *criu* as non-root has many limitations and depending on the process
+to checkpoint and restore it may not be possible.
+
+In addition to *CAP_CHECKPOINT_RESTORE* it is possible to give *criu* additional
+capabilities to enable additional features in non-root mode.
+
+Currently *criu* can benefit from the following additional capabilities:
+
+    - *CAP_NET_ADMIN*
+    - *CAP_SYS_CHROOT*
+    - *CAP_SETUID*
+    - *CAP_SYS_RESOURCE*
+
+Note that for some operations, having a capability in a namespace other than
+the init namespace (i.e. the default/root namespace) is not sufficient. For
+example, in order to read symlinks in proc/[pid]/map_files CRIU requires
+CAP_CHECKPOINT_RESTORE in the init namespace; having CAP_CHECKPOINT_RESTORE
+while running in another user namespace (e.g. in a container) does not allow
+CRIU to read symlinks in /proc/[pid]/map_files.
+
+Without access to /proc/[pid]/map_files checkpointing/restoring processes
+that have mapped deleted files may not be possible.
+
+Independent of the capabilities it is always necessary to use "*--unprivileged*" to
+accept *criu*'s limitation in non-root mode.
 
 EXAMPLES
 --------

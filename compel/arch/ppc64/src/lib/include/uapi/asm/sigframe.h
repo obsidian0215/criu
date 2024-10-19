@@ -14,7 +14,7 @@
  */
 #include <signal.h>
 
-// XXX: the idetifier rt_sigcontext is expected to be struct by the CRIU code
+// XXX: the identifier rt_sigcontext is expected to be struct by the CRIU code
 #define rt_sigcontext sigcontext
 
 #include <compel/sigframe-common.h>
@@ -23,6 +23,11 @@
 
 /* Copied from the Linux kernel header arch/powerpc/include/asm/ptrace.h */
 #define USER_REDZONE_SIZE 512
+#if _CALL_ELF != 2
+#error Only supporting ABIv2.
+#else
+#define STACK_FRAME_MIN_SIZE 32
+#endif
 
 /* Copied from the Linux kernel source file arch/powerpc/kernel/signal_64.c */
 #define TRAMP_SIZE 6

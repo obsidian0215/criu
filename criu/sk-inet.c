@@ -14,6 +14,8 @@
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
 #include <poll.h>
+#include <linux/in.h>
+#include <linux/in6.h>
 
 #include "../soccr/soccr.h"
 
@@ -388,6 +390,10 @@ static int dump_ip_raw_opts(int sk, int family, int proto, IpOptsRawEntry *r)
 	return ret;
 }
 
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78
+#endif
+
 static int dump_ip_opts(int sk, int family, int type, int proto, IpOptsEntry *ioe)
 {
 	int ret = 0;
@@ -398,11 +404,25 @@ static int dump_ip_opts(int sk, int family, int type, int proto, IpOptsEntry *io
 		 * and fetch additional options.
 		 */
 		ret |= dump_ip_raw_opts(sk, family, proto, ioe->raw);
-	} else {
-		/* Due to kernel code we can use SOL_IP instead of SOL_IPV6 */
-		ret |= dump_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
-		ioe->has_freebind = ioe->freebind;
 	}
+
+	if (family == AF_INET6) {
+		if (kdat.has_ipv6_freebind)
+			ret |= dump_opt(sk, SOL_IPV6, IPV6_FREEBIND, &ioe->freebind);
+		else if (type != SOCK_RAW)
+			/* Due to kernel code we can use SOL_IP instead of SOL_IPV6 */
+			ret |= dump_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+		ret |= dump_opt(sk, SOL_IPV6, IPV6_RECVPKTINFO, &ioe->pktinfo);
+	} else {
+		ret |= dump_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+		ret |= dump_opt(sk, SOL_IP, IP_PKTINFO, &ioe->pktinfo);
+		ret |= dump_opt(sk, SOL_IP, IP_TOS, &ioe->tos);
+		ret |= dump_opt(sk, SOL_IP, IP_TTL, &ioe->ttl);
+	}
+	ioe->has_freebind = ioe->freebind;
+	ioe->has_pktinfo = !!ioe->pktinfo;
+	ioe->has_tos = !!ioe->tos;
+	ioe->has_ttl = !!ioe->ttl;
 
 	return ret;
 }
@@ -434,6 +454,7 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	IpOptsEntry ipopts = IP_OPTS_ENTRY__INIT;
 	IpOptsRawEntry ipopts_raw = IP_OPTS_RAW_ENTRY__INIT;
 	SkOptsEntry skopts = SK_OPTS_ENTRY__INIT;
+	TcpOptsEntry tcpopts = TCP_OPTS_ENTRY__INIT;
 	int ret = -1, err = -1, proto, aux, type;
 
 	ret = do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL, &proto, sizeof(proto));
@@ -501,6 +522,7 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	ie.opts = &skopts;
 	ie.ip_opts = &ipopts;
 	ie.ip_opts->raw = &ipopts_raw;
+	ie.tcp_opts = &tcpopts;
 
 	ie.n_src_addr = PB_ALEN_INET;
 	ie.n_dst_addr = PB_ALEN_INET;
@@ -561,9 +583,20 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 
 	switch (proto) {
 	case IPPROTO_TCP:
-		err = (type != SOCK_RAW) ? dump_one_tcp(lfd, sk, &skopts) : 0;
 		if (sk->shutdown)
 			sk_encode_shutdown(&ie, sk->shutdown);
+
+		if (type == SOCK_RAW) {
+			err = 0;
+		} else {
+			err = dump_tcp_opts(lfd, &tcpopts);
+			if (err < 0)
+				goto err;
+
+			err = dump_one_tcp(lfd, sk, &skopts);
+			if (err < 0)
+				goto err;
+		}
 		break;
 	case IPPROTO_UDP:
 	case IPPROTO_UDPLITE:
@@ -787,8 +820,21 @@ int restore_ip_opts(int sk, int family, int proto, IpOptsEntry *ioe)
 {
 	int ret = 0;
 
-	if (ioe->has_freebind)
-		ret |= restore_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+	if (family == AF_INET6) {
+		if (ioe->has_freebind)
+			ret |= restore_opt(sk, SOL_IPV6, IPV6_FREEBIND, &ioe->freebind);
+		if (ioe->has_pktinfo)
+			ret |= restore_opt(sk, SOL_IPV6, IPV6_RECVPKTINFO, &ioe->pktinfo);
+	} else {
+		if (ioe->has_freebind)
+			ret |= restore_opt(sk, SOL_IP, IP_FREEBIND, &ioe->freebind);
+		if (ioe->has_pktinfo)
+			ret |= restore_opt(sk, SOL_IP, IP_PKTINFO, &ioe->pktinfo);
+		if (ioe->has_tos)
+			ret |= restore_opt(sk, SOL_IP, IP_TOS, &ioe->tos);
+		if (ioe->has_ttl)
+			ret |= restore_opt(sk, SOL_IP, IP_TTL, &ioe->ttl);
+	}
 
 	if (ioe->raw)
 		ret |= restore_ip_raw_opts(sk, family, proto, ioe->raw);
@@ -904,6 +950,9 @@ done:
 		goto err;
 
 	if (restore_socket_opts(sk, ie->opts))
+		goto err;
+
+	if (ie->proto == IPPROTO_TCP && restore_tcp_opts(sk, ie->tcp_opts))
 		goto err;
 
 	if (ie->has_shutdown &&

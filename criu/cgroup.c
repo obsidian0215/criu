@@ -8,6 +8,7 @@
 #include <ftw.h>
 #include <libgen.h>
 #include <sched.h>
+#include <sys/wait.h>
 
 #include "common/list.h"
 #include "xmalloc.h"
@@ -55,6 +56,7 @@ static u32 cg_set_ids = 1;
 
 static LIST_HEAD(cgroups);
 static unsigned int n_cgroups;
+static pid_t cgroupd_pid;
 
 static CgSetEntry *find_rst_set_by_id(u32 id)
 {
@@ -174,6 +176,7 @@ struct cg_controller *new_controller(const char *name)
 	nc->n_controllers = 1;
 
 	nc->n_heads = 0;
+	nc->is_threaded = false;
 	INIT_LIST_HEAD(&nc->heads);
 
 	return nc;
@@ -371,7 +374,8 @@ static void free_all_cgroup_props(struct cgroup_dir *ncd)
 	ncd->n_properties = 0;
 }
 
-static int dump_cg_props_array(const char *fpath, struct cgroup_dir *ncd, const cgp_t *cgp)
+static int dump_cg_props_array(const char *fpath, struct cgroup_dir *ncd, const cgp_t *cgp,
+			       struct cg_controller *controller)
 {
 	int j;
 	char buf[PATH_MAX];
@@ -422,6 +426,14 @@ static int dump_cg_props_array(const char *fpath, struct cgroup_dir *ncd, const 
 			prop->value = new;
 		}
 
+		/*
+		 * Set the is_threaded flag if cgroup.type's value is threaded
+		 * or it is a cgroup v1 (it has a 'tasks' property).
+		 * Ignore all other values.
+		 */
+		if ((!strcmp("cgroup.type", prop->name) && !strcmp("threaded", prop->value)) || !strcmp("tasks", prop->name))
+			controller->is_threaded = true;
+
 		pr_info("Dumping value %s from %s/%s\n", prop->value, fpath, prop->name);
 		list_add_tail(&prop->list, &ncd->properties);
 		ncd->n_properties++;
@@ -437,12 +449,20 @@ static int add_cgroup_properties(const char *fpath, struct cgroup_dir *ncd, stru
 	for (i = 0; i < controller->n_controllers; ++i) {
 		const cgp_t *cgp = cgp_get_props(controller->controllers[i]);
 
-		if (dump_cg_props_array(fpath, ncd, cgp) < 0) {
+		if (dump_cg_props_array(fpath, ncd, cgp, controller) < 0) {
 			pr_err("dumping known properties failed\n");
 			return -1;
 		}
+	}
 
-		if (dump_cg_props_array(fpath, ncd, &cgp_global) < 0) {
+	/* cgroup v2 */
+	if (controller->controllers[0][0] == 0) {
+		if (dump_cg_props_array(fpath, ncd, &cgp_global_v2, controller) < 0) {
+			pr_err("dumping global properties v2 failed\n");
+			return -1;
+		}
+	} else {
+		if (dump_cg_props_array(fpath, ncd, &cgp_global, controller) < 0) {
 			pr_err("dumping global properties failed\n");
 			return -1;
 		}
@@ -561,14 +581,15 @@ static int __new_open_cgroupfs(struct cg_ctl *cc)
 	int fsfd, fd;
 	char *name;
 
-	fsfd = sys_fsopen(fstype, 0);
+	fsfd = cr_fsopen(fstype, 0);
 	if (fsfd < 0) {
 		pr_perror("Unable to open the cgroup file system");
 		return -1;
 	}
 
 	if (strstartswith(cc->name, namestr)) {
-		if (sys_fsconfig(fsfd, FSCONFIG_SET_STRING, "name", cc->name + strlen(namestr), 0)) {
+		if (cr_fsconfig(fsfd, FSCONFIG_SET_STRING, "name", cc->name + strlen(namestr), 0)) {
+			fsfd_dump_messages(fsfd);
 			pr_perror("Unable to configure the cgroup (%s) file system", cc->name);
 			goto err;
 		}
@@ -576,7 +597,8 @@ static int __new_open_cgroupfs(struct cg_ctl *cc)
 		char *saveptr = NULL, *buf = strdupa(cc->name);
 		name = strtok_r(buf, ",", &saveptr);
 		while (name) {
-			if (sys_fsconfig(fsfd, FSCONFIG_SET_FLAG, name, NULL, 0)) {
+			if (cr_fsconfig(fsfd, FSCONFIG_SET_FLAG, name, NULL, 0)) {
+				fsfd_dump_messages(fsfd);
 				pr_perror("Unable to configure the cgroup (%s) file system", name);
 				goto err;
 			}
@@ -584,14 +606,17 @@ static int __new_open_cgroupfs(struct cg_ctl *cc)
 		}
 	}
 
-	if (sys_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0)) {
+	if (cr_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0)) {
+		fsfd_dump_messages(fsfd);
 		pr_perror("Unable to create the cgroup (%s) file system", cc->name);
 		goto err;
 	}
 
-	fd = sys_fsmount(fsfd, 0, 0);
-	if (fd < 0)
+	fd = cr_fsmount(fsfd, 0, 0);
+	if (fd < 0) {
+		fsfd_dump_messages(fsfd);
 		pr_perror("Unable to mount the cgroup (%s) file system", cc->name);
+	}
 	close(fsfd);
 
 	return fd;
@@ -620,8 +645,8 @@ static int open_cgroupfs(struct cg_ctl *cc)
 		return -1;
 	}
 
-	if (mount("none", prefix, fstype, 0, mopts) < 0) {
-		pr_perror("Unable to mount %s", mopts);
+	if (mount("none", prefix, fstype, 0, mopts[0] ? mopts : NULL) < 0) {
+		pr_perror("Unable to mount %s %s", fstype, mopts);
 		rmdir(prefix);
 		return -1;
 	}
@@ -695,6 +720,8 @@ static int collect_cgroups(struct list_head *ctls)
 			}
 		} else {
 			fd = open_cgroupfs(cc);
+			if (fd < 0)
+				return -1;
 		}
 
 		path_pref_len = snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
@@ -727,20 +754,28 @@ static int collect_cgroups(struct list_head *ctls)
 	return 0;
 }
 
-int dump_task_cgroup(struct pstree_item *item, u32 *cg_id, struct parasite_dump_cgroup_args *args)
+int dump_thread_cgroup(const struct pstree_item *item, u32 *cg_id, struct parasite_dump_cgroup_args *args, int id)
 {
-	int pid;
+	int pid, tid;
 	LIST_HEAD(ctls);
 	unsigned int n_ctls = 0;
 	struct cg_set *cs;
+
+	if (opts.unprivileged)
+		return 0;
 
 	if (item)
 		pid = item->pid->real;
 	else
 		pid = getpid();
 
-	pr_info("Dumping cgroups for %d\n", pid);
-	if (parse_task_cgroup(pid, args, &ctls, &n_ctls))
+	if (id < 0)
+		tid = pid;
+	else
+		tid = item->threads[id].real;
+
+	pr_info("Dumping cgroups for thread %d\n", tid);
+	if (parse_thread_cgroup(pid, tid, args, &ctls, &n_ctls))
 		return -1;
 
 	cs = get_cg_set(&ctls, n_ctls, item);
@@ -753,9 +788,10 @@ int dump_task_cgroup(struct pstree_item *item, u32 *cg_id, struct parasite_dump_
 		pr_info("Set %d is criu one\n", cs->id);
 	} else {
 		if (item == root_item) {
-			BUG_ON(root_cgset);
-			root_cgset = cs;
-			pr_info("Set %d is root one\n", cs->id);
+			if (!root_cgset) {
+				root_cgset = cs;
+				pr_info("Set %d is root one\n", cs->id);
+			}
 		} else {
 			struct cg_ctl *root, *stray;
 
@@ -902,6 +938,8 @@ static int dump_controllers(CgroupEntry *cg)
 	list_for_each_entry(cur, &cgroups, l) {
 		cg_controller_entry__init(ce);
 
+		ce->has_is_threaded = true;
+		ce->is_threaded = cur->is_threaded;
 		ce->cnames = cur->controllers;
 		ce->n_cnames = cur->n_controllers;
 		ce->n_dirs = cur->n_heads;
@@ -989,6 +1027,9 @@ int dump_cgroups(void)
 	CgroupEntry cg = CGROUP_ENTRY__INIT;
 	int ret = -1;
 
+	if (opts.unprivileged)
+		return 0;
+
 	BUG_ON(!criu_cgset || !root_cgset);
 
 	/*
@@ -1055,8 +1096,15 @@ static int ctrl_dir_and_opt(CgControllerEntry *ctl, char *dir, int ds, char *opt
  * it. We restore these properties as soon as the cgroup is created.
  */
 static const char *special_props[] = {
-	"cpuset.cpus",	     "cpuset.mems",	   "devices.list",	   "memory.kmem.limit_in_bytes",
-	"memory.swappiness", "memory.oom_control", "memory.use_hierarchy", NULL,
+	"cpuset.cpus",
+	"cpuset.mems",
+	"devices.list",
+	"memory.kmem.limit_in_bytes",
+	"memory.swappiness",
+	"memory.oom_control",
+	"memory.use_hierarchy",
+	"cgroup.type",
+	NULL,
 };
 
 bool is_special_property(const char *prop)
@@ -1162,16 +1210,11 @@ static int prepare_cgns(CgSetEntry *se)
 	return 0;
 }
 
-static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
+static int move_in_cgroup(CgSetEntry *se)
 {
 	int i;
 
 	pr_info("Move into %d\n", se->id);
-
-	if (setup_cgns && prepare_cgns(se) < 0) {
-		pr_err("failed preparing cgns\n");
-		return -1;
-	}
 
 	for (i = 0; i < se->n_ctls; i++) {
 		char aux[PATH_MAX];
@@ -1212,7 +1255,44 @@ static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
 	return 0;
 }
 
-int prepare_task_cgroup(struct pstree_item *me)
+int prepare_cgroup_namespace(struct pstree_item *root_task)
+{
+	CgSetEntry *se;
+
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
+
+	if (root_task->parent) {
+		pr_err("Expecting root_task to restore cgroup namespace\n");
+		return -1;
+	}
+
+	/*
+	 * If on dump all dumped tasks are in same cgset with criu we don't
+	 * dump cgsets and thus cgroup namespaces and rely that on restore
+	 * criu caller would prepare proper cgset/cgns for us. Also in case
+	 * of --unprivileged we don't even have the root cgset here.
+	 */
+	if (!rsti(root_task)->cg_set || rsti(root_task)->cg_set == root_cg_set) {
+		pr_info("Cgroup namespace inherited from parent\n");
+		return 0;
+	}
+
+	se = find_rst_set_by_id(rsti(root_task)->cg_set);
+	if (!se) {
+		pr_err("No set %d found\n", rsti(root_task)->cg_set);
+		return -1;
+	}
+
+	if (prepare_cgns(se) < 0) {
+		pr_err("failed preparing cgns\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+int restore_task_cgroup(struct pstree_item *me)
 {
 	struct pstree_item *parent = me->parent;
 	CgSetEntry *se;
@@ -1244,13 +1324,7 @@ int prepare_task_cgroup(struct pstree_item *me)
 		return -1;
 	}
 
-	/* Since don't support nesting of cgroup namespaces, let's only set up
-	 * the cgns (if it exists) in the init task. In the future, we should
-	 * just check that the cgns prefix string matches for all the entries
-	 * in the cgset, and only unshare if that's true.
-	 */
-
-	return move_in_cgroup(se, !me->parent);
+	return move_in_cgroup(se);
 }
 
 void fini_cgroup(void)
@@ -1269,39 +1343,75 @@ void fini_cgroup(void)
 	cg_yard = NULL;
 }
 
-static int restore_perms(int fd, const char *path, CgroupPerms *perms)
+static int add_subtree_control_prop_prefix(char *input, char *output, char prefix)
 {
-	struct stat sb;
+	char *current, *next;
+	size_t len, off = 0;
 
-	if (perms) {
-		if (fstat(fd, &sb) < 0) {
-			pr_perror("stat of property %s failed", path);
-			return -1;
-		}
+	current = input;
+	do {
+		next = strchrnul(current, ' ');
+		len = next - current;
 
-		/* only chmod/chown if the perms are actually different: we aren't
-		 * allowed to chmod some cgroup props (e.g. the read only ones), so we
-		 * don't want to try if the perms already match.
-		 */
-		if (sb.st_mode != (mode_t)perms->mode && fchmod(fd, perms->mode) < 0) {
-			pr_perror("chmod of %s failed", path);
-			return -1;
-		}
+		output[off] = prefix;
+		off++;
+		memcpy(output + off, current, len);
+		off += len;
+		output[off] = ' ';
+		off++;
 
-		if ((sb.st_uid != perms->uid || sb.st_gid != perms->gid) && fchown(fd, perms->uid, perms->gid)) {
-			pr_perror("chown of %s failed", path);
-			return -1;
-		}
+		current = next + 1;
+	} while (*next != '\0');
+
+	return off;
+}
+
+static int restore_cgroup_subtree_control(const CgroupPropEntry *cg_prop_entry_p, int fd)
+{
+	char buf[1024];
+	char line[1024];
+	int ret, off = 0;
+
+	ret = read(fd, buf, sizeof(buf) - 1);
+	if (ret < 0) {
+		pr_perror("read from cgroup.subtree_control");
+		return ret;
+	}
+	/* Remove the trailing newline */
+	buf[ret] = '\0';
+
+	/* Remove all current subsys in subtree_control */
+	if (buf[0] != '\0')
+		off = add_subtree_control_prop_prefix(buf, line, '-');
+
+	/* Add subsys need to be restored in subtree_control */
+	if (cg_prop_entry_p->value[0] != '\0')
+		off += add_subtree_control_prop_prefix(cg_prop_entry_p->value, line + off, '+');
+
+	/* Remove the trailing space */
+	if (off != 0) {
+		off--;
+		line[off] = '\0';
+	}
+
+	if (write(fd, line, off) != off) {
+		pr_perror("write to cgroup.subtree_control");
+		return -1;
 	}
 
 	return 0;
 }
 
+/*
+ * Note: The path string can be modified in this function,
+ * the length of path string should be at least PATH_MAX.
+ */
 static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *path, int off, bool split_lines,
 			       bool skip_fails)
 {
-	int cg, fd, ret = -1;
+	int cg, fd, exit_code = -1, flag;
 	CgroupPerms *perms = cg_prop_entry_p->perms;
+	int is_subtree_control = !strcmp(cg_prop_entry_p->name, "cgroup.subtree_control");
 
 	if (opts.manage_cgroups == CG_MODE_IGNORE)
 		return 0;
@@ -1318,19 +1428,35 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 
 	pr_info("Restoring cgroup property value [%s] to [%s]\n", cg_prop_entry_p->value, path);
 
+	if (is_subtree_control)
+		flag = O_RDWR;
+	else
+		flag = O_WRONLY;
+
 	cg = get_service_fd(CGROUP_YARD);
-	fd = openat(cg, path, O_WRONLY);
+	fd = openat(cg, path, flag);
 	if (fd < 0) {
 		pr_perror("bad cgroup path: %s", path);
 		return -1;
 	}
 
-	if (restore_perms(fd, path, perms) < 0)
+	if (perms && cr_fchperm(fd, perms->uid, perms->gid, perms->mode) < 0)
 		goto out;
 
 	/* skip these two since restoring their values doesn't make sense */
 	if (!strcmp(cg_prop_entry_p->name, "cgroup.procs") || !strcmp(cg_prop_entry_p->name, "tasks")) {
-		ret = 0;
+		exit_code = 0;
+		goto out;
+	}
+
+	if (is_subtree_control) {
+		exit_code = restore_cgroup_subtree_control(cg_prop_entry_p, fd);
+		goto out;
+	}
+
+	/* skip restoring cgroup.type if its value is not "threaded" */
+	if (!strcmp(cg_prop_entry_p->name, "cgroup.type") && strcmp(cg_prop_entry_p->value, "threaded")) {
+		exit_code = 0;
 		goto out;
 	}
 
@@ -1352,21 +1478,28 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 		} while (*next_line != '\0');
 	} else {
 		size_t len = strlen(cg_prop_entry_p->value);
+		int ret;
 
-		if (write(fd, cg_prop_entry_p->value, len) != len) {
+		ret = write(fd, cg_prop_entry_p->value, len);
+		/* memory.kmem.limit_in_bytes has been deprecated. Look at
+		 * 58056f77502f3 ("memcg, kmem: further deprecate
+		 * kmem.limit_in_bytes") for more details. */
+		if (ret == -1 && errno == EOPNOTSUPP &&
+		    !strcmp(cg_prop_entry_p->name, "memory.kmem.limit_in_bytes"))
+			ret = len;
+		if (ret != len) {
 			pr_perror("Failed writing %s to %s", cg_prop_entry_p->value, path);
 			if (!skip_fails)
 				goto out;
 		}
 	}
 
-	ret = 0;
-
+	exit_code = 0;
 out:
 	if (close(fd) != 0)
 		pr_perror("Failed closing %s", path);
 
-	return ret;
+	return exit_code;
 }
 
 static CgroupPropEntry *freezer_state_entry;
@@ -1631,7 +1764,7 @@ static int restore_special_props(char *paux, size_t off, CgroupDirEntry *e)
 
 static int prepare_dir_perms(int cg, char *path, CgroupPerms *perms)
 {
-	int fd, ret;
+	int fd, ret = 0;
 
 	fd = openat(cg, path, O_DIRECTORY);
 	if (fd < 0) {
@@ -1639,7 +1772,8 @@ static int prepare_dir_perms(int cg, char *path, CgroupPerms *perms)
 		return -1;
 	}
 
-	ret = restore_perms(fd, path, perms);
+	if (perms)
+		ret = cr_fchperm(fd, perms->uid, perms->gid, perms->mode);
 	close(fd);
 	return ret;
 }
@@ -1678,12 +1812,9 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 				return -1;
 
 			for (j = 0; j < n_controllers; j++) {
-				if (!strcmp(controllers[j], "cpuset") || !strcmp(controllers[j], "memory") ||
-				    !strcmp(controllers[j], "devices")) {
-					if (restore_special_props(paux, off2, e) < 0) {
-						pr_err("Restoring special cpuset props failed!\n");
-						return -1;
-					}
+				if (restore_special_props(paux, off2, e) < 0) {
+					pr_err("Restoring special cpuset props failed!\n");
+					return -1;
 				}
 			}
 		} else {
@@ -1797,7 +1928,7 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 			if (ctrl->cnames[0][0] == 0)
 				fstype = "cgroup2";
 
-			pr_debug("\tMaking controller dir %s (%s)\n", paux, opt);
+			pr_debug("\tMaking controller dir %s (%s), type %s\n", paux, opt, fstype);
 			if (mkdir(paux, 0700)) {
 				pr_perror("\tCan't make controller dir %s", paux);
 				return -1;
@@ -1816,6 +1947,161 @@ static int prepare_cgroup_sfd(CgroupEntry *ce)
 		if (opts.manage_cgroups &&
 		    prepare_cgroup_dirs(ctrl->cnames, ctrl->n_cnames, yard, yard_off, ctrl->dirs, ctrl->n_dirs))
 			return -1;
+	}
+
+	return 0;
+}
+
+static int cgroupd_unblock_sigterm(void)
+{
+	sigset_t unblockmask;
+
+	sigemptyset(&unblockmask);
+	sigaddset(&unblockmask, SIGTERM);
+
+	if (sigprocmask(SIG_UNBLOCK, &unblockmask, NULL)) {
+		pr_perror("cgroupd: can't unblock SIGTERM");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * If a thread is a different cgroup set than the main thread in process,
+ * it means it is in a threaded controller. This daemon receives the cg_set
+ * number from the restored thread and move this thread to the correct
+ * cgroup controllers
+ */
+static int cgroupd(int sk)
+{
+	/*
+	 * This pairs with SIGTERM in stop_cgroupd(), and ensures that cgroupd
+	 * will receive termination signal, regardless of which signal block
+	 * mask was inherited.
+	 */
+	if (cgroupd_unblock_sigterm())
+		return -1;
+
+	pr_info("cgroud: Daemon started\n");
+
+	while (1) {
+		struct unsc_msg um;
+		uns_call_t call;
+		pid_t tid;
+		int fd, cg_set, i;
+		CgSetEntry *cg_set_entry;
+		int ret;
+
+		unsc_msg_init(&um, &call, &cg_set, NULL, 0, 0, NULL);
+		ret = recvmsg(sk, &um.h, 0);
+		if (ret <= 0) {
+			pr_perror("cgroupd: recv req error");
+			return -1;
+		}
+
+		unsc_msg_pid_fd(&um, &tid, &fd);
+		pr_debug("cgroupd: move process %d into cg_set %d\n", tid, cg_set);
+
+		cg_set_entry = find_rst_set_by_id(cg_set);
+		if (!cg_set_entry) {
+			pr_err("cgroupd: No set found %d\n", cg_set);
+			return -1;
+		}
+
+		for (i = 0; i < cg_set_entry->n_ctls; i++) {
+			int j, aux_off;
+			CgMemberEntry *ce = cg_set_entry->ctls[i];
+			char aux[PATH_MAX];
+			CgControllerEntry *ctrl = NULL;
+			const char *format;
+
+			for (j = 0; j < n_controllers; j++) {
+				CgControllerEntry *cur = controllers[j];
+				if (cgroup_contains(cur->cnames, cur->n_cnames, ce->name, NULL)) {
+					ctrl = cur;
+					break;
+				}
+			}
+
+			if (!ctrl) {
+				pr_err("cgroupd: No cg_controller_entry found for %s/%s\n", ce->name, ce->path);
+				return -1;
+			}
+
+			/*
+			 * This is not a threaded controller, all threads in this
+			 * process must be in this controller. Main thread has been
+			 * restored, so this thread is in this controller already.
+			 */
+			if (!ctrl->has_is_threaded || !ctrl->is_threaded)
+				continue;
+
+			aux_off = ctrl_dir_and_opt(ctrl, aux, sizeof(aux), NULL, 0);
+			format = ctrl->cnames[0][0] ? "/%s/tasks" : "/%s/cgroup.threads";
+			snprintf(aux + aux_off, sizeof(aux) - aux_off, format, ce->path);
+
+			/*
+			 * Cgroupd runs outside of the namespaces so we don't
+			 * need to use userns_call here
+			 */
+			if (userns_move(aux, 0, tid)) {
+				pr_err("cgroupd: Can't move thread %d into %s/%s\n", tid, ce->name, ce->path);
+				return -1;
+			}
+		}
+
+		/*
+		 * We only want to send the cred which contains thread id back.
+		 * The restored thread recvmsg(MSG_PEEK) until it gets its own
+		 * thread id.
+		 */
+		unsc_msg_init(&um, &call, &cg_set, NULL, 0, 0, &tid);
+		if (sendmsg(sk, &um.h, 0) <= 0) {
+			pr_perror("cgroupd: send req error");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int stop_cgroupd(void)
+{
+	if (cgroupd_pid) {
+		sigset_t blockmask, oldmask;
+
+		/*
+		 * Block the SIGCHLD signal to avoid triggering
+		 * sigchld_handler()
+		 */
+		sigemptyset(&blockmask);
+		sigaddset(&blockmask, SIGCHLD);
+		sigprocmask(SIG_BLOCK, &blockmask, &oldmask);
+
+		kill(cgroupd_pid, SIGTERM);
+		waitpid(cgroupd_pid, NULL, 0);
+
+		sigprocmask(SIG_SETMASK, &oldmask, NULL);
+	}
+
+	return 0;
+}
+
+static int prepare_cgroup_thread_sfd(void)
+{
+	int sk;
+
+	sk = start_unix_cred_daemon(&cgroupd_pid, cgroupd);
+	if (sk < 0) {
+		pr_err("failed to start cgroupd\n");
+		return -1;
+	}
+
+	if (install_service_fd(CGROUPD_SK, sk) < 0) {
+		kill(cgroupd_pid, SIGKILL);
+		waitpid(cgroupd_pid, NULL, 0);
+		return -1;
 	}
 
 	return 0;
@@ -1975,15 +2261,19 @@ int prepare_cgroup(void)
 	n_controllers = ce->n_controllers;
 	controllers = ce->controllers;
 
-	if (n_sets)
+	if (n_sets) {
 		/*
 		 * We rely on the fact that all sets contain the same
 		 * set of controllers. This is checked during dump
 		 * with cg_set_compare(CGCMP_ISSUB) call.
 		 */
 		ret = prepare_cgroup_sfd(ce);
-	else
+		if (ret < 0)
+			return ret;
+		ret = prepare_cgroup_thread_sfd();
+	} else {
 		ret = 0;
+	}
 
 	return ret;
 }

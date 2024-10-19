@@ -21,6 +21,8 @@
 #include <sys/prctl.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/utsname.h>
+#include <sys/stat.h>
 
 #include "../soccr/soccr.h"
 
@@ -29,7 +31,7 @@
 #include "sockets.h"
 #include "crtools.h"
 #include "log.h"
-#include "util-pie.h"
+#include "util-caps.h"
 #include "prctl.h"
 #include "files.h"
 #include "sk-inet.h"
@@ -52,6 +54,7 @@
 #include "restorer.h"
 #include "uffd.h"
 #include "linux/aio_abi.h"
+#include "mount-v2.h"
 
 #include "images/inventory.pb-c.h"
 
@@ -104,7 +107,7 @@ out:
 
 static int check_apparmor_stacking(void)
 {
-	if (!check_aa_ns_dumping())
+	if (!kdat.apparmor_ns_dumping_enabled)
 		return -1;
 
 	return 0;
@@ -514,6 +517,14 @@ err:
 static int check_ipc(void)
 {
 	int ret;
+
+	/*
+	 * Since kernel 5.16 sem_next_id can be accessed via CAP_CHECKPOINT_RESTORE, however
+	 * for non-root users access() runs with an empty set of caps and will therefore always
+	 * fail.
+	 */
+	if (opts.uid)
+		return 0;
 
 	ret = access("/proc/sys/kernel/sem_next_id", R_OK | W_OK);
 	if (!ret)
@@ -1039,10 +1050,14 @@ static int check_tcp(void)
 	}
 
 	val = 1;
-	ret = setsockopt(sk, SOL_TCP, TCP_REPAIR, &val, sizeof(val));
-	if (ret < 0) {
-		pr_perror("Can't turn TCP repair mode ON");
-		goto out;
+	if (!opts.unprivileged || has_cap_net_admin(opts.cap_eff)) {
+		ret = setsockopt(sk, SOL_TCP, TCP_REPAIR, &val, sizeof(val));
+		if (ret < 0) {
+			pr_perror("Can't turn TCP repair mode ON");
+			goto out;
+		}
+	} else {
+		pr_info("Not checking for TCP repair mode. Please set CAP_NET_ADMIN\n");
 	}
 
 	optlen = sizeof(val);
@@ -1073,6 +1088,8 @@ static int kerndat_tcp_repair_window(void)
 	int sk, val = 1;
 
 	sk = socket(AF_INET, SOCK_STREAM, 0);
+	if (sk < 0 && errno == EAFNOSUPPORT)
+		sk = socket(AF_INET6, SOCK_STREAM, 0);
 	if (sk < 0) {
 		pr_perror("Unable to create inet socket");
 		goto errn;
@@ -1180,7 +1197,7 @@ static int check_ipt_legacy(void)
 	char *ipt_legacy_bin;
 	char *ip6t_legacy_bin;
 
-	ipt_legacy_bin = get_legacy_iptables_bin(false);
+	ipt_legacy_bin = get_legacy_iptables_bin(false, false);
 	if (!ipt_legacy_bin) {
 		pr_warn("Couldn't find iptables version which is using iptables legacy API\n");
 		return -1;
@@ -1191,7 +1208,7 @@ static int check_ipt_legacy(void)
 	if (!kdat.ipv6)
 		return 0;
 
-	ip6t_legacy_bin = get_legacy_iptables_bin(true);
+	ip6t_legacy_bin = get_legacy_iptables_bin(true, false);
 	if (!ip6t_legacy_bin) {
 		pr_warn("Couldn't find ip6tables version which is using iptables legacy API\n");
 		return -1;
@@ -1311,9 +1328,6 @@ static int check_pidfd_store(void)
 
 static int check_ns_pid(void)
 {
-	if (kerndat_has_nspid() < 0)
-		return -1;
-
 	if (!kdat.has_nspid)
 		return -1;
 
@@ -1362,6 +1376,211 @@ static int check_openat2(void)
 	return 0;
 }
 
+static int check_ipv6_freebind(void)
+{
+	if (!kdat.has_ipv6_freebind)
+		return -1;
+
+	return 0;
+}
+
+static int check_pagemap_scan(void)
+{
+	if (!kdat.has_pagemap_scan)
+		return -1;
+
+	return 0;
+}
+
+/* musl doesn't have a statx wrapper... */
+struct staty {
+	__u32 stx_dev_major;
+	__u32 stx_dev_minor;
+	__u64 stx_ino;
+};
+
+static long get_file_dev_and_inode(void *addr, struct staty *stx)
+{
+	char buf[4096];
+	FILE *mapf;
+
+	mapf = fopen("/proc/self/maps", "r");
+	if (mapf == NULL) {
+		pr_perror("fopen(/proc/self/maps)");
+		return -1;
+	}
+
+	while (fgets(buf, sizeof(buf), mapf)) {
+		unsigned long start, end;
+		uint32_t maj, min;
+		__u64 ino;
+
+		if (sscanf(buf, "%lx-%lx %*s %*s %x:%x %llu",
+			   &start, &end, &maj, &min, &ino) != 5) {
+			pr_perror("Unable to parse: %s", buf);
+			return -1;
+		}
+		if (start == (unsigned long)addr) {
+			stx->stx_dev_major = maj;
+			stx->stx_dev_minor = min;
+			stx->stx_ino = ino;
+			return 0;
+		}
+	}
+
+	pr_err("Unable to find the mapping\n");
+	return -1;
+}
+
+static int ovl_mount(void)
+{
+	int tmpfs, fsfd, ovl;
+
+	fsfd = cr_fsopen("tmpfs", 0);
+	if (fsfd == -1) {
+		pr_perror("Unable to fsopen tmpfs");
+		return -1;
+	}
+
+	if (cr_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1) {
+		pr_perror("Unable to create tmpfs mount");
+		return -1;
+	}
+
+	tmpfs = cr_fsmount(fsfd, 0, 0);
+	if (tmpfs == -1) {
+		pr_perror("Unable to mount tmpfs");
+		return -1;
+	}
+
+	close(fsfd);
+
+	/* overlayfs can't be constructed on top of a detached mount. */
+	if (sys_move_mount(tmpfs, "", AT_FDCWD, "/tmp", MOVE_MOUNT_F_EMPTY_PATH)) {
+		pr_perror("Unable to attach tmpfs mount");
+		return -1;
+	}
+	close(tmpfs);
+
+	if (chdir("/tmp")) {
+		pr_perror("Unable to change working directory");
+		return -1;
+	}
+
+	if (mkdir("/tmp/w", 0755) == -1 ||
+	    mkdir("/tmp/u", 0755) == -1 ||
+	    mkdir("/tmp/l", 0755) == -1) {
+		pr_perror("mkdir");
+		return -1;
+	}
+
+	fsfd = cr_fsopen("overlay", 0);
+	if (fsfd == -1) {
+		pr_perror("Unable to fsopen overlayfs");
+		return -1;
+	}
+	if (cr_fsconfig(fsfd, FSCONFIG_SET_STRING, "source", "test", 0) == -1 ||
+	    cr_fsconfig(fsfd, FSCONFIG_SET_STRING, "lowerdir", "/tmp/l", 0) == -1 ||
+	    cr_fsconfig(fsfd, FSCONFIG_SET_STRING, "upperdir", "/tmp/u", 0) == -1 ||
+	    cr_fsconfig(fsfd, FSCONFIG_SET_STRING, "workdir", "/tmp/w", 0) == -1) {
+		pr_perror("Unable to configure overlayfs");
+		return -1;
+	}
+	if (cr_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1) {
+		pr_perror("Unable to create overlayfs");
+		return -1;
+	}
+	ovl = cr_fsmount(fsfd, 0, 0);
+	if (ovl == -1) {
+		pr_perror("Unable to mount overlayfs");
+		return -1;
+	}
+
+	return ovl;
+}
+
+/*
+ * Check that the file device and inode shown in /proc/pid/maps match values
+ * returned by stat(2).
+ */
+static int do_check_overlayfs_maps(void)
+{
+	struct staty stx, mstx;
+	struct stat st;
+	int ovl, fd;
+	void *addr;
+
+	/* Create a new mount namespace to not care about cleaning test mounts. */
+	if (unshare(CLONE_NEWNS) == -1) {
+		pr_warn("Unable to create a new mount namespace\n");
+		return 0;
+	}
+
+	if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL) == -1) {
+		pr_perror("Unable to remount / with MS_SLAVE");
+		return -1;
+	}
+
+	ovl = ovl_mount();
+	if (ovl == -1)
+		return -1;
+
+	fd = openat(ovl, "test", O_RDWR | O_CREAT, 0644);
+	if (fd == -1) {
+		pr_perror("Unable to open a test file");
+		return -1;
+	}
+
+	addr = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
+	if (addr == MAP_FAILED) {
+		pr_perror("Unable to map the test file");
+		return -1;
+	}
+
+	if (get_file_dev_and_inode(addr, &mstx))
+		return -1;
+	if (fstat(fd, &st)) {
+		pr_perror("stat");
+		return -1;
+	}
+	stx.stx_dev_major = major(st.st_dev);
+	stx.stx_dev_minor = minor(st.st_dev);
+	stx.stx_ino = st.st_ino;
+
+	if (stx.stx_dev_major != mstx.stx_dev_major ||
+	    stx.stx_dev_minor != mstx.stx_dev_minor ||
+	    stx.stx_ino != mstx.stx_ino) {
+		pr_err("unmatched dev:ino %x:%x:%llx (expected %x:%x:%llx)\n",
+		       mstx.stx_dev_major, mstx.stx_dev_minor, mstx.stx_ino,
+		       stx.stx_dev_major, stx.stx_dev_minor, stx.stx_ino);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int check_overlayfs_maps(void)
+{
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	if (pid == -1) {
+		pr_perror("Unable to fork a child");
+		return -1;
+	}
+	if (pid == 0) {
+		if (do_check_overlayfs_maps())
+			exit(1);
+		exit(0);
+	}
+	if (waitpid(pid, &status, 0) == -1) {
+		pr_perror("waitpid");
+		return -1;
+	}
+	return status == 0 ? 0 : -1;
+}
+
 static int (*chk_feature)(void);
 
 /*
@@ -1393,9 +1612,6 @@ int cr_check(void)
 {
 	struct ns_id *ns;
 	int ret = 0;
-
-	if (!is_root_user())
-		return -1;
 
 	root_item = alloc_pstree_item();
 	if (root_item == NULL)
@@ -1478,13 +1694,18 @@ int cr_check(void)
 		ret |= check_newifindex();
 		ret |= check_pidfd_store();
 		ret |= check_ns_pid();
-		ret |= check_apparmor_stacking();
 		ret |= check_network_lock_nftables();
 		ret |= check_sockopt_buf_lock();
 		ret |= check_memfd_hugetlb();
 		ret |= check_move_mount_set_group();
 		ret |= check_openat2();
 		ret |= check_ptrace_get_rseq_conf();
+		ret |= check_ipv6_freebind();
+		ret |= check_pagemap_scan();
+		ret |= check_overlayfs_maps();
+
+		if (kdat.lsm == LSMTYPE__APPARMOR)
+			ret |= check_apparmor_stacking();
 	}
 
 	/*
@@ -1602,6 +1823,9 @@ static struct feature_list feature_list[] = {
 	{ "move_mount_set_group", check_move_mount_set_group },
 	{ "openat2", check_openat2 },
 	{ "get_rseq_conf", check_ptrace_get_rseq_conf },
+	{ "ipv6_freebind", check_ipv6_freebind },
+	{ "pagemap_scan", check_pagemap_scan },
+	{ "overlayfs_maps", check_overlayfs_maps },
 	{ NULL, NULL },
 };
 
@@ -1652,4 +1876,55 @@ static char *feature_name(int (*func)(void))
 			return fl->name;
 	}
 	return NULL;
+}
+
+static int pr_set_dumpable(int value)
+{
+	int ret = prctl(PR_SET_DUMPABLE, value, 0, 0, 0);
+	if (ret < 0)
+		pr_perror("Unable to set PR_SET_DUMPABLE");
+	return ret;
+}
+
+int check_caps(void)
+{
+	/* Read out effective capabilities and store in opts.cap_eff. */
+	if (set_opts_cap_eff())
+		goto out;
+
+	/*
+	 * No matter if running as root or not. CRIU always needs
+	 * at least these capabilities.
+	 */
+	if (!has_cap_checkpoint_restore(opts.cap_eff))
+		goto out;
+
+	/* For some things we need to know if we are running as root. */
+	opts.uid = geteuid();
+
+	if (!opts.uid) {
+		/* CRIU is running as root. No further checks are necessary. */
+		return 0;
+	}
+
+	if (!opts.unprivileged) {
+		pr_msg("Running as non-root requires '--unprivileged'\n");
+		pr_msg("Please consult the documentation for limitations when running as non-root\n");
+		return -1;
+	}
+
+	/*
+	 * At his point we know we are running as non-root with the necessary
+	 * capabilities available. Now we have to make the process dumpable
+	 * so that /proc/self is not owned by root.
+	 */
+	if (pr_set_dumpable(1))
+		return -1;
+
+	return 0;
+out:
+	pr_msg("CRIU needs to have the CAP_SYS_ADMIN or the CAP_CHECKPOINT_RESTORE capability: \n");
+	pr_msg("setcap cap_checkpoint_restore+eip %s\n", opts.argv_0);
+
+	return -1;
 }

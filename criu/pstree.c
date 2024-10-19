@@ -228,6 +228,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
 	item->pid->state = TASK_UNDEF;
+	item->pid->stop_signo = -1;
 	item->born_sid = -1;
 	item->pid->item = item;
 	// [Obsidian0215] init dirty-log
@@ -390,20 +391,26 @@ static int prepare_pstree_for_shell_job(pid_t pid)
 		}
 
 		for_each_pstree_item(pi) {
+			if (pi->sid == current_sid) {
+				pr_err("Current sid %d intersects with sid of (%d) in images\n", current_sid, vpid(pi));
+				return -1;
+			}
 			if (pi->sid == old_sid)
 				pi->sid = current_sid;
 
+			if (pi->pgid == current_sid) {
+				pr_err("Current sid %d intersects with pgid of (%d) in images\n", current_sid,
+				       vpid(pi));
+				return -1;
+			}
 			if (pi->pgid == old_sid)
 				pi->pgid = current_sid;
 		}
-
-		if (lookup_create_item(current_sid) == NULL)
-			return -1;
 	}
 
 	/* root_item is a group leader */
 	if (root_item->pgid == vpid(root_item))
-		return 0;
+		goto add_fake_session_leader;
 
 	old_gid = root_item->pgid;
 	if (old_gid != current_gid) {
@@ -416,14 +423,21 @@ static int prepare_pstree_for_shell_job(pid_t pid)
 		}
 
 		for_each_pstree_item(pi) {
+			if (current_gid != current_sid && pi->pgid == current_gid) {
+				pr_err("Current gid %d intersects with pgid of (%d) in images\n", current_gid,
+				       vpid(pi));
+				return -1;
+			}
 			if (pi->pgid == old_gid)
 				pi->pgid = current_gid;
 		}
-
-		if (lookup_create_item(current_gid) == NULL)
-			return -1;
 	}
 
+	if (old_gid != current_gid && !lookup_create_item(current_gid))
+		return -1;
+add_fake_session_leader:
+	if (old_sid != current_sid && !lookup_create_item(current_sid))
+		return -1;
 	return 0;
 }
 

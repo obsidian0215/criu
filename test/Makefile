@@ -12,7 +12,7 @@ all:
 	$(MAKE) zdtm-freezer
 .PHONY: all
 
-TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs mnt-ext-dev shell-job
+TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs mnt-ext-dev shell-job criu-ns skip-file-rwx-check
 
 other:
 	for t in $(TESTS); do				\
@@ -44,10 +44,6 @@ zdtm-freezer:
 	./zdtm.py run --test zdtm/transition/thread-bomb --pre 3 --freezecg zdtm:t
 	./zdtm.py run --test zdtm/transition/thread-bomb --pre 3 --freezecg zdtm:f
 .PHONY: zdtm-freezer
-
-fault-injection:
-	$(MAKE) -C fault-injection
-.PHONY: fault-injection
 
 override CFLAGS += -D_GNU_SOURCE
 

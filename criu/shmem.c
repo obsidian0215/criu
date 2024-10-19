@@ -206,23 +206,28 @@ static int expand_shmem(struct shmem_info *si, unsigned long new_size)
 	return 0;
 }
 
-static void update_shmem_pmaps(struct shmem_info *si, u64 *map, VmaEntry *vma)
+static void update_shmem_pmaps(struct shmem_info *si, pmc_t *pmc, VmaEntry *vma)
 {
 	unsigned long shmem_pfn, vma_pfn, vma_pgcnt;
+	u64 vaddr;
 
 	if (!is_shmem_tracking_en())
 		return;
 
 	vma_pgcnt = DIV_ROUND_UP(si->size - vma->pgoff, PAGE_SIZE);
-	for (vma_pfn = 0; vma_pfn < vma_pgcnt; ++vma_pfn) {
-		if (!should_dump_page(vma, map[vma_pfn]))
+	for (vma_pfn = 0, vaddr = vma->start; vma_pfn < vma_pgcnt; ++vma_pfn, vaddr += PAGE_SIZE) {
+		bool softdirty = false;
+		u64 next;
+
+		next = should_dump_page(pmc, vma, vaddr, &softdirty);
+		if (next != vaddr) {
+			vaddr = next - PAGE_SIZE;
 			continue;
+		}
 
 		shmem_pfn = vma_pfn + DIV_ROUND_UP(vma->pgoff, PAGE_SIZE);
-		if (map[vma_pfn] & PME_SOFT_DIRTY)
+		if (softdirty)
 			set_pstate(si->pstate_map, shmem_pfn, PST_DIRTY);
-		else if (page_is_zero(map[vma_pfn]))
-			set_pstate(si->pstate_map, shmem_pfn, PST_ZERO);
 		else
 			set_pstate(si->pstate_map, shmem_pfn, PST_DUMP);
 	}
@@ -648,7 +653,7 @@ err:
 	return -1;
 }
 
-int add_shmem_area(pid_t pid, VmaEntry *vma, u64 *map)
+int add_shmem_area(pid_t pid, VmaEntry *vma, pmc_t *pmc)
 {
 	struct shmem_info *si;
 	unsigned long size = vma->pgoff + (vma->end - vma->start);
@@ -662,7 +667,7 @@ int add_shmem_area(pid_t pid, VmaEntry *vma, u64 *map)
 			if (expand_shmem(si, size))
 				return -1;
 		}
-		update_shmem_pmaps(si, map, vma);
+		update_shmem_pmaps(si, pmc, vma);
 
 		return 0;
 	}
@@ -679,7 +684,7 @@ int add_shmem_area(pid_t pid, VmaEntry *vma, u64 *map)
 
 	if (expand_shmem(si, size))
 		return -1;
-	update_shmem_pmaps(si, map, vma);
+	update_shmem_pmaps(si, pmc, vma);
 
 	return 0;
 }
@@ -750,7 +755,7 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		unsigned long pgaddr;
 		int st = -1;
 
-		if (pfn >= next_hole_pfn && next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
+		if (fd >= 0 && pfn >= next_hole_pfn && next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
 			goto err_xfer;
 
 		if (si->pstate_map && is_shmem_tracking_en()) {
@@ -808,24 +813,62 @@ static int dump_one_shmem(struct shmem_info *si)
 {
 	int fd, ret = -1;
 	void *addr;
+	unsigned long cur, remaining;
 
 	pr_info("Dumping shared memory %ld\n", si->shmid);
 
-	fd = open_proc(si->pid, "map_files/%lx-%lx", si->start, si->end);
-	if (fd < 0)
-		goto err;
+	fd = __open_proc(si->pid, EPERM, O_RDONLY, "map_files/%lx-%lx", si->start, si->end);
+	if (fd >= 0) {
+		addr = mmap(NULL, si->size, PROT_READ, MAP_SHARED, fd, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't map shmem 0x%lx (0x%lx-0x%lx)", si->shmid, si->start, si->end);
+			goto errc;
+		}
+	} else {
+		if (errno != EPERM || !opts.unprivileged) {
+			goto err;
+		}
 
-	addr = mmap(NULL, si->size, PROT_READ, MAP_SHARED, fd, 0);
-	if (addr == MAP_FAILED) {
-		pr_err("Can't map shmem 0x%lx (0x%lx-0x%lx)\n", si->shmid, si->start, si->end);
-		goto errc;
+		pr_debug("Could not access map_files/ link, falling back to /proc/$pid/mem\n");
+
+		fd = open_proc(si->pid, "mem");
+		if (fd < 0) {
+			goto err;
+		}
+
+		addr = mmap(NULL, si->size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't map empty space for shmem 0x%lx (0x%lx-0x%lx)", si->shmid, si->start, si->end);
+			goto errc;
+		}
+
+		if (lseek(fd, si->start, SEEK_SET) < 0) {
+			pr_perror("Can't seek virtual memory");
+			goto errc;
+		}
+
+		cur = 0;
+		remaining = si->size;
+		do {
+			ret = read(fd, addr + cur, remaining);
+			if (ret <= 0) {
+				pr_perror("Can't read virtual memory");
+				goto errc;
+			}
+			remaining -= ret;
+			cur += ret;
+		} while (remaining > 0);
+
+		close(fd);
+		fd = -1;
 	}
 
 	ret = do_dump_one_shmem(fd, addr, si);
 
 	munmap(addr, si->size);
 errc:
-	close(fd);
+	if (fd >= 0)
+		close(fd);
 err:
 	return ret;
 }

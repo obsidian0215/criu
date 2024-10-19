@@ -1,10 +1,12 @@
 #ifndef __CR_OPTIONS_H__
 #define __CR_OPTIONS_H__
 
-#include <sys/types.h>
 #include <stdbool.h>
+#include <sys/capability.h>
 #include "common/config.h"
 #include "common/list.h"
+#include "int.h"
+#include "image.h"
 
 /* Configuration and CLI parsing order defines */
 #define PARSING_GLOBAL_CONF  1
@@ -65,6 +67,7 @@ struct cg_root_opt {
 enum NETWORK_LOCK_METHOD {
 	NETWORK_LOCK_IPTABLES,
 	NETWORK_LOCK_NFTABLES,
+	NETWORK_LOCK_SKIP,
 };
 
 #define NETWORK_LOCK_DEFAULT NETWORK_LOCK_IPTABLES
@@ -92,6 +95,9 @@ enum FILE_VALIDATION_OPTIONS {
 
 /* This constant dictates which file validation method should be tried by default. */
 #define FILE_VALIDATION_DEFAULT FILE_VALIDATION_BUILD_ID
+
+/* This constant dictates that criu use fiemap to copy ghost file by default.*/
+#define FIEMAP_DEFAULT 1
 
 struct irmap;
 
@@ -165,6 +171,7 @@ struct cr_options {
 	int enable_external_masters;
 	bool aufs; /* auto-detected, not via cli */
 	bool overlayfs;
+	int ghost_fiemap;
 #ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
 	bool has_binfmt_misc; /* auto-detected */
 #endif
@@ -179,6 +186,7 @@ struct cr_options {
 	bool lazy_pages;
 	char *work_dir;
 	int network_lock_method;
+	int skip_file_rwx_check;
 
 	/*
 	 * When we scheduler for removal some functionality we first
@@ -210,7 +218,27 @@ struct cr_options {
 
 	int mntns_compat_mode;
 
-	/* use for adaptive live migration */
+	/* Remember the program name passed to main() so we can use it in
+	 * error messages elsewhere.
+	 */
+	char *argv_0;
+	/*
+	 * This contains the eUID of the current CRIU user. It
+	 * will only be set to a non-zero value if CRIU has
+	 * the necessary capabilities to run as non root.
+	 * CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN
+	 */
+	uid_t uid;
+	/* This contains the value from capget()->effective */
+	u32 cap_eff[_LINUX_CAPABILITY_U32S_3];
+	/*
+	 * If CRIU should be running as non-root with the help of
+	 * CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN the user should
+	 * explicitly request it as it comes with many limitations.
+	 */
+	int unprivileged;
+
+	/* [Obsidian0215]use for adaptive live migration */
 	int use_dirty_map;
 	char* dirty_map_dir;
 };

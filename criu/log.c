@@ -71,7 +71,8 @@ static void print_ts(void)
 
 	gettimeofday(&t, NULL);
 	timediff(&start, &t);
-	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u)", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
+	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
+	buffer[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
 	buffer[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
 }
 
@@ -133,7 +134,7 @@ static void log_note_err(char *msg)
 		 */
 		mutex_lock(&first_err->l);
 		if (first_err->s[0] == '\0')
-			strlcpy(first_err->s, msg, sizeof(first_err->s));
+			__strlcpy(first_err->s, msg, sizeof(first_err->s));
 		mutex_unlock(&first_err->l);
 	}
 }
@@ -397,15 +398,28 @@ void print_on_level(unsigned int loglevel, const char *format, ...)
 
 int write_pidfile(int pid)
 {
-	int fd;
+	int fd, ret, exit_code = -1;
 
 	fd = open(opts.pidfile, O_WRONLY | O_EXCL | O_CREAT, 0600);
 	if (fd == -1) {
-		pr_perror("Can't open %s", opts.pidfile);
+		pr_perror("pidfile: Can't open %s", opts.pidfile);
 		return -1;
 	}
 
-	dprintf(fd, "%d", pid);
+	ret = dprintf(fd, "%d", pid);
+	if (ret < 0) {
+		pr_perror("pidfile: Can't write pid %d to %s", pid, opts.pidfile);
+		goto close;
+	}
+
+	if (ret == 0) {
+		pr_err("pidfile: Can't write pid %d to %s\n", pid, opts.pidfile);
+		goto close;
+	}
+
+	pr_debug("pidfile: Wrote pid %d to %s (%d bytes)\n", pid, opts.pidfile, ret);
+	exit_code = 0;
+close:
 	close(fd);
-	return 0;
+	return exit_code;
 }
