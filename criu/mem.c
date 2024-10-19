@@ -618,7 +618,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	//[Obsidian0215]initial pid's dirty-map
 	if (mdc->use_dirty_map) {
-		ret = use_dirty_map(vpid(item), &item->dl);
+		ret = use_dirty_map(vpid(item), &item->dirty_log);
 		if (ret < 0)
 			goto out_pp;
 	}
