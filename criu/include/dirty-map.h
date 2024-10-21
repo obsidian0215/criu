@@ -23,6 +23,8 @@ struct __attribute__((__packed__)) dirty_heatmap{
 
     // 页热度
     unsigned char heat_level;
+    unsigned char last_heat_level;
+
 };
 
 struct dirty_log {
