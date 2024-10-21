@@ -15,15 +15,19 @@
 #define WRITE_RATIO_MAX 0.1   	// 最大阈值：<= 100%
 
 // 脏页信息
-struct __attribute__((__packed__)) dirty_page{
-	unsigned long address;
-    unsigned long write_count;
-    unsigned int page_type;
+struct __attribute__((__packed__)) dirty_heatmap{
+    // address range
+    unsigned long start;
+    unsigned long end;
+    unsigned int page_size;
+
+    // 页热度
+    unsigned char heat_level;
 };
 
 struct dirty_log {
     pid_t pid;
-	struct dirty_page *dirtymap;
+	struct dirty_heatmap *dirtymap;
 	unsigned long dirtymap_size;
 	unsigned long max_write_count;
 };

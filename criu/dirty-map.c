@@ -73,7 +73,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     close(fd);
 
     // 更新该进程的struct dirty_log
-    dl->dirtymap = (struct dirty_page *)mapped;
+    dl->dirtymap = (struct dirty_heatmap *)mapped;
     dl->dirtymap_size = st.st_size;
 
     printf("[Obsidian0215] Successfully mapped dirty-map file %s (size: %lu bytes): 0x%p\n", filepath, dl->dirtymap_size, dl->dirtymap);
@@ -100,7 +100,7 @@ int get_max_write_count(struct dirty_log *dl) {
     }
 
     // 计算脏页的数量
-    num_pages = dl->dirtymap_size / sizeof(struct dirty_page);
+    num_pages = dl->dirtymap_size / sizeof(struct dirty_heatmap);
     // if (num_pages == 0) {
     //     fprintf(stderr, "No dirty pages found in dirtymap\n");
     //     return -1;
