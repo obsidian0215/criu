@@ -3,52 +3,54 @@
 
 #include <stdbool.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include "int.h"
 #include "pid.h"
 #include "page.h"
 #include "pagemap-cache.h"
 
-// 定义页修改频率的比例阈值
-#define WRITE_RATIO_COLD 0.05  	// 冷页阈值：< 5%
-#define WRITE_RATIO_WARM 0.25  	// 温页阈值：>= 5% 且 < 25%
-#define WRITE_RATIO_HOT 0.3   	// 热页阈值：>= 25% 且 < 30%
-#define WRITE_RATIO_MAX 0.1   	// 最大阈值：<= 100%
+// dirty-track LKM definitions
+#define DIRTY_TRACK_MAGIC 'd'
+#define IOCTL_SET_DIRTY_MAP_PATH _IOW(DIRTY_TRACK_MAGIC, 1, char[256])
+#define IOCTL_START_PID _IOW(DIRTY_TRACK_MAGIC, 2, pid_t)
+#define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
+#define IOCTL_CLEAR_SOFT_DIRTY _IO(DIRTY_TRACK_MAGIC, 4)
+#define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
+
+#define DT_DEV_PATH "/dev/dirty-track"
 
 // 脏页信息
 struct __attribute__((__packed__)) dirty_heatmap{
     // address range
     unsigned long start;
-    unsigned long end;
-    unsigned int page_size;
+    unsigned int size;
 
-    // 页热度
-    unsigned char heat_level;
-    unsigned char last_heat_level;
-
+    unsigned char heat_level;       // 热度
+    char heat_trend;                // 热度变化
+    unsigned char selected;         // 被选择转储及次数
 };
 
 struct dirty_log {
     pid_t pid;
 	struct dirty_heatmap *dirtymap;
 	unsigned long dirtymap_size;
-	unsigned long max_write_count;
 };
 
 #define INIT_DIRTY_LOG(log) do { \
     (log).pid = -1; \
     (log).dirtymap = NULL; \
     (log).dirtymap_size = 0; \
-    (log).max_write_count = 0; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
     (log_ptr)->pid = -1; \
     (log_ptr)->dirtymap = NULL; \
     (log_ptr)->dirtymap_size = 0; \
-    (log_ptr)->max_write_count = 0; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
-int use_dirty_map(pid_t pid, struct dirty_log *dl);
+int fini_dirty_map(struct pstree_item *item);
+int start_dirty_track(int pid);
+struct dirty_heatmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
 
 #endif

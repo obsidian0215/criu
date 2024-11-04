@@ -1521,7 +1521,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
-	// [Obsidian0215] init dirty map
+	// [Obsidian0215] init dirty-map
 	if (opts.use_dirty_map)
 		mdc.use_dirty_map = true;
 	else

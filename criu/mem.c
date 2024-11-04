@@ -45,7 +45,16 @@ static int task_reset_dirty_track(int pid)
 
 	BUG_ON(!kdat.has_dirty_track);
 
-	ret = do_task_reset_dirty_track(pid);
+	if (opts.use_dirty_map) {
+		ret = start_dirty_track(pid);
+		if (ret == -EEXIST) {
+			pr_info("Dirty tracking already started for %d\n", pid);
+		} else if (ret) {
+			pr_perror("Failed to start dirty tracking for %d\n", pid);
+		}
+	}
+	else
+		ret = do_task_reset_dirty_track(pid);
 	BUG_ON(ret == 1);
 	return ret;
 }
@@ -480,13 +489,107 @@ again:
 	return ret;
 }
 
+//[Obsidian0215]make the decision whether to dump the pages
+static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_heatmap *dhm) {
+    if (pre_dump) {
+        if (dhm == NULL) {
+            // 未在dirty_map中找到(未变脏的页)，根据是否有父镜像决定
+            if (!has_parent || !page_in_parent(false)) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            // 在dirty_map中找到，基于heat_level和heat_trend决定
+            if (dhm->heat_level < 4) {
+				dhm.selected += 1;	// 增加被选择传输的次数
+                return true;
+            } else if (dhm->heat_level < 7) {
+                if (dhm->heat_trend < 0) {
+					dhm.selected += 1;	// 增加被选择传输的次数
+                    return true;
+                } else {
+                    return false;
+                }
+            } else { // heat_level >= 7
+                return false;
+            }
+        }
+    } else { // dump模式下，只要dirty_map中存在且heat_level > 0，就选中
+        if (dhm != NULL && dhm->heat_level > 0) {
+			dhm.selected += 1;	// 增加被选择传输的次数
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
 //[Obsidian0215]put pages into page-pipe with dirty-map
 static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent)
+			 bool has_parent, bool pre_dump)
 {
 	int ret = 0;
 	// struct dirty_log *dl = &item->dirty_log;
+	unsigned long nr_scanned;
+	unsigned long pages[3] = {};
+	unsigned long vaddr;
+	bool dump_all_pages;
+	int ret = 0;
 
+	dump_all_pages = should_dump_entire_vma(vma->e);
+
+	nr_scanned = 0;
+	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
+		unsigned int ppb_flags = 0;
+		bool softdirty = false;
+		u64 next;
+		int st;
+		struct dirty_heatmap *dhm = search_dirty_map(item, vaddr);
+
+		/* If dump_all_pages is true, should_dump_page is called to get pme. */
+		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
+		if (!dump_all_pages && next != vaddr) {
+			vaddr = next - PAGE_SIZE;
+			continue;
+		}
+
+		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+			ppb_flags |= PPB_LAZY;
+
+		/*
+		 * If we're doing incremental dump (parent images
+		 * specified) and page is not soft-dirty -- we dump
+		 * hole and expect the parent images to contain this
+		 * page. The latter would be checked in page-xfer.
+		 */
+		if (!choose_page_by_dirtymap(pre_dump, has_parent, dhm)) {
+			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+			st = 0;
+		} else {
+			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+				st = 1;
+			else
+				st = 2;
+		}
+
+		if (ret) {
+			/* Do not do pfn++, just bail out */
+			pr_debug("Pagemap full\n");
+			break;
+		}
+
+		pages[st]++;
+	}
+
+	*pvaddr = vaddr;
+	cnt_add(CNT_PAGES_SCANNED, nr_scanned);
+	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
+	cnt_add(CNT_PAGES_LAZY, pages[1]);
+	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+
+	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
 	return ret;
 }
 
@@ -531,7 +634,7 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 	vaddr = vma->e->start;
 
 again:
-	ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent);
+	ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -616,13 +719,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		}
 	}
 
-	//[Obsidian0215]initial pid's dirty-map
-	if (mdc->use_dirty_map) {
-		ret = use_dirty_map(vpid(item), &item->dirty_log);
-		if (ret < 0)
-			goto out_pp;
-	}
-
 	/*
 	 * Step 1 -- generate the pagemap
 	 */
@@ -674,6 +770,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;
+	
+	//[Obsidian0215]update pid's dirty-map
+	if (mdc->use_dirty_map)
+		fini_dirty_map(item);
+
 out_xfer:
 	if (!mdc->pre_dump)
 		xfer.close(&xfer);
@@ -1196,7 +1297,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 */
 		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
-			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
+			pr->falses(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
 			continue;
 		}
@@ -1240,7 +1341,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
 
-				pr->skip_pages(pr, len);
+				pr->falses(pr, len);
 
 				va += len;
 				len >>= PAGE_SHIFT;
