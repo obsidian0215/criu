@@ -49,8 +49,8 @@ struct dirty_log {
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
-int fini_dirty_map(struct pstree_item *item);
+void fini_dirty_map(struct pstree_item *item);
 int start_dirty_track(int pid);
-struct dirty_heatmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
+struct dirty_heatmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
 
 #endif
