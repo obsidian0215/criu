@@ -502,11 +502,11 @@ static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struc
         } else {
             // 在dirty_map中找到，基于heat_level和heat_trend决定
             if (dhm->heat_level < 4) {
-				dhm.selected += 1;	// 增加被选择传输的次数
+				dhm->selected += 1;	// 增加被选择传输的次数
                 return true;
             } else if (dhm->heat_level < 7) {
                 if (dhm->heat_trend < 0) {
-					dhm.selected += 1;	// 增加被选择传输的次数
+					dhm->selected += 1;	// 增加被选择传输的次数
                     return true;
                 } else {
                     return false;
@@ -517,7 +517,7 @@ static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struc
         }
     } else { // dump模式下，只要dirty_map中存在且heat_level > 0，就选中
         if (dhm != NULL && dhm->heat_level > 0) {
-			dhm.selected += 1;	// 增加被选择传输的次数
+			dhm->selected += 1;	// 增加被选择传输的次数
             return true;
         } else {
             return false;
@@ -535,7 +535,6 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
-	int ret = 0;
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
@@ -1297,7 +1296,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 */
 		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
-			pr->falses(pr, nr_pages * PAGE_SIZE);
+			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
 			continue;
 		}
@@ -1341,7 +1340,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
 
-				pr->falses(pr, len);
+				pr->skip_pages(pr, len);
 
 				va += len;
 				len >>= PAGE_SHIFT;
