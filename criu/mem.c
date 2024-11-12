@@ -490,38 +490,45 @@ again:
 }
 
 //[Obsidian0215]make the decision whether to dump the pages
-static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_heatmap *dhm) {
+static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_heatmap *dhm, bool softdirty) {
     if (pre_dump) {
-        if (dhm == NULL) {
-            // 未在dirty_map中找到(未变脏的页)，根据是否有父镜像决定
-            if (!has_parent || !page_in_parent(false)) {
+        if (!dhm) {
+            // 未在dirty_map中找到(可能有未被追踪到的脏页)，根据是否有父镜像决定
+            if (!has_parent || !page_in_parent(softdirty)) {
                 return true;
             } else {
                 return false;
             }
         } else {
-            // 在dirty_map中找到，基于heat_level和heat_trend决定
-            if (dhm->heat_level < 4) {
-				dhm->selected += 1;	// 增加被选择传输的次数
+            // 被dirty_map记录则基于热度和热度变化确定
+            if (dhm->heat_level == 0) {
+				// 完全冷页，直接选择
+				dhm->selected += 1;
                 return true;
-            } else if (dhm->heat_level < 7) {
+            } else if (dhm->heat_level == 1) {
+				// 半冷页，选择热度下降的
                 if (dhm->heat_trend < 0) {
-					dhm->selected += 1;	// 增加被选择传输的次数
+					dhm->selected += 1;
                     return true;
-                } else {
-                    return false;
-                }
-            } else { // heat_level >= 7
+                } else
+                	return false;
+            } else {
+				 // 温页和热页被跳过
                 return false;
             }
         }
-    } else { // dump模式下，只要dirty_map中存在且heat_level > 0，就选中
-        if (dhm != NULL && dhm->heat_level > 0) {
-			dhm->selected += 1;	// 增加被选择传输的次数
+    } else { // dump模式下
+        if (dhm != NULL && (dhm->heat_level > 0 || !dhm->selected)) {
+			// 被dirty-map记录的非冷页或没被选择过的页——最后一次需要传输
+			dhm->selected += 1;
             return true;
-        } else {
-            return false;
-        }
+        } else if (!dhm && has_parent && !page_in_parent(softdirty)) {
+			// 未被dirty-map记录但soft-dirty置位(发生过修改)——最后一次需要传输
+            return true;
+        } else
+			// 未被dirty-map记录且soft-dirty未置位(冷页)
+			// 或dirty-map记录未修改且被选择传输过——跳过
+			return false;
     }
 }
 
@@ -562,7 +569,8 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		 * hole and expect the parent images to contain this
 		 * page. The latter would be checked in page-xfer.
 		 */
-		if (!choose_page_by_dirtymap(pre_dump, has_parent, dhm)) {
+		if (!choose_page_by_dirtymap(pre_dump, has_parent, dhm, softdirty)) {
+			// ret = page_pipe_add_hole(pp, vaddr, pre_dump? PP_HOLE_SKIP: PP_HOLE_PARENT);
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {

@@ -344,6 +344,8 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 				return -1;
 			}
 		}
+	} else if (flags & PE_SKIP) {
+		/* Nothing to do */
 	}
 
 	if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
@@ -456,6 +458,8 @@ static int get_hole_flags(struct page_pipe *pp, int n)
 
 	if (hole_flags == PP_HOLE_PARENT)
 		return PE_PARENT;
+	else if (hole_flags == PP_HOLE_SKIP)
+		return PE_SKIP;
 	else
 		BUG();
 

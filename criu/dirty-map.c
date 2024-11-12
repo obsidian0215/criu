@@ -125,6 +125,7 @@ void fini_dirty_map(struct pstree_item *item){
     
     if (dl) {
         if (dl->dirtymap) {
+            msync(dl->dirtymap, dl->dirtymap_size, MS_SYNC);
             munmap(dl->dirtymap, dl->dirtymap_size);
             dl->dirtymap = NULL;
             dl->dirtymap_size = 0;
