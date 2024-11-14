@@ -36,7 +36,7 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid)
+static int task_reset_dirty_track(int pid, bool use_dirty_map)
 {
 	int ret;
 
@@ -45,7 +45,7 @@ static int task_reset_dirty_track(int pid)
 
 	BUG_ON(!kdat.has_dirty_track);
 
-	if (opts.use_dirty_map) {
+	if (use_dirty_map) {
 		ret = start_dirty_track(pid);
 		if (ret == -EEXIST) {
 			pr_info("Dirty tracking already started for %d\n", pid);
@@ -490,44 +490,50 @@ again:
 }
 
 //[Obsidian0215]make the decision whether to dump the pages
-static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_heatmap *dhm, bool softdirty) {
+static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_diffmap *dhm, bool softdirty) {
     if (pre_dump) {
         if (!dhm) {
-            // 未在dirty_map中找到(可能有未被追踪到的脏页)，根据是否有父镜像决定
-            if (!has_parent || !page_in_parent(softdirty)) {
-                return true;
+            // 未在dirty_map中找到，根据是否有父镜像决定
+            if (!has_parent) {
+				// 没有父镜像，选择没有变脏的冷页
+				if (page_in_parent(softdirty))
+                	return true;
+				else	// 一般情况下不会走该分支
+                	return false;
             } else {
+				// (现在脏页追踪到进程冻结才结束，一般dirtymap不会遗漏脏页)
+				// 有父镜像且无dirty-map记录的一定是冷页且被传输过，跳过
                 return false;
             }
         } else {
             // 被dirty_map记录则基于热度和热度变化确定
             if (dhm->heat_level == 0) {
-				// 完全冷页，直接选择
-				dhm->selected += 1;
-                return true;
-            } else if (dhm->heat_level == 1) {
-				// 半冷页，选择热度下降的
-                if (dhm->heat_trend < 0) {
-					dhm->selected += 1;
+				// 完全冷页（一般只会从第二次predump出现），选择从脏页变化下来的
+				if (dhm->heat_trend < 0) {
+                	return true;
+				} else	// 一般情况下不会走该分支
+					return false;
+            } else if (dhm->heat_level <= 4) {
+				// 温页，选择热度下降较快的（超过50%）
+                if (dhm->heat_trend < -dhm->heat_level) {
                     return true;
                 } else
                 	return false;
             } else {
-				 // 温页和热页被跳过
+				 // 热页被跳过
                 return false;
             }
         }
     } else { // dump模式下
-        if (dhm != NULL && (dhm->heat_level > 0 || !dhm->selected)) {
-			// 被dirty-map记录的非冷页或没被选择过的页——最后一次需要传输
-			dhm->selected += 1;
+        if (dhm) {
+			// 被dirty-map记录的页——最后一次需要传输
             return true;
         } else if (!dhm && has_parent && !page_in_parent(softdirty)) {
 			// 未被dirty-map记录但soft-dirty置位(发生过修改)——最后一次需要传输
+			// (目前这种情况应该不太可能触发，dirty-map能覆盖进程运行的所有脏页)
             return true;
         } else
 			// 未被dirty-map记录且soft-dirty未置位(冷页)
-			// 或dirty-map记录未修改且被选择传输过——跳过
 			return false;
     }
 }
@@ -551,7 +557,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		bool softdirty = false;
 		u64 next;
 		int st;
-		struct dirty_heatmap *dhm = search_dirty_map(item, vaddr);
+		struct dirty_diffmap *dhm = search_dirty_map(item, vaddr);
 
 		/* If dump_all_pages is true, should_dump_page is called to get pme. */
 		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
@@ -773,7 +779,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 4 -- clean up
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real);
+	ret = task_reset_dirty_track(item->pid->real, mdc->use_dirty_map);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;

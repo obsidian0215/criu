@@ -1,6 +1,11 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <regex.h>
+#include <dirent.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -21,78 +26,457 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 
+#define TIMESTAMP_LIST_PREFIX "timestamp_list."
+
+#define MAX_FILES 32
+
 /**
- * @brief 为特定pid进程初始化其dirty_map
+ * @brief 从timestamp_list.pid文件中读取timestamp_list
  *
- * @param item 指向per-process结构<pid>的指针
- * @param dirty_map_dir dirty-map目录的字符串
- * @return int 成功返回0，失败返回-1
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param pid 进程pid
+ * @param timestamp_list 指向存储timestamp_list的指针
+ * @param ts_list_size 指针，存储timestamp_list的大小
+ * @return int 成功返回0，失败返回-1并设置errno。
+ */
+static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **timestamp_list, size_t *ts_list_size) {
+    char timestamp_file_path[PATH_MAX];
+    void *mmaped = NULL;
+    size_t current_size, current_count, required_size;
+    int fd;
+    struct stat st;
+
+    snprintf(timestamp_file_path, sizeof(timestamp_file_path), "%s/%s%d", dirty_map_dir, TIMESTAMP_LIST_PREFIX, pid);
+    
+    // 打开文件，如果不存在则创建并初始化
+    fd = open(timestamp_file_path, O_RDWR | O_CREAT, 0666);
+    if (fd == -1) {
+        perror("open");
+        return -1;
+    }
+    
+    // 获取文件大小
+    if (fstat(fd, &st) == -1) {
+        perror("fstat");
+        close(fd);
+        return -1;
+    }
+    
+    current_size = st.st_size;
+    current_count = current_size / sizeof(int);
+    
+    // 如果文件大小不是整数倍的 sizeof(int)，修正
+    if (current_size % sizeof(int) != 0) {
+        fprintf(stderr, "Invalid timestamp_list file size\n");
+        close(fd);
+        return -1;
+    }
+    
+    // 需要映射的总大小为 current_count + 1 个 int
+    required_size = (current_count + 1) * sizeof(int);
+    
+    // 如果当前文件大小小于 required_size，则扩展文件
+    if (current_size < required_size) {
+        if (ftruncate(fd, required_size) == -1) {
+            perror("ftruncate");
+            close(fd);
+            return -1;
+        }
+        // // 清零新增加的空间
+        // if (current_size == 0)
+        //     // 文件刚创建，初始化为 0
+        //     memset(&((*timestamp_list)[0]), 0, sizeof(int));
+        // else {
+            // // 其他情况，确保新的 int 空间为 0
+            // int zero = 0;
+            // if (pwrite(fd, &zero, sizeof(int), current_size) != sizeof(int)) {
+            //     perror("pwrite");
+            //     close(fd);
+            //     return -1;
+            // }
+        // }
+    }
+    
+    // 映射文件到内存
+    void *mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    
+    *timestamp_list = (int *)mapped;
+    *ts_list_size = current_count;
+    
+    return 0;
+}
+
+/**
+ * @brief 检查指定的时间戳是否存在于timestamp_list中
+ *
+ * @param timestamp_list 已映射的时间戳列表指针。
+ * @param ts_list_size 时间戳列表的大小。
+ * @param timestamp 要检查的时间戳。
+ * @return int 返回 1 表示存在，0 表示不存在。
+ */
+static int is_timestamp_in_list(int *timestamp_list, size_t ts_list_size, int timestamp) {
+    for (size_t i = 0; i < ts_list_size; ++i) {
+        if (timestamp_list[i] == timestamp) {
+            return 1; // 存在
+        }
+    }
+    return 0; // 不存在
+}
+
+/**
+ * @brief 将新的时间戳追加到已映射的 timestamp_list 中。
+ *
+ * @param timestamp_list 已映射的时间戳列表指针，包含预留的一个 int 空间。
+ * @param ts_list_size 指向当前时间戳数量的指针。
+ * @param new_timestamp 要追加的新的时间戳。
+ * @return int 成功返回 0，失败返回 -1 并设置 errno。
+ */
+static int append_timestamp_to_list(int *timestamp_list, size_t *ts_list_size, int new_timestamp) {
+    // 将 new_timestamp 写入预留的空间
+    timestamp_list[*ts_list_size] = new_timestamp;
+    
+    // 增加时间戳数量
+    (*ts_list_size)++;
+    
+    // 同步更改到文件
+    if (msync(timestamp_list, (*ts_list_size) * sizeof(int), MS_SYNC) == -1) {
+        perror("msync");
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 将指定pid和timestamp的dirtymap文件映射到内存中。
+ *
+ * @param pid 目标进程的pid。
+ * @param timestamp 要映射的dirtymap文件的时间戳
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param dm 指向将存储映射后指针的指针
+ * @param dm_size 指向将存储映射大小的指针
+ * @return int 成功返回 0，失败返回 -1 并设置errno
+ */
+static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
+                struct dirty_map **dm, unsigned long *dm_size) {
+    if (timestamp == 0) {
+        *dm = NULL;
+        *dm_size = 0;
+        return 0;
+    }
+    
+    char dm_filepath[PATH_MAX];
+    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%d.dirtymap", dirty_map_dir, pid, timestamp);
+    
+    int fd = open(dm_filepath, O_RDONLY);
+    if (fd == -1) {
+        fprintf(stderr, "Error opening dirtymap file %s: %s\n", dm_filepath, strerror(errno));
+        return -1;
+    }
+    
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        fprintf(stderr, "Error getting size of %s: %s\n", dm_filepath, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    if (st.st_size == 0) {
+        fprintf(stderr, "Dirtymap file %s is empty\n", dm_filepath);
+        close(fd);
+        return -1;
+    }
+    
+    void *mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        fprintf(stderr, "Error mapping dirtymap file %s: %s\n", dm_filepath, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    close(fd);
+    *dm = (struct dirty_map *)mapped;
+    *dm_size = st.st_size;
+    printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n", 
+           dm_filepath, *dm_size, *dm);
+    return 0;
+}
+
+/**
+ * @brief 合并latest_dm和less_latest_dm，生成dirty_diffmap数组
+ *
+ * @param latest_dm 最新的dirty_map数组（默认已按地址排序）
+ * @param ldm_size 最新dirty_map数组的大小
+ * @param less_latest_dm 次新的dirty_map数组（默认已按地址排序）
+ * @param lldm_size 次新dirty_map数组的大小
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param dl 指向dirty_log结构体的指针
+ * @return struct dirty_diffmap* 生成的diffmap
+ */
+struct dirty_diffmap* merge_dirty_maps(
+    struct dirty_map *latest_dm, size_t latest_size,
+    struct dirty_map *less_latest_dm, size_t less_latest_size,
+    size_t *diffmap_size) {
+    // 预估最大可能的diffmap大小
+    size_t max_size = latest_size + less_latest_size;
+    struct dirty_diffmap *diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
+    if (!diffmap) {
+        perror("内存分配失败");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t i = 0, j = 0, k = 0;
+    while (i < latest_size && j < less_latest_size) {
+        if (latest_dm[i].address < less_latest_dm[j].address) {
+            // 仅在latest_dm中存在
+            diffmap[k].address = latest_dm[i].address;
+            diffmap[k].heat_level = (latest_dm[i].write_count);
+            diffmap[k].heat_trend = (latest_dm[i].write_count);
+            i++;
+        }
+        else if (latest_dm[i].address > less_latest_dm[j].address) {
+            // 仅在less_latest_dm中存在
+            diffmap[k].address = less_latest_dm[j].address;
+            diffmap[k].heat_level = 0;
+            diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+            }
+            j++;
+        }
+        else {
+            // 同时存在于两个数组中
+            diffmap[k].address = latest_dm[i].address;
+            diffmap[k].heat_level = (latest_dm[i].write_count);
+            diffmap[k].heat_trend = latest_dm[i].write_count - less_latest_dm[j].write_count;
+            i++;
+            j++;
+        }
+        k++;
+    }
+
+    // 处理剩余的 latest_dm 条目
+    while (i < latest_size) {
+        diffmap[k].address = latest_dm[i].address;
+        diffmap[k].heat_level = (latest_dm[i].write_count);
+        diffmap[k].heat_trend = (latest_dm[i].write_count);
+        i++;
+        k++;
+    }
+
+    // 处理剩余的 less_latest_dm 条目
+    while (j < less_latest_size) {
+        diffmap[k].address = less_latest_dm[j].address;
+        diffmap[k].heat_level = 0;
+        diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+        j++;
+        k++;
+    }
+
+    // 更新实际的 diffmap 大小
+    *diffmap_size = k;
+
+    // 重新分配内存以节省空间
+    struct dirty_diffmap *resized_diffmap = realloc(diffmap, k * sizeof(struct dirty_diffmap));
+    if (!resized_diffmap && k > 0) {
+        perror("内存重新分配失败");
+        free(diffmap);
+        exit(EXIT_FAILURE);
+    }
+
+    return resized_diffmap;
+}
+
+/**
+ * @brief 为特定 pid 进程初始化其 dirty_map，读取最新和次新的 dirtymap 文件。
+ *
+ * @param item 指向 per-process 结构 <pid> 的指针。
+ * @param dirty_map_dir dirty_map 目录的字符串。
+ * @return int 成功返回 0，失败返回 -1。
  */
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
-	struct dirty_log *dl = &item->dirty_log;
-	pid_t pid = dl->pid;
-    char filepath[PATH_MAX];
-	int ret, fd;
-    struct stat st;
-	void *mapped;
-
-	printf("[Obsidian0215] init dirty-log for pid: %d\n", pid);
-    // 确保dirty-track LKM的dirty-map目录存在且与输入的dirty_map_dir一致
-    fd = open(DT_DEV_PATH, O_RDWR);
-    if (ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, filepath) < 0) {
-        fprintf(stderr, "Error to get dirty_map_path for dirty-track\n");
-        close(fd);
-        return -1;
-    } else if (strcmp(filepath, dirty_map_dir) != 0) {
-        fprintf(stderr, "Error: dirty_map_dir %s is not the same as the one in dirty-track LKM\n", dirty_map_dir);
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    // 将filepath清空
-    memset(filepath, 0, sizeof(filepath));
-
-	// 打开<dirty_map_dir>/newest-<pid>.img
-    ret = snprintf(filepath, sizeof(filepath), "%s/latest-%d.heatmap", dirty_map_dir, pid);
-    if (ret < 0 || ret >= sizeof(filepath)) {
-        fprintf(stderr, "Error constructing file path for pid %d\n", pid);
-        return -1;
-    }
-    fd = open(filepath, O_RDONLY);
+    struct dirty_log *dl = &item->dirty_log;
+    pid_t pid = dl->pid;
+    char current_dirty_map_path[PATH_MAX];
+    int ret;
+    
+    printf("[Obsidian0215] Init dirty-log for pid: %d\n", pid);
+    
+    // 打开 DT_DEV_PATH 并验证 dirty_map_dir
+    int fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
-        fprintf(stderr, "Error opening dirty-heatmap file\n");
+        fprintf(stderr, "Error opening %s: %s\n", DT_DEV_PATH, strerror(errno));
         return -1;
     }
-
-    // 获取dirty-map文件大小
-    if (fstat(fd, &st) == -1) {
-        fprintf(stderr, "Error getting %s's size\n", filepath);
+    
+    // 通过 ioctl 获取当前 dirty_map 路径
+    ret = ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, current_dirty_map_path);
+    if (ret < 0) {
+        fprintf(stderr, "Error getting dirty_map_path for dirty-track: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    } else if (strcmp(current_dirty_map_path, dirty_map_dir) != 0) {
+        fprintf(stderr, "Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
+                dirty_map_dir, current_dirty_map_path);
         close(fd);
         return -1;
     }
-
-    if (st.st_size == 0) {
-        fprintf(stderr, "Dirty-map %s is empty\n", filepath);
-        close(fd);
+    
+    // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
+    ret = read_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to read timestamp_list for pid %d\n", pid);
         return -1;
     }
+    
+    // 初始化latest_timestamp和less_latest_timestamp
+    if (dl->ts_list_size >= 2) {
+        dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
+        dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-2];
+    } else if (dl->ts_list_size == 1) {
+        dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
+        // dl->less_latest_timestamp = 0;
+    } else {
+        // dl->latest_timestamp = 0;
+        // dl->less_latest_timestamp = 0;
+    }
 
-    // 将dirty-map映射到criu的内存空间
-    mapped = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "Error mapping dirty-map file\n");
+    // 停止pid的dirty track以生成dirty-map文件
+    ret = ioctl(fd, IOCTL_STOP_PID, &pid);
+    if (ret < 0) {
+        fprintf(stderr, "Error stoping dirty-track for pid %d\n", pid);
         close(fd);
         return -1;
     }
     close(fd);
+    
+    // 扫描dirty_map_dir，查找新的dirtymap文件
+    DIR *dir = opendir(dirty_map_dir);
+    if (!dir) {
+        perror("opendir");
+        return -1;
+    }
+    
+    // 编译正则表达式以匹配<pid>-<timestamp>.dirtymap
+    regex_t regex;
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "^%d-([0-9]+)\\.dirtymap$", pid);
+    if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
+        fprintf(stderr, "Failed to compile regex: %s\n", pattern);
+        closedir(dir);
+        return -1;
+    }
+    
+    struct dirent *entry;
+    int new_latest_timestamp = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG)
+            continue;
+        
+        regmatch_t matches[2];
+        ret = regexec(&regex, entry->d_name, 2, matches, 0);
+        if (ret == 0) {
+            // 提取 timestamp
+            int len = matches[1].rm_eo - matches[1].rm_so;
+            if (len <= 0 || len >= 64) {
+                fprintf(stderr, "Invalid timestamp in file name: %s\n", entry->d_name);
+                continue;
+            }
+            char timestamp_str[64];
+            strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
+            timestamp_str[len] = '\0';
+            
+            int timestamp = atoi(timestamp_str);
+            if (timestamp <= 0) {
+                fprintf(stderr, "Invalid timestamp value: %s\n", timestamp_str);
+                continue;
+            }
+            
+            // 检查 timestamp 是否已在 timestamp_list 中
+            int in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, timestamp);
+            if (in_list == 1) {
+                continue; // 已存在
+            }
+            
+            // 找到一个新的timestamp，退出循环
+            if (timestamp) {
+                new_latest_timestamp = timestamp;
+                break;
+            }
+        }
+    }
+    regfree(&regex);
+    closedir(dir);
+    
+    // 更新 latest_timestamp 和 less_latest_timestamp
+    if (new_latest_timestamp > 0) {
+        // 将当前 latest 移动到 less_latest
+        dl->less_latest_timestamp = dl->latest_timestamp;
+        // 更新 latest_timestamp
+        dl->latest_timestamp = new_latest_timestamp;
+    } else {
+        // 未找到新的dirtymap文件，latest_timestamp更新为0
+        dl->less_latest_timestamp = dl->latest_timestamp;
+        dl->latest_timestamp = 0;
+    }
 
-    // 更新该进程的struct dirty_log
-    dl->dirtymap = (struct dirty_heatmap *)mapped;
-    dl->dirtymap_size = st.st_size;
+    // 将更新的latest_timestamp追加到timestamp_list
+    ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to append latest timestamp %d to timestamp_list.%d\n", 
+                dl->latest_timestamp, pid);
+        // 追加失败也继续执行
+    }
 
-    printf("[Obsidian0215] Successfully mapped dirty-map file %s (size: %lu bytes): 0x%p\n", filepath, dl->dirtymap_size, dl->dirtymap);
+    // 解除映射的timestamp_list
+    if (munmap(dl->timestamp_list, dl->ts_list_size * sizeof(int)) == -1) {
+        fprintf(stderr, "Error unmapping timestamp_list: %s\n", strerror(errno));
+    }
+    dl->timestamp_list = NULL;
+    dl->ts_list_size = 0;
+    
+    // 映射latest_dm
+    if (dl->latest_timestamp) {
+        ret = map_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
+                          &dl->latest_dm, &dl->ldm_size);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to map latest dirtymap for pid %d\n", pid);
+            dl->latest_dm = NULL;
+            dl->ldm_size = 0;
+        } else
+            printf("[Obsidian0215] Successfully loaded %d's latest dirty-map (size: %lu bytes): 0x%p\n", pid, dl->ldm_size, dl->latest_dm);
+    } else {
+        dl->latest_dm = NULL;
+        dl->ldm_size = 0;
+    }
+    
+    // 映射less_latest_dm
+    if (dl->less_latest_timestamp) {
+        ret = map_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir, 
+                          &dl->less_latest_dm, &dl->lldm_size);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to map less latest dirtymap for pid %d\n", pid);
+            dl->less_latest_dm = NULL;
+            dl->lldm_size = 0;
+        } else
+            printf("[Obsidian0215] Successfully loaded %d's less-latest dirty-map (size: %lu bytes): 0x%p\n", pid, dl->lldm_size, dl->less_latest_dm);
+    } else {
+        dl->less_latest_dm = NULL;
+        dl->lldm_size = 0;
+    }
 
-	return 0;
+    // 使用less_latest_dm和latest_dm生成dirty_diffmap
+    dl->diffmap = merge_dirty_maps(
+        dl->latest_dm, dl->ldm_size,
+        dl->less_latest_dm, dl->lldm_size,
+        &(dl->diffmap_size)
+    );
+
+    return 0;
 }
 
 /**
@@ -111,6 +495,27 @@ int start_dirty_track(int pid) {
     }
 
     ret = ioctl(fd, IOCTL_START_PID, &pid);
+    close(fd);
+    return ret;
+}
+
+/**
+ * @brief 为特定pid进程停止dirty track
+ *
+ * @param pid 目标进程的真实pid
+ * @return int 成功返回0，失败返回-1/errno
+ */
+int stop_dirty_track(int pid) {
+    int ret = 0, fd;
+    
+    fd = open(DT_DEV_PATH, O_RDWR);
+    if (fd == -1) {
+        fprintf(stderr, "Error opening dirty-track LKM\n");
+        return -1;
+    }
+
+    ret = ioctl(fd, IOCTL_STOP_PID, &pid);
+    close(fd);
     return ret;
 }
 
@@ -124,25 +529,43 @@ void fini_dirty_map(struct pstree_item *item){
     struct dirty_log *dl = &item->dirty_log;
     
     if (dl) {
-        if (dl->dirtymap) {
-            msync(dl->dirtymap, dl->dirtymap_size, MS_SYNC);
-            munmap(dl->dirtymap, dl->dirtymap_size);
-            dl->dirtymap = NULL;
-            dl->dirtymap_size = 0;
+        // 卸载最新的dirtymap
+        if (dl->latest_dm) {
+            if (munmap(dl->latest_dm, dl->ldm_size) == -1) {
+                fprintf(stderr, "Error unmapping latest dirtymap: %s\n", strerror(errno));
+            }
+            dl->latest_dm = NULL;
+            dl->ldm_size = 0;
+        }
+
+        // 处理次新的dirtymap
+        if (dl->less_latest_dm) {
+            if (munmap(dl->less_latest_dm, dl->lldm_size) == -1) {
+                fprintf(stderr, "Error unmapping second latest dirtymap: %s\n", strerror(errno));
+            }
+            dl->less_latest_dm = NULL;
+            dl->lldm_size = 0;
+        }
+
+        // 处理diffmap
+        if (dl->diffmap) {
+            free(dl->diffmap);
+            dl->diffmap = NULL;
+            dl->diffmap_size = 0;
         }
     }
 }
 
 /**
- * @brief 查找dirty_map中包含指定address的dirty_heatmap结构体
+ * @brief 查找dirty_map中包含指定address的dirty_diffmap结构体
  *
  * @param item 指向per-process结构<pid>的指针
  * @param addr 要查找的线性地址
- * @return struct dirty_heatmap * 返回指向dirty_heatmap结构体的指针，如果未找到则返回NULL
+ * @return struct dirty_diffmap * 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
  */
-struct dirty_heatmap *search_dirty_map(struct pstree_item *item, unsigned long addr) {
+struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr) {
     struct dirty_log *dl = &item->dirty_log;
-    struct dirty_heatmap *map = dl->dirtymap;
+    struct dirty_diffmap *map = dl->dirtymap;
     unsigned long left = 0;
     unsigned long right = dl->dirtymap_size;
 

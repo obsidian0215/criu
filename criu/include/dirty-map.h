@@ -19,38 +19,79 @@
 
 #define DT_DEV_PATH "/dev/dirty-track"
 
-// 脏页信息
-struct __attribute__((__packed__)) dirty_heatmap{
-    // address range
-    unsigned long start;
-    unsigned int size;
+// 纪录被选择传输的页地址和次数
+struct __attribute__((__packed__)) selected_page
+{
+    unsigned long address;
+    unsigned char s_count;  // 被选择转储的次数
+};
 
+// 脏页heatmap信息
+struct __attribute__((__packed__)) dirty_diffmap
+{
+    unsigned long address;          // 页地址
     unsigned char heat_level;       // 热度
     char heat_trend;                // 热度变化
-    unsigned char selected;         // 被选择转储及次数
+};
+
+// 脏页dirtymap信息
+struct __attribute__((__packed__)) dirty_map
+{
+	unsigned long address;
+    unsigned int write_count;
 };
 
 struct dirty_log {
     pid_t pid;
-	struct dirty_heatmap *dirtymap;
-	unsigned long dirtymap_size;
+    struct dirty_diffmap *diffmap;
+    unsigned long diffmap_size;
+
+    struct {
+        int *timestamp_list;
+        size_t ts_list_size;
+
+        int latest_timestamp;
+        struct dirty_map *latest_dm;
+	    unsigned long ldm_size;
+
+        int less_latest_timestamp;
+        struct dirty_map *less_latest_dm;
+	    unsigned long lldm_size;
+    };
 };
 
 #define INIT_DIRTY_LOG(log) do { \
     (log).pid = -1; \
-    (log).dirtymap = NULL; \
-    (log).dirtymap_size = 0; \
+    (log).timestamp_list = NULL; \
+    (log).ts_list_size = 0; \
+    (log).latest_timestamp = 0; \
+    (log).latest_dm = NULL; \
+    (log).ldm_size = 0; \
+    (log).less_latest_timestamp = 0; \
+    (log).less_latest_dm = NULL; \
+    (log).lldm_size = 0; \
+    (log).heatmap = NULL; \
+    (log).heatmap_size = 0;
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
     (log_ptr)->pid = -1; \
-    (log_ptr)->dirtymap = NULL; \
-    (log_ptr)->dirtymap_size = 0; \
+    (log_ptr)->timestamp_list = NULL; \
+    (log_ptr)->ts_list_size = 0; \
+    (log_ptr)->latest_timestamp = 0; \
+    (log_ptr)->latest_dm = NULL; \
+    (log_ptr)->ldm_size = 0; \
+    (log_ptr)->less_latest_timestamp = 0; \
+    (log_ptr)->less_latest_dm = NULL; \
+    (log_ptr)->lldm_size = 0; \
+    (log_ptr)->heatmap = NULL; \
+    (log_ptr)->heatmap_size = 0;
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
 void fini_dirty_map(struct pstree_item *item);
 int start_dirty_track(int pid);
-struct dirty_heatmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
+int stop_dirty_track(int pid);
+struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
 
 #endif
