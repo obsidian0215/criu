@@ -71,7 +71,7 @@ struct dirty_log {
     (log).less_latest_dm = NULL; \
     (log).lldm_size = 0; \
     (log).heatmap = NULL; \
-    (log).heatmap_size = 0;
+    (log).heatmap_size = 0; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -85,7 +85,7 @@ struct dirty_log {
     (log_ptr)->less_latest_dm = NULL; \
     (log_ptr)->lldm_size = 0; \
     (log_ptr)->heatmap = NULL; \
-    (log_ptr)->heatmap_size = 0;
+    (log_ptr)->heatmap_size = 0; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
