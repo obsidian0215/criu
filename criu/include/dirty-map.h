@@ -95,4 +95,3 @@ int stop_dirty_track(int pid);
 struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
 
 #endif
-4\
