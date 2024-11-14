@@ -98,15 +98,15 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     }
     
     // 映射文件到内存
-    void *mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapped == MAP_FAILED) {
+    mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mmaped == MAP_FAILED) {
         perror("mmap");
         close(fd);
         return -1;
     }
     close(fd);
     
-    *timestamp_list = (int *)mapped;
+    *timestamp_list = (int *)mmaped;
     *ts_list_size = current_count;
     
     return 0;
@@ -164,22 +164,24 @@ static int append_timestamp_to_list(int *timestamp_list, size_t *ts_list_size, i
  */
 static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
                 struct dirty_map **dm, unsigned long *dm_size) {
+    char dm_filepath[PATH_MAX];
+    int fd;
+    struct stat st;
+    void *mapped;
     if (timestamp == 0) {
         *dm = NULL;
         *dm_size = 0;
         return 0;
     }
     
-    char dm_filepath[PATH_MAX];
     snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%d.dirtymap", dirty_map_dir, pid, timestamp);
     
-    int fd = open(dm_filepath, O_RDONLY);
+    fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
         fprintf(stderr, "Error opening dirtymap file %s: %s\n", dm_filepath, strerror(errno));
         return -1;
     }
     
-    struct stat st;
     if (fstat(fd, &st) == -1) {
         fprintf(stderr, "Error getting size of %s: %s\n", dm_filepath, strerror(errno));
         close(fd);
@@ -192,7 +194,7 @@ static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
         return -1;
     }
     
-    void *mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "Error mapping dirtymap file %s: %s\n", dm_filepath, strerror(errno));
         close(fd);
@@ -218,19 +220,19 @@ static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
  * @param dl 指向dirty_log结构体的指针
  * @return struct dirty_diffmap* 生成的diffmap
  */
-struct dirty_diffmap* merge_dirty_maps(
-    struct dirty_map *latest_dm, size_t latest_size,
-    struct dirty_map *less_latest_dm, size_t less_latest_size,
-    size_t *diffmap_size) {
+struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t latest_size,
+        struct dirty_map *less_latest_dm, size_t less_latest_size, size_t *diffmap_size) {
+    size_t max_size, i = 0, j = 0, k = 0;
+    struct dirty_diffmap *diffmap, resized_diffmap;
+
     // 预估最大可能的diffmap大小
-    size_t max_size = latest_size + less_latest_size;
-    struct dirty_diffmap *diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
+    max_size = latest_size + less_latest_size;
+    diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
         perror("内存分配失败");
         exit(EXIT_FAILURE);
     }
 
-    size_t i = 0, j = 0, k = 0;
     while (i < latest_size && j < less_latest_size) {
         if (latest_dm[i].address < less_latest_dm[j].address) {
             // 仅在latest_dm中存在
@@ -244,7 +246,6 @@ struct dirty_diffmap* merge_dirty_maps(
             diffmap[k].address = less_latest_dm[j].address;
             diffmap[k].heat_level = 0;
             diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
-            }
             j++;
         }
         else {
@@ -280,7 +281,7 @@ struct dirty_diffmap* merge_dirty_maps(
     *diffmap_size = k;
 
     // 重新分配内存以节省空间
-    struct dirty_diffmap *resized_diffmap = realloc(diffmap, k * sizeof(struct dirty_diffmap));
+    resized_diffmap = realloc(diffmap, k * sizeof(struct dirty_diffmap));
     if (!resized_diffmap && k > 0) {
         perror("内存重新分配失败");
         free(diffmap);
@@ -300,13 +301,17 @@ struct dirty_diffmap* merge_dirty_maps(
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirty_log *dl = &item->dirty_log;
     pid_t pid = dl->pid;
-    char current_dirty_map_path[PATH_MAX];
-    int ret;
+    char current_dirty_map_path[PATH_MAX], pattern[256], timestamp_str[64];
+    int ret, fd, len, timestamp, in_List, new_latest_timestamp = 0;
+    DIR *dir;
+    regex_t regex;
+    struct dirent *entry;
+    regmatch_t matches[2];
     
     printf("[Obsidian0215] Init dirty-log for pid: %d\n", pid);
     
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
-    int fd = open(DT_DEV_PATH, O_RDWR);
+    fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
         fprintf(stderr, "Error opening %s: %s\n", DT_DEV_PATH, strerror(errno));
         return -1;
@@ -354,15 +359,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     close(fd);
     
     // 扫描dirty_map_dir，查找新的dirtymap文件
-    DIR *dir = opendir(dirty_map_dir);
+    dir = opendir(dirty_map_dir);
     if (!dir) {
         perror("opendir");
         return -1;
     }
     
     // 编译正则表达式以匹配<pid>-<timestamp>.dirtymap
-    regex_t regex;
-    char pattern[256];
     snprintf(pattern, sizeof(pattern), "^%d-([0-9]+)\\.dirtymap$", pid);
     if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
         fprintf(stderr, "Failed to compile regex: %s\n", pattern);
@@ -370,34 +373,29 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
     
-    struct dirent *entry;
-    int new_latest_timestamp = 0;
-    
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type != DT_REG)
             continue;
         
-        regmatch_t matches[2];
         ret = regexec(&regex, entry->d_name, 2, matches, 0);
         if (ret == 0) {
             // 提取 timestamp
-            int len = matches[1].rm_eo - matches[1].rm_so;
+            len = matches[1].rm_eo - matches[1].rm_so;
             if (len <= 0 || len >= 64) {
                 fprintf(stderr, "Invalid timestamp in file name: %s\n", entry->d_name);
                 continue;
             }
-            char timestamp_str[64];
             strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
             timestamp_str[len] = '\0';
             
-            int timestamp = atoi(timestamp_str);
+            timestamp = atoi(timestamp_str);
             if (timestamp <= 0) {
                 fprintf(stderr, "Invalid timestamp value: %s\n", timestamp_str);
                 continue;
             }
             
             // 检查 timestamp 是否已在 timestamp_list 中
-            int in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, timestamp);
+            in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, timestamp);
             if (in_list == 1) {
                 continue; // 已存在
             }
@@ -565,19 +563,17 @@ void fini_dirty_map(struct pstree_item *item){
  */
 struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr) {
     struct dirty_log *dl = &item->dirty_log;
-    struct dirty_diffmap *map = dl->dirtymap;
+    struct dirty_diffmap *map = dl->diffmap;
     unsigned long left = 0;
-    unsigned long right = dl->dirtymap_size;
+    unsigned long right = dl->diffmap_size;
 
     while (left < right) {
         unsigned long mid = left + (right - left) / 2;
-        unsigned long range_start = map[mid].start;
-        unsigned long range_end = range_start + map[mid].size;
 
-        if (addr < range_start) {
+        if (addr < map[mid].address) {
             // 地址在当前范围左侧，缩小右边界
             right = mid;
-        } else if (addr >= range_end) {
+        } else if (addr > map[mid].address) {
             // 地址在当前范围右侧，缩小左边界
             left = mid + 1;
         } else {
