@@ -223,7 +223,7 @@ static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
 struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t latest_size,
         struct dirty_map *less_latest_dm, size_t less_latest_size, size_t *diffmap_size) {
     size_t max_size, i = 0, j = 0, k = 0;
-    struct dirty_diffmap *diffmap, resized_diffmap;
+    struct dirty_diffmap *diffmap, *resized_diffmap;
 
     // 预估最大可能的diffmap大小
     max_size = latest_size + less_latest_size;
@@ -281,7 +281,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     *diffmap_size = k;
 
     // 重新分配内存以节省空间
-    resized_diffmap = realloc(diffmap, k * sizeof(struct dirty_diffmap));
+    resized_diffmap = (struct dirty_diffmap *)realloc(diffmap, k * sizeof(struct dirty_diffmap));
     if (!resized_diffmap && k > 0) {
         perror("内存重新分配失败");
         free(diffmap);
@@ -302,7 +302,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirty_log *dl = &item->dirty_log;
     pid_t pid = dl->pid;
     char current_dirty_map_path[PATH_MAX], pattern[256], timestamp_str[64];
-    int ret, fd, len, timestamp, in_List, new_latest_timestamp = 0;
+    int ret, fd, len, timestamp, in_list, new_latest_timestamp = 0;
     DIR *dir;
     regex_t regex;
     struct dirent *entry;
