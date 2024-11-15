@@ -23,7 +23,7 @@
 struct pid_check {
     pid_t pid;
     bool is_tracked;
-}
+};
 
 // 纪录被选择传输的页地址和次数
 struct __attribute__((__packed__)) selected_page
