@@ -1717,7 +1717,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	if (mdc.use_dirty_map) {
 		ret = init_dirty_map(item, opts.dirty_map_dir);
 		if (ret) {
-			pr_err("init %d's dirty map failed\n", item->dirty_log.pid);
+			pr_err("init %d's dirty map failed\n", item->dl->pid);
 		}
 	}
 
