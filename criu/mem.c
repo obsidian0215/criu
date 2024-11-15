@@ -36,26 +36,38 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid)
-{
-	int ret;
+static int task_reset_dirty_track(int pid, bool use_dirty_map, bool pre_dump) {
+	int ret, fd;
+	struct pid_check pc = {.pid = pid, .is_tracked = 0};
 
 	if (!opts.track_mem)
 		return 0;
 
 	BUG_ON(!kdat.has_dirty_track);
-
-	if (opts.use_dirty_map) {
-		ret = start_dirty_track(pid);
-		if (ret == -EEXIST) {
-			pr_info("[Obsidian0215]dirty-track already started for %d\n", pid);
-		} else if (ret) {
-			pr_perror("[Obsidian0215]failed to start dirty tracking for %d\n", pid);
-		} else {
-			pr_info("[Obsidian0215]dirty-track started for %d\n", pid);
+    
+	if (use_dirty_map && pre_dump) {
+		fd = open(DT_DEV_PATH, O_RDWR);
+		if (fd == -1) {
+			pr_perror("[Obsidian0215]Error opening dirty-track LKM");
+			return -1;
 		}
-	} else
+		ret = ioctl(fd, IOCTL_CHECK_PID, &pc);
+		if (!ret && !pc.is_tracked) {
+			ret = ioctl(fd, IOCTL_START_PID, &pid);
+			if (ret) {
+				pr_perror("[Obsidian0215]failed to start dirty-track for %d", pid);
+			} else {
+				pr_info("[Obsidian0215]dirty-track started for %d\n", pid);
+			}
+		} else if (!ret && pc.is_tracked) {
+			pr_info("[Obsidian0215]dirty-track already started for %d\n", pid);
+		} else {
+			pr_perror("[Obsidian0215]failed to check dirty-track for %d", pid);
+		}
+
+	} else {
 		ret = do_task_reset_dirty_track(pid);
+	}
 	BUG_ON(ret == 1);
 	return ret;
 }
@@ -780,7 +792,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 4 -- clean up
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real);
+	ret = task_reset_dirty_track(item->pid->real, mdc->pre_dump);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;

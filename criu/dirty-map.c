@@ -51,13 +51,13 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     // 打开文件，如果不存在则创建并初始化
     fd = open(timestamp_file_path, O_RDWR | O_CREAT, 0666);
     if (fd == -1) {
-        perror("open");
+        pr_perror("[Obsidian0215]open");
         return -1;
     }
     
     // 获取文件大小
     if (fstat(fd, &st) == -1) {
-        perror("fstat");
+        pr_perror("[Obsidian0215]fstat");
         close(fd);
         return -1;
     }
@@ -67,7 +67,7 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     
     // 如果文件大小不是整数倍的 sizeof(int)，修正
     if (current_size % sizeof(int) != 0) {
-        fprintf(stderr, "Invalid timestamp_list file size\n");
+        pr_perror("[Obsidian0215]Invalid timestamp_list file size");
         close(fd);
         return -1;
     }
@@ -78,7 +78,7 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     // 如果当前文件大小小于 required_size，则扩展文件
     if (current_size < required_size) {
         if (ftruncate(fd, required_size) == -1) {
-            perror("ftruncate");
+            pr_perror("[Obsidian0215]ftruncate");
             close(fd);
             return -1;
         }
@@ -178,25 +178,25 @@ static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
     
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
-        fprintf(stderr, "Error opening dirtymap file %s: %s\n", dm_filepath, strerror(errno));
+        pr_perror("Error opening dirtymap file %s", dm_filepath);
         return -1;
     }
     
     if (fstat(fd, &st) == -1) {
-        fprintf(stderr, "Error getting size of %s: %s\n", dm_filepath, strerror(errno));
+        pr_perror("Error getting size of %s", dm_filepath);
         close(fd);
         return -1;
     }
     
     if (st.st_size == 0) {
-        fprintf(stderr, "Dirtymap file %s is empty\n", dm_filepath);
+        pr_perror("Dirtymap file %s is empty", dm_filepath);
         close(fd);
         return -1;
     }
     
     mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
-        fprintf(stderr, "Error mapping dirtymap file %s: %s\n", dm_filepath, strerror(errno));
+        pr_perror("Error mapping dirtymap file %s", dm_filepath);
         close(fd);
         return -1;
     }
@@ -229,7 +229,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     max_size = latest_size + less_latest_size;
     diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
-        perror("内存分配失败");
+        pr_perror("[Obsidian0215] Failed to allocate memory for diffmap");
         exit(EXIT_FAILURE);
     }
 
@@ -283,7 +283,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     // 重新分配内存以节省空间
     resized_diffmap = (struct dirty_diffmap *)realloc(diffmap, k * sizeof(struct dirty_diffmap));
     if (!resized_diffmap && k > 0) {
-        perror("内存重新分配失败");
+        pr_perror("[Obsidian0215]re-alloc diffmap failed");
         free(diffmap);
         exit(EXIT_FAILURE);
     }
@@ -308,11 +308,12 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     regex_t regex;
     struct dirent *entry;
     regmatch_t matches[2];
+    struct pid_check pc = {.pid = pid, .is_tracked = 0};
     
     // [Obsidian0215] init dirty-log for pid
     dl = (struct dirty_log *)xzalloc(sizeof(struct dirty_log));
     if (!dl) {
-        fprintf(stderr, "[Obsidian0215]Error allocating memory for dirty-log: %s\n", strerror(errno));
+        pr_perror("[Obsidian0215]Failed to allocate memory for dirty-log");
         return -1;
     }
     INIT_DIRTY_LOG_PTR(dl);
@@ -322,7 +323,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
     fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
-        fprintf(stderr, "[Obsidian0215]Error opening %s: %s\n", DT_DEV_PATH, strerror(errno));
+        pr_perror("[Obsidian0215]Failed to open dirty_track device %s", DT_DEV_PATH);
         return -1;
     }
     
@@ -330,11 +331,11 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // // 通过 ioctl 获取当前 dirty_map 路径
     // ret = ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, current_dirty_map_path);
     // if (ret < 0) {
-    //     pr_err("[Obsidian0215]Error getting dirty_map_path for dirty-track: %s\n", strerror(errno));
+    //     pr_perror("[Obsidian0215]Error getting dirty_map_path for dirty-track\n");
     //     close(fd);
     //     return -1;
     // } else if (strcmp(current_dirty_map_path, dirty_map_dir) != 0) {
-    //     pr_err("[Obsidian0215]Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
+    //     pr_perror("[Obsidian0215]Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
     //             dirty_map_dir, current_dirty_map_path);
     //     close(fd);
     //     return -1;
@@ -343,7 +344,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
     ret = read_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
     if (ret < 0) {
-        fprintf(stderr, "[Obsidian0215]Failed to read timestamp_list for pid %d\n", pid);
+        pr_perror("[Obsidian0215]Failed to read timestamp_list for pid %d", pid);
         return -1;
     }
     
@@ -360,25 +361,35 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // 停止pid的dirty track以生成dirty-map文件
-    ret = ioctl(fd, IOCTL_STOP_PID, &pid);
-    if (ret < 0) {
-        fprintf(stderr, "[Obsidian0215]Error stoping dirty-track for pid %d\n", pid);
+    ret = ioctl(fd, IOCTL_CHECK_PID, &pc);
+    if (!ret && pc.is_tracked) {
+        ret = ioctl(fd, IOCTL_STOP_PID, &pid);
+        if (ret < 0) {
+            pr_perror("[Obsidian0215]Error stoping dirty-track for pid %d", pid);
+            close(fd);
+            return -1;
+        }
+    } else if (!ret && !pc.is_tracked) {
+        pr_info("[Obsidian0215]pid %d is not tracked by dirty-track LKM\n", pid);
+    } else {
+        pr_perror("[Obsidian0215]Error checking if pid %d is tracked by dirty-track LKM", pid);
         close(fd);
         return -1;
     }
+
     close(fd);
     
     // 扫描dirty_map_dir，查找新的dirtymap文件
     dir = opendir(dirty_map_dir);
     if (!dir) {
-        fprintf(stderr, "[Obsidian0215]opendir failed:%s\n", dirty_map_dir);
+        pr_perror("[Obsidian0215]%s opendir failed", dirty_map_dir);
         return -1;
     }
     
     // 编译正则表达式以匹配<pid>-<timestamp>.dirtymap
     snprintf(pattern, sizeof(pattern), "^%d-([0-9]+)\\.dirtymap$", pid);
     if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
-        fprintf(stderr, "[Obsidian0215]Failed to compile regex: %s\n", pattern);
+        pr_perror("[Obsidian0215]Failed to compile regex: %s", pattern);
         closedir(dir);
         return -1;
     }
@@ -392,7 +403,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             // 提取 timestamp
             len = matches[1].rm_eo - matches[1].rm_so;
             if (len <= 0 || len >= 64) {
-                fprintf(stderr, "[Obsidian0215]Invalid timestamp in file name: %s\n", entry->d_name);
+                pr_perror("[Obsidian0215]Invalid timestamp in file name: %s", entry->d_name);
                 continue;
             }
             strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
@@ -400,7 +411,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             
             timestamp = atoi(timestamp_str);
             if (timestamp <= 0) {
-                fprintf(stderr, "[Obsidian0215]Invalid timestamp value: %s\n", timestamp_str);
+                pr_perror("[Obsidian0215]Invalid timestamp value: %s", timestamp_str);
                 continue;
             }
             
@@ -435,14 +446,14 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
-        fprintf(stderr, "[Obsidian0215]Failed to append latest timestamp %d to timestamp_list.%d\n", 
+        pr_perror("[Obsidian0215]Failed to append latest timestamp %d to timestamp_list.%d", 
                 dl->latest_timestamp, pid);
         // 追加失败也继续执行
     }
 
     // 解除映射的timestamp_list
     if (munmap(dl->timestamp_list, dl->ts_list_size * sizeof(int)) == -1) {
-        fprintf(stderr, "[Obsidian0215]Error unmapping timestamp_list: %s\n", strerror(errno));
+        pr_perror("[Obsidian0215]Error unmapping timestamp_list");
     }
     dl->timestamp_list = NULL;
     dl->ts_list_size = 0;
@@ -452,7 +463,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         ret = map_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
                           &dl->latest_dm, &dl->ldm_size);
         if (ret < 0) {
-            fprintf(stderr, "[Obsidian0215]Failed to map latest dirtymap for pid %d\n", pid);
+            pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %n", pid);
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
@@ -467,7 +478,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         ret = map_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir, 
                           &dl->less_latest_dm, &dl->lldm_size);
         if (ret < 0) {
-            fprintf(stderr, "[Obsidian0215]Failed to map less latest dirtymap for pid %d\n", pid);
+            pr_perror("[Obsidian0215]Failed to map less latest dirtymap for pid %d", pid);
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
         } else
@@ -498,7 +509,7 @@ int start_dirty_track(int pid) {
     
     fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
-        fprintf(stderr, "[Obsidian0215]Error opening dirty-track LKM\n");
+        pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
 
@@ -518,7 +529,7 @@ int stop_dirty_track(int pid) {
     
     fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
-        fprintf(stderr, "[Obsidian0215]Error opening dirty-track LKM\n");
+        pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
 
@@ -540,7 +551,7 @@ void fini_dirty_map(struct pstree_item *item){
         // 卸载最新的dirtymap
         if (dl->latest_dm) {
             if (munmap(dl->latest_dm, dl->ldm_size) == -1) {
-                fprintf(stderr, "[Obsidian0215]Error unmapping latest dirtymap: %s\n", strerror(errno));
+                pr_perror("[Obsidian0215]Error unmapping latest dirtymap");
             }
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
@@ -549,7 +560,7 @@ void fini_dirty_map(struct pstree_item *item){
         // 处理次新的dirtymap
         if (dl->less_latest_dm) {
             if (munmap(dl->less_latest_dm, dl->lldm_size) == -1) {
-                fprintf(stderr, "[Obsidian0215]Error unmapping second latest dirtymap: %s\n", strerror(errno));
+                pr_perror("[Obsidian0215]Error unmapping second latest dirtymap");
             }
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
@@ -561,6 +572,10 @@ void fini_dirty_map(struct pstree_item *item){
             dl->diffmap = NULL;
             dl->diffmap_size = 0;
         }
+        
+        // 释放dl结构体
+        free(dl);
+        item->dl = NULL;
     }
 }
 

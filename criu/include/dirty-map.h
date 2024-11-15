@@ -14,10 +14,16 @@
 #define IOCTL_SET_DIRTY_MAP_PATH _IOW(DIRTY_TRACK_MAGIC, 1, char[256])
 #define IOCTL_START_PID _IOW(DIRTY_TRACK_MAGIC, 2, pid_t)
 #define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
-#define IOCTL_CLEAR_SOFT_DIRTY _IO(DIRTY_TRACK_MAGIC, 4)
+#define IOCTL_CHECK_PID _IOWR(DIRTY_TRACK_MAGIC, 4, struct pid_check)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
 #define DT_DEV_PATH "/dev/dirty-track"
+
+// 检查pid是否被dirty-track中
+struct pid_check {
+    pid_t pid;
+    bool is_tracked;
+}
 
 // 纪录被选择传输的页地址和次数
 struct __attribute__((__packed__)) selected_page
