@@ -463,7 +463,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         ret = map_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
                           &dl->latest_dm, &dl->ldm_size);
         if (ret < 0) {
-            pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %n", pid);
+            pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
