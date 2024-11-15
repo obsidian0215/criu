@@ -36,7 +36,7 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid, bool use_dirty_map)
+static int task_reset_dirty_track(int pid)
 {
 	int ret;
 
@@ -45,15 +45,16 @@ static int task_reset_dirty_track(int pid, bool use_dirty_map)
 
 	BUG_ON(!kdat.has_dirty_track);
 
-	if (use_dirty_map) {
+	if (opts.use_dirty_map) {
 		ret = start_dirty_track(pid);
 		if (ret == -EEXIST) {
-			pr_info("Dirty tracking already started for %d\n", pid);
+			pr_info("[Obsidian0215]dirty-track already started for %d\n", pid);
 		} else if (ret) {
-			pr_perror("Failed to start dirty tracking for %d\n", pid);
+			pr_perror("[Obsidian0215]failed to start dirty tracking for %d\n", pid);
+		} else {
+			pr_info("[Obsidian0215]dirty-track started for %d\n", pid);
 		}
-	}
-	else
+	} else
 		ret = do_task_reset_dirty_track(pid);
 	BUG_ON(ret == 1);
 	return ret;
@@ -779,7 +780,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 4 -- clean up
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real, mdc->use_dirty_map);
+	ret = task_reset_dirty_track(item->pid->real);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;

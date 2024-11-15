@@ -308,7 +308,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirent *entry;
     regmatch_t matches[2];
     
-    printf("[Obsidian0215] Init dirty-log for pid: %d\n", pid);
+    // printf("[Obsidian0215] Init dirty-log for pid: %d\n", pid);
     
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
     fd = open(DT_DEV_PATH, O_RDWR);
