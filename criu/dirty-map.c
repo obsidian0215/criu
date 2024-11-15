@@ -301,7 +301,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirty_log *dl = &item->dirty_log;
     pid_t pid = dl->pid;
-    char current_dirty_map_path[PATH_MAX], pattern[256], timestamp_str[64];
+    char pattern[256], timestamp_str[64];
+    // char current_dirty_map_path[PATH_MAX];
     int ret, fd, len, timestamp, in_list, new_latest_timestamp = 0;
     DIR *dir;
     regex_t regex;
