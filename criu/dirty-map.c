@@ -534,7 +534,7 @@ int stop_dirty_track(int pid) {
  * @return void
  */
 void fini_dirty_map(struct pstree_item *item){
-    struct dirty_log *dl = &item->dl;
+    struct dirty_log *dl = item->dl;
     
     if (dl) {
         // 卸载最新的dirtymap
@@ -572,7 +572,7 @@ void fini_dirty_map(struct pstree_item *item){
  * @return struct dirty_diffmap * 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
  */
 struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr) {
-    struct dirty_log *dl = &item->dl;
+    struct dirty_log *dl = item->dl;
     struct dirty_diffmap *map = dl->diffmap;
     unsigned long left = 0;
     unsigned long right = dl->diffmap_size;
