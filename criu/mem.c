@@ -36,8 +36,10 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid, bool use_dirty_map, bool pre_dump) {
+static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc) {
 	int ret, fd;
+	bool use_dirty_map = mdc->use_dirty_map;
+	bool pre_dump = mdc->pre_dump;
 	struct pid_check pc = {.pid = pid, .is_tracked = 0};
 
 	if (!opts.track_mem)
@@ -792,7 +794,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 4 -- clean up
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real, mdc->pre_dump);
+	ret = task_reset_dirty_track(item->pid->real, mdc);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;
