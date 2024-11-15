@@ -317,18 +317,19 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
     
-    // 通过 ioctl 获取当前 dirty_map 路径
-    ret = ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, current_dirty_map_path);
-    if (ret < 0) {
-        pr_err("[Obsidian0215]Error getting dirty_map_path for dirty-track: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    } else if (strcmp(current_dirty_map_path, dirty_map_dir) != 0) {
-        pr_err("[Obsidian0215]Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
-                dirty_map_dir, current_dirty_map_path);
-        close(fd);
-        return -1;
-    }
+    // 通过service传递的是dirty-map-dir-fd（/proc/pid/fd/num）
+    // // 通过 ioctl 获取当前 dirty_map 路径
+    // ret = ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, current_dirty_map_path);
+    // if (ret < 0) {
+    //     pr_err("[Obsidian0215]Error getting dirty_map_path for dirty-track: %s\n", strerror(errno));
+    //     close(fd);
+    //     return -1;
+    // } else if (strcmp(current_dirty_map_path, dirty_map_dir) != 0) {
+    //     pr_err("[Obsidian0215]Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
+    //             dirty_map_dir, current_dirty_map_path);
+    //     close(fd);
+    //     return -1;
+    // }
     
     // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
     ret = read_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
