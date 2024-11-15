@@ -197,7 +197,6 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 {
 	struct pstree_item *item;
 	int sz;
-	struct dirty_log *dl;
 
 	if (!rst) {
 		sz = sizeof(*item) + sizeof(struct dmp_info) + sizeof(struct pid);
@@ -217,9 +216,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 		item->pid = (void *)item + sizeof(*item) + sizeof(struct rst_info);
 		
 		// [Obsidian0215] init dirty-log
-		dl = &item->dirty_log;
-		INIT_DIRTY_LOG_PTR(dl);
-		item->dirty_log.pid = item->pid->real;
+		item->dl = NULL;
 	}
 
 	INIT_LIST_HEAD(&item->children);
@@ -231,9 +228,6 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->pid->stop_signo = -1;
 	item->born_sid = -1;
 	item->pid->item = item;
-	// [Obsidian0215] init dirty-log
-	dl = &item->dirty_log;
-	INIT_DIRTY_LOG_PTR(dl);
 
 	futex_init(&item->task_st);
 

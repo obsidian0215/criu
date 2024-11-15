@@ -299,8 +299,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
  * @return int 成功返回 0，失败返回 -1。
  */
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
-    struct dirty_log *dl = &item->dirty_log;
-    pid_t pid = dl->pid;
+    struct dirty_log *dl;
+    pid_t pid = item->pid->real;
     char pattern[256], timestamp_str[64];
     // char current_dirty_map_path[PATH_MAX];
     int ret, fd, len, timestamp, in_list, new_latest_timestamp = 0;
@@ -309,7 +309,15 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirent *entry;
     regmatch_t matches[2];
     
-    // printf("[Obsidian0215] Init dirty-log for pid: %d\n", pid);
+    // [Obsidian0215] init dirty-log for pid
+    dl = (struct dirty_log *)xzalloc(sizeof(struct dirty_log));
+    if (!dl) {
+        fprintf(stderr, "[Obsidian0215]Error allocating memory for dirty-log: %s\n", strerror(errno));
+        return -1;
+    }
+    INIT_DIRTY_LOG_PTR(dl);
+    dl->pid = pid;
+    item->dl = dl;
     
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
     fd = open(DT_DEV_PATH, O_RDWR);

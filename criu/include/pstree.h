@@ -31,7 +31,7 @@ struct pstree_item {
 		futex_t task_st;
 		unsigned long task_st_le_bits;
 	};
-	struct dirty_log dirty_log;
+	struct dirty_log *dl;
 };
 
 static inline pid_t vpid(const struct pstree_item *i)
