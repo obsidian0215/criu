@@ -511,7 +511,7 @@ static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struc
             // 未在dirty_map中找到，根据是否有父镜像决定
             if (!has_parent) {
 				// 没有父镜像，选择没有变脏的冷页
-				if (page_in_parent(softdirty))
+				if (!page_in_parent(softdirty))
                 	return true;
 				else	// 一般情况下不会走该分支
                 	return false;
