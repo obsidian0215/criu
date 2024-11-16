@@ -49,6 +49,7 @@ struct __attribute__((__packed__)) dirty_map
 
 struct dirty_log {
     pid_t pid;
+    int dirty_track_fd;     // dirty-track设备文件描述符
     struct dirty_diffmap *diffmap;
     unsigned long diffmap_size;
 
@@ -68,6 +69,7 @@ struct dirty_log {
 
 #define INIT_DIRTY_LOG(log) do { \
     (log).pid = -1; \
+    (log).dirty_track_fd = -1; \
     (log).timestamp_list = NULL; \
     (log).ts_list_size = 0; \
     (log).latest_timestamp = 0; \
@@ -82,6 +84,7 @@ struct dirty_log {
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
     (log_ptr)->pid = -1; \
+    (log_ptr)->dirty_track_fd = -1; \
     (log_ptr)->timestamp_list = NULL; \
     (log_ptr)->ts_list_size = 0; \
     (log_ptr)->latest_timestamp = 0; \
@@ -96,8 +99,8 @@ struct dirty_log {
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
 void fini_dirty_map(struct pstree_item *item);
-int start_dirty_track(int pid);
-int stop_dirty_track(int pid);
+// int start_dirty_track(struct dirty_log* dl);
+// int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
 
 #endif

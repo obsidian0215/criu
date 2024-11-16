@@ -396,12 +396,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 * open dirty_map_dir - together with use_dirty_map
 	 */
 	if (req->use_dirty_map) {
-		if (req->dirty_map_dir_fd != -1)
-			sprintf(dirty_map_dir_path, "/proc/%d/fd/%d", ids.pid, req->dirty_map_dir_fd);
-		else if (req->dirty_map_dir)
+		if (req->dirty_map_dir)
 			strncpy(dirty_map_dir_path, req->dirty_map_dir, PATH_MAX - 1);
 		else {
-			pr_err("While --use-dirty-map, Neither dirty_map_dir_fd nor dirty_map_dir was passed by RPC client.\n");
+			pr_err("While --use-dirty-map, no dirty_map_dir was passed by RPC client.\n");
 			goto err;
 		}
 		opts.use_dirty_map = true;

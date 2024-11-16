@@ -36,8 +36,8 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc) {
-	int ret, fd;
+static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc, struct pstree_item *item) {
+	int ret, fd = item->dl->dirty_track_fd;
 	bool use_dirty_map = mdc->use_dirty_map;
 	bool pre_dump = mdc->pre_dump;
 	struct pid_check pc = {.pid = pid, .is_tracked = 0};
@@ -48,8 +48,8 @@ static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc) {
 	BUG_ON(!kdat.has_dirty_track);
     
 	if (use_dirty_map && pre_dump) {
-		fd = open(DT_DEV_PATH, O_RDWR);
-		if (fd == -1) {
+		// fd = item->dl->dirty_track_fd;
+		if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
 			pr_perror("[Obsidian0215]Error opening dirty-track LKM");
 			return -1;
 		}

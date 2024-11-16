@@ -26,7 +26,7 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 
-#define TIMESTAMP_LIST_PREFIX "timestamp_list."
+#define TIMESTAMP_LIST_PREFIX "timestamp_list"
 
 #define MAX_FILES 32
 
@@ -46,12 +46,12 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     int fd;
     struct stat st;
 
-    snprintf(timestamp_file_path, sizeof(timestamp_file_path), "%s/%s%d", dirty_map_dir, TIMESTAMP_LIST_PREFIX, pid);
-    
+    snprintf(timestamp_file_path, sizeof(timestamp_file_path), "%s/%s.%d", dirty_map_dir, TIMESTAMP_LIST_PREFIX, pid);
+    timestamp_file_path[sizeof(timestamp_file_path) - 1] = '\0';
     // 打开文件，如果不存在则创建并初始化
     fd = open(timestamp_file_path, O_RDWR | O_CREAT, 0666);
     if (fd == -1) {
-        pr_perror("[Obsidian0215]open");
+        pr_perror("[Obsidian0215]open %s", timestamp_file_path);
         return -1;
     }
     
@@ -321,8 +321,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     item->dl = dl;
     
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
-    fd = open(DT_DEV_PATH, O_RDWR);
-    if (fd == -1) {
+    ret = init_dirty_track(dl);
+    if (ret) {
         pr_perror("[Obsidian0215]Failed to open dirty_track device %s", DT_DEV_PATH);
         return -1;
     }
@@ -361,23 +361,22 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // 停止pid的dirty track以生成dirty-map文件
-    ret = ioctl(fd, IOCTL_CHECK_PID, &pc);
+    ret = ioctl(dl->dirty_track_fd, IOCTL_CHECK_PID, &pc);
     if (!ret && pc.is_tracked) {
-        ret = ioctl(fd, IOCTL_STOP_PID, &pid);
+        ret = ioctl(dl->dirty_track_fd, IOCTL_STOP_PID, &pid);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Error stoping dirty-track for pid %d", pid);
-            close(fd);
+            close(dl->dirty_track_fd);
             return -1;
         }
     } else if (!ret && !pc.is_tracked) {
         pr_info("[Obsidian0215]pid %d is not tracked by dirty-track LKM\n", pid);
     } else {
         pr_perror("[Obsidian0215]Error checking if pid %d is tracked by dirty-track LKM", pid);
-        close(fd);
+        close(dl->dirty_track_fd);
         return -1;
     }
-
-    close(fd);
+    // close(dl->dirty_track_fd);
     
     // 扫描dirty_map_dir，查找新的dirtymap文件
     dir = opendir(dirty_map_dir);
@@ -499,42 +498,58 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 }
 
 /**
- * @brief 为特定pid进程启动dirty track
+ * @brief 为特定pid进程打开dirty-track设备
  *
- * @param pid 目标进程的真实pid
- * @return int 成功返回0，失败返回-1/errno
+ * @param dl 目标dirty_log实例
+ * @return int 成功返回0，失败返回-1
  */
-int start_dirty_track(int pid) {
-    int ret = 0, fd;
+static int init_dirty_track(struct dirty_log *dl) {
+    int fd;
     
     fd = open(DT_DEV_PATH, O_RDWR);
     if (fd == -1) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
+    dl->dirty_track_fd = fd;
+    return 0;
+}
+
+/**
+ * @brief 为特定pid进程启动dirty track
+ *
+ * @param dl 目标dirty_log实例
+ * @return int 成功返回0，失败返回-1/errno
+ */
+static int start_dirty_track(struct dirty_log *dl) {
+    int ret = 0, fd = dl->dirty_track_fd;
+    
+    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
+        pr_perror("[Obsidian0215]Error opening dirty-track LKM");
+        return -1;
+    }
 
     ret = ioctl(fd, IOCTL_START_PID, &pid);
-    close(fd);
+    // close(fd);
     return ret;
 }
 
 /**
  * @brief 为特定pid进程停止dirty track
  *
- * @param pid 目标进程的真实pid
+ * @param dl 目标dirty_log实例
  * @return int 成功返回0，失败返回-1/errno
  */
-int stop_dirty_track(int pid) {
-    int ret = 0, fd;
+static int stop_dirty_track(struct dirty_log *dl) {
+    int ret = 0, fd = dl->dirty_track_fd;
     
-    fd = open(DT_DEV_PATH, O_RDWR);
-    if (fd == -1) {
+    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
 
     ret = ioctl(fd, IOCTL_STOP_PID, &pid);
-    close(fd);
+    // close(fd);
     return ret;
 }
 
@@ -548,6 +563,12 @@ void fini_dirty_map(struct pstree_item *item){
     struct dirty_log *dl = item->dl;
     
     if (dl) {
+        // 关闭打开的dirty-track设备fd
+        if (dl->dirty_track_fd) {
+            close(dl->dirty_track_fd);
+            dl->dirty_track_fd = -1;
+        }
+
         // 卸载最新的dirtymap
         if (dl->latest_dm) {
             if (munmap(dl->latest_dm, dl->ldm_size) == -1) {
