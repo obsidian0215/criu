@@ -303,7 +303,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     pid_t pid = item->pid->real;
     char pattern[256], timestamp_str[64];
     // char current_dirty_map_path[PATH_MAX];
-    int ret, fd, len, timestamp, in_list, new_latest_timestamp = 0;
+    int ret, len, timestamp, in_list, new_latest_timestamp = 0;
     DIR *dir;
     regex_t regex;
     struct dirent *entry;
@@ -524,7 +524,7 @@ int init_dirty_track(struct dirty_log *dl) {
 int start_dirty_track(struct dirty_log *dl) {
     int ret = 0, fd = dl->dirty_track_fd;
     
-    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
+    if (fd == -1 && (fd = open(DT_DEV_PATH, O_RDWR)) == -1) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
@@ -543,7 +543,7 @@ int start_dirty_track(struct dirty_log *dl) {
 int check_dirty_track(struct dirty_log *dl, struct pid_check *pc) {
     int ret = 0, fd = dl->dirty_track_fd;
     
-    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
+    if (fd == -1 && (fd = open(DT_DEV_PATH, O_RDWR)) == -1) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
@@ -562,7 +562,7 @@ int check_dirty_track(struct dirty_log *dl, struct pid_check *pc) {
 int stop_dirty_track(struct dirty_log *dl) {
     int ret = 0, fd = dl->dirty_track_fd;
     
-    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
+    if (fd == -1 && ((fd = open(DT_DEV_PATH, O_RDWR)) == -1)) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;
     }
