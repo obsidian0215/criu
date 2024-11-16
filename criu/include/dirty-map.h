@@ -99,8 +99,10 @@ struct dirty_log {
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
 void fini_dirty_map(struct pstree_item *item);
-// int start_dirty_track(struct dirty_log* dl);
-// int stop_dirty_track(struct dirty_log* dl);
+int init_dirty_track(struct dirty_log *dl);
+int start_dirty_track(struct dirty_log* dl);
+int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
+int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
 
 #endif

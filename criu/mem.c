@@ -36,8 +36,9 @@
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
 
-static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc, struct pstree_item *item) {
-	int ret, fd = item->dl->dirty_track_fd;
+static int task_reset_dirty_track(struct pstree_item *item, struct mem_dump_ctl *mdc) {
+	int ret, pid = item->pid->real;
+	struct dirty_log *dl = item->dl;
 	bool use_dirty_map = mdc->use_dirty_map;
 	bool pre_dump = mdc->pre_dump;
 	struct pid_check pc = {.pid = pid, .is_tracked = 0};
@@ -49,13 +50,14 @@ static int task_reset_dirty_track(int pid, struct mem_dump_ctl *mdc, struct pstr
     
 	if (use_dirty_map && pre_dump) {
 		// fd = item->dl->dirty_track_fd;
-		if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
-			pr_perror("[Obsidian0215]Error opening dirty-track LKM");
+		if (!dl || (dl->dirty_track_fd == -1) || (dl->pid != pid)) {
+			pr_err("[Obsidian0215]No available dirty-track fd for %d\n", pid);
 			return -1;
+
 		}
-		ret = ioctl(fd, IOCTL_CHECK_PID, &pc);
+		ret = check_dirty_track(dl, &pc);
 		if (!ret && !pc.is_tracked) {
-			ret = ioctl(fd, IOCTL_START_PID, &pid);
+			ret = start_dirty_track(dl);
 			if (ret) {
 				pr_perror("[Obsidian0215]failed to start dirty-track for %d", pid);
 			} else {
@@ -794,7 +796,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 4 -- clean up
 	 */
 
-	ret = task_reset_dirty_track(item->pid->real, mdc);
+	ret = task_reset_dirty_track(item, mdc);
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;

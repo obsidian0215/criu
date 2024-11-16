@@ -503,7 +503,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
  * @param dl 目标dirty_log实例
  * @return int 成功返回0，失败返回-1
  */
-static int init_dirty_track(struct dirty_log *dl) {
+int init_dirty_track(struct dirty_log *dl) {
     int fd;
     
     fd = open(DT_DEV_PATH, O_RDWR);
@@ -521,7 +521,7 @@ static int init_dirty_track(struct dirty_log *dl) {
  * @param dl 目标dirty_log实例
  * @return int 成功返回0，失败返回-1/errno
  */
-static int start_dirty_track(struct dirty_log *dl) {
+int start_dirty_track(struct dirty_log *dl) {
     int ret = 0, fd = dl->dirty_track_fd;
     
     if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
@@ -529,7 +529,26 @@ static int start_dirty_track(struct dirty_log *dl) {
         return -1;
     }
 
-    ret = ioctl(fd, IOCTL_START_PID, &pid);
+    ret = ioctl(fd, IOCTL_START_PID, &dl->pid);
+    // close(fd);
+    return ret;
+}
+
+/**
+ * @brief 为特定pid进程启动dirty track
+ *
+ * @param dl 目标dirty_log实例
+ * @return int 成功返回0，失败返回-1/errno
+ */
+int check_dirty_track(struct dirty_log *dl, struct pid_check *pc) {
+    int ret = 0, fd = dl->dirty_track_fd;
+    
+    if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
+        pr_perror("[Obsidian0215]Error opening dirty-track LKM");
+        return -1;
+    }
+
+    ret = ioctl(fd, IOCTL_CHECK_PID, pc);
     // close(fd);
     return ret;
 }
@@ -540,7 +559,7 @@ static int start_dirty_track(struct dirty_log *dl) {
  * @param dl 目标dirty_log实例
  * @return int 成功返回0，失败返回-1/errno
  */
-static int stop_dirty_track(struct dirty_log *dl) {
+int stop_dirty_track(struct dirty_log *dl) {
     int ret = 0, fd = dl->dirty_track_fd;
     
     if (fd == -1 && fd = open(DT_DEV_PATH, O_RDWR) == -1) {
@@ -548,7 +567,7 @@ static int stop_dirty_track(struct dirty_log *dl) {
         return -1;
     }
 
-    ret = ioctl(fd, IOCTL_STOP_PID, &pid);
+    ret = ioctl(fd, IOCTL_STOP_PID, &dl->pid);
     // close(fd);
     return ret;
 }
