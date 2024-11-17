@@ -421,8 +421,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
             timestamp_str[len] = '\0';
             
-            timestamp = atoi(timestamp_str);
-            if (timestamp <= 0) {
+            char *endptr;
+            timestamp = strtoul(timestamp_str, &endptr, 10);
+            if (*endptr != '\0') { // 确保整个字符串都被转换
+                pr_perror("[Obsidian0215]Non-numeric characters in timestamp: %s", timestamp_str);
+                continue;
+            }
+            if (timestamp <= 0 || (timestamp == ULONG_MAX && errno == ERANGE)) {
                 pr_perror("[Obsidian0215]Invalid timestamp value: %s", timestamp_str);
                 continue;
             }
@@ -464,7 +469,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // 解除映射的timestamp_list
-    if (munmap(dl->timestamp_list, dl->ts_list_size * sizeof(int)) == -1) {
+    if (munmap(dl->timestamp_list, dl->ts_list_size * sizeof(unsigned long)) == -1) {
         pr_perror("[Obsidian0215]Error unmapping timestamp_list");
     }
     dl->timestamp_list = NULL;
