@@ -166,7 +166,7 @@ static int append_timestamp_to_list(int *timestamp_list, size_t *ts_list_size, i
  * @param dm_size 指向将存储映射大小的指针
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
-static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
+static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
                 struct dirty_map **dm, unsigned long *dm_size) {
     char dm_filepath[PATH_MAX];
     int fd;
@@ -178,7 +178,7 @@ static int map_dirtymap(pid_t pid, int timestamp, const char *dirty_map_dir,
         return 0;
     }
     
-    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%d.dirtymap", dirty_map_dir, pid, timestamp);
+    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%lu.dirtymap", dirty_map_dir, pid, timestamp);
     
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
