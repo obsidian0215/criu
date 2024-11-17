@@ -141,7 +141,7 @@ static int is_timestamp_in_list(int *timestamp_list, size_t ts_list_size, int ti
  * @param new_timestamp 要追加的新的时间戳。
  * @return int 成功返回 0，失败返回 -1 并设置 errno。
  */
-static int append_timestamp_to_list(int *timestamp_list, size_t *ts_list_size, int new_timestamp) {
+static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_list_size, unsigned long new_timestamp) {
     // 将 new_timestamp 写入预留的空间
     timestamp_list[*ts_list_size] = new_timestamp;
     
@@ -149,7 +149,7 @@ static int append_timestamp_to_list(int *timestamp_list, size_t *ts_list_size, i
     (*ts_list_size)++;
     
     // 同步更改到文件
-    if (msync(timestamp_list, (*ts_list_size) * sizeof(int), MS_SYNC) == -1) {
+    if (msync(timestamp_list, (*ts_list_size) * sizeof(unsigned long), MS_SYNC) == -1) {
         perror("msync");
         return -1;
     }
@@ -307,7 +307,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     pid_t pid = item->pid->real;
     char pattern[256], timestamp_str[64];
     // char current_dirty_map_path[PATH_MAX];
-    int ret, len, timestamp, in_list;
+    int ret, len, in_list;
+    unsigned long timestamp;
     DIR *dir;
     regex_t regex;
     struct dirent *entry;

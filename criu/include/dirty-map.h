@@ -54,7 +54,7 @@ struct dirty_log {
     unsigned long diffmap_size;
 
     struct {
-        int *timestamp_list;
+        unsigned long *timestamp_list;
         size_t ts_list_size;
 
         unsigned long latest_timestamp;
