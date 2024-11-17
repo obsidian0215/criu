@@ -198,7 +198,7 @@ static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_ma
         return -1;
     }
     
-    mapped = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
         pr_perror("Error mapping dirtymap file %s", dm_filepath);
         close(fd);
