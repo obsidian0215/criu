@@ -120,7 +120,7 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
  * @param timestamp 要检查的时间戳。
  * @return int 返回 1 表示存在，0 表示不存在。
  */
-static int is_timestamp_in_list(int *timestamp_list, size_t ts_list_size, int timestamp) {
+static int is_timestamp_in_list(unsigned long *timestamp_list, size_t ts_list_size, unsigned long timestamp) {
     // 如果timestamp_list为空直接覆盖ts_list内存的原有值
     if (!ts_list_size)
         return 0;
