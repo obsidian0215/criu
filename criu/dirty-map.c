@@ -457,7 +457,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to append latest timestamp %d to timestamp_list.%d", 
+        pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d", 
                 dl->latest_timestamp, pid);
         // 追加失败也继续执行
     }
