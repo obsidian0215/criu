@@ -57,13 +57,13 @@ struct dirty_log {
         int *timestamp_list;
         size_t ts_list_size;
 
-        int latest_timestamp;
+        unsigned long latest_timestamp;
         struct dirty_map *latest_dm;
-	    unsigned long ldm_size;
+	    unsigned int ldm_size;
 
-        int less_latest_timestamp;
+        unsigned long less_latest_timestamp;
         struct dirty_map *less_latest_dm;
-	    unsigned long lldm_size;
+	    unsigned int lldm_size;
     };
 };
 
