@@ -39,7 +39,7 @@
  * @param ts_list_size 指针，存储timestamp_list的大小
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **timestamp_list, size_t *ts_list_size) {
+static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, size_t *ts_list_size) {
     char timestamp_file_path[PATH_MAX];
     void *mmaped = NULL;
     size_t current_size, current_count, required_size;
@@ -63,17 +63,17 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     }
     
     current_size = st.st_size;
-    current_count = current_size / sizeof(int);
+    current_count = current_size / sizeof(unsigned long);
     
     // 如果文件大小不是整数倍的 sizeof(int)，修正
-    if (current_size % sizeof(int) != 0) {
+    if (current_size % sizeof(unsigned long) != 0) {
         pr_perror("[Obsidian0215]Invalid timestamp_list file size");
         close(fd);
         return -1;
     }
     
     // 需要映射的总大小为 current_count + 1 个 int
-    required_size = (current_count + 1) * sizeof(int);
+    required_size = (current_count + 1) * sizeof(unsigned long);
     
     // 如果当前文件大小小于 required_size，则扩展文件
     if (current_size < required_size) {
@@ -106,7 +106,7 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
     }
     close(fd);
     
-    *timestamp_list = (int *)mmaped;
+    *timestamp_list = (unsigned long *)mmaped;
     *ts_list_size = current_count;
     
     return 0;
