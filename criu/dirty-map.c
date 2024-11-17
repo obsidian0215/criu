@@ -305,7 +305,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     struct dirty_log *dl;
     pid_t pid = item->pid->real;
-    char pattern[256], timestamp_str[64];
+    char pattern[256], timestamp_str[64], *endptr;
     // char current_dirty_map_path[PATH_MAX];
     int ret, len, in_list;
     unsigned long timestamp;
@@ -421,7 +421,6 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
             timestamp_str[len] = '\0';
             
-            char *endptr;
             timestamp = strtoul(timestamp_str, &endptr, 10);
             if (*endptr != '\0') { // 确保整个字符串都被转换
                 pr_perror("[Obsidian0215]Non-numeric characters in timestamp: %s", timestamp_str);
