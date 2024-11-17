@@ -121,6 +121,10 @@ static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, int **times
  * @return int 返回 1 表示存在，0 表示不存在。
  */
 static int is_timestamp_in_list(int *timestamp_list, size_t ts_list_size, int timestamp) {
+    // 如果timestamp_list为空直接覆盖ts_list内存的原有值
+    if (!ts_list_size)
+        return 0;
+    
     for (size_t i = 0; i < ts_list_size; ++i) {
         if (timestamp_list[i] == timestamp) {
             return 1; // 存在
@@ -303,7 +307,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     pid_t pid = item->pid->real;
     char pattern[256], timestamp_str[64];
     // char current_dirty_map_path[PATH_MAX];
-    int ret, len, timestamp, in_list, new_latest_timestamp = 0;
+    int ret, len, timestamp, in_list;
     DIR *dir;
     regex_t regex;
     struct dirent *entry;
@@ -348,15 +352,23 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
     
-    // 初始化latest_timestamp和less_latest_timestamp
-    if (dl->ts_list_size >= 2) {
-        dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
-        dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-2];
-    } else if (dl->ts_list_size == 1) {
-        dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
-        // dl->less_latest_timestamp = 0;
+    // // 初始化latest_timestamp和less_latest_timestamp
+    // if (dl->ts_list_size >= 2) {
+    //     dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
+    //     dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-2];
+    // } else if (dl->ts_list_size == 1) {
+    //     dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
+    //     // dl->less_latest_timestamp = 0;
+    // } else {
+    //     // dl->latest_timestamp = 0;
+    //     // dl->less_latest_timestamp = 0;
+    // }
+
+    // 若timestamp_list不为空则将记录的最后一个timestamp作为less_latest_timestamp
+    if (dl->ts_list_size) {
+        dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
     } else {
-        // dl->latest_timestamp = 0;
+        // 什么都不干，已初始化为0
         // dl->less_latest_timestamp = 0;
     }
 
@@ -420,9 +432,9 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
                 continue; // 已存在
             }
             
-            // 找到一个新的timestamp，退出循环
+            // 找到一个新的timestamp，更新latest_timestamp退出循环
             if (timestamp) {
-                new_latest_timestamp = timestamp;
+                dl->latest_timestamp = timestamp;
                 break;
             }
         }
@@ -430,17 +442,17 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     regfree(&regex);
     closedir(dir);
     
-    // 更新 latest_timestamp 和 less_latest_timestamp
-    if (new_latest_timestamp > 0) {
-        // 将当前 latest 移动到 less_latest
-        dl->less_latest_timestamp = dl->latest_timestamp;
-        // 更新 latest_timestamp
-        dl->latest_timestamp = new_latest_timestamp;
-    } else {
-        // 未找到新的dirtymap文件，latest_timestamp更新为0
-        dl->less_latest_timestamp = dl->latest_timestamp;
-        dl->latest_timestamp = 0;
-    }
+    // // 更新 latest_timestamp 和 less_latest_timestamp
+    // if (timestamp > 0) {
+    //     // 将当前 latest 移动到 less_latest
+    //     dl->less_latest_timestamp = dl->latest_timestamp;
+    //     // 更新 latest_timestamp
+    //     dl->latest_timestamp = timestamp;
+    // } else {
+    //     // 未找到新的dirtymap文件，latest_timestamp更新为0
+    //     dl->less_latest_timestamp = dl->latest_timestamp;
+    //     dl->latest_timestamp = 0;
+    // }
 
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
