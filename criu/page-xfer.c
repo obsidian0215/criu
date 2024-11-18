@@ -304,12 +304,11 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, stru
 				dhm = search_dirty_map(dl, off);
 				if (dhm) {
 				    pr_info("[Obsidian0215] Found %lx in dirty map\n", off);
-					if (off >= end) {
+					off += PAGE_SIZE;
+					if (off >= end)
 						return 0;
-					} else {
-						off += PAGE_SIZE;
+					else
 						continue;
-					}
 				}
 				pr_err("[Obsidian0215] Missing %lx both in dirtymap and parent pagemap\n", off);
 			}
