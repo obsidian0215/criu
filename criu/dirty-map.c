@@ -30,6 +30,24 @@
 
 #define MAX_FILES 32
 
+// Comparator函数用于qsort
+int compare_dirty_map(const void *a, const void *b) {
+    struct dirty_map *dm_a = (struct dirty_map *)a;
+    struct dirty_map *dm_b = (struct dirty_map *)b;
+    if (dm_a->address < dm_b->address)
+        return -1;
+    else if (dm_a->address > dm_b->address)
+        return 1;
+    else
+        return 0;
+}
+
+// 函数用于排序dirty_map数组
+void sort_dirty_map(struct dirty_map *dm, size_t size) {
+    if (dm && size > 1)
+        qsort(dm, size, sizeof(struct dirty_map), compare_dirty_map);
+}
+
 /**
  * @brief 从timestamp_list.pid文件中读取timestamp_list
  *
@@ -178,7 +196,7 @@ static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_ma
         return 0;
     }
     
-    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%lu.dirtymap", dirty_map_dir, pid, timestamp);
+    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%llu.dirtymap", dirty_map_dir, pid, timestamp);
     
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
@@ -229,8 +247,20 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     size_t max_size, i = 0, j = 0, k = 0;
     struct dirty_diffmap *diffmap, *resized_diffmap;
 
-    // 预估最大可能的diffmap大小
-    max_size = latest_size + less_latest_size;
+    // 两个dirty_map都为空，直接返回空diffmap
+    if ((latest_dm == NULL || latest_size == 0) && (less_latest_dm == NULL || less_latest_size == 0)) {
+        *diffmap_size = 0;
+        return NULL;
+    }
+
+    // 估算diffmap的最大可能大小
+    if (latest_dm && less_latest_dm)
+        max_size = latest_size + less_latest_size;
+    else if (latest_dm)
+        max_size = latest_size;
+    else
+        max_size = less_latest_size;
+
     diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
         pr_perror("[Obsidian0215] Failed to allocate memory for diffmap");
@@ -238,52 +268,73 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
         return NULL;
     }
 
-    while (i < latest_size && j < less_latest_size) {
-        if (latest_dm[i].address < less_latest_dm[j].address) {
-            // 仅在latest_dm中存在
+    if (latest_dm && latest_size > 0 && less_latest_dm && less_latest_size > 0) {
+        while (i < latest_size && j < less_latest_size) {
+            if (latest_dm[i].address < less_latest_dm[j].address) {
+                // 仅在latest_dm中存在
+                diffmap[k].address = latest_dm[i].address;
+                diffmap[k].heat_level = (latest_dm[i].write_count);
+                diffmap[k].heat_trend = (latest_dm[i].write_count);
+                i++;
+            }
+            else if (latest_dm[i].address > less_latest_dm[j].address) {
+                // 仅在less_latest_dm中存在
+                diffmap[k].address = less_latest_dm[j].address;
+                diffmap[k].heat_level = 0;
+                diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+                j++;
+            }
+            else {
+                // 同时存在于两个数组中
+                diffmap[k].address = latest_dm[i].address;
+                diffmap[k].heat_level = (latest_dm[i].write_count);
+                diffmap[k].heat_trend = latest_dm[i].write_count - less_latest_dm[j].write_count;
+                i++;
+                j++;
+            }
+            k++;
+        }
+
+        // 处理剩余的 latest_dm 条目
+        while (i < latest_size) {
             diffmap[k].address = latest_dm[i].address;
             diffmap[k].heat_level = (latest_dm[i].write_count);
             diffmap[k].heat_trend = (latest_dm[i].write_count);
             i++;
+            k++;
         }
-        else if (latest_dm[i].address > less_latest_dm[j].address) {
-            // 仅在less_latest_dm中存在
+
+        // 处理剩余的 less_latest_dm 条目
+        while (j < less_latest_size) {
             diffmap[k].address = less_latest_dm[j].address;
             diffmap[k].heat_level = 0;
             diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
             j++;
+            k++;
         }
-        else {
-            // 同时存在于两个数组中
+    } else if (latest_dm && latest_size > 0) {
+        // 仅latest_dm存在，less_latest_dm为空
+        for (; i < latest_size; i++, k++) {
             diffmap[k].address = latest_dm[i].address;
-            diffmap[k].heat_level = (latest_dm[i].write_count);
-            diffmap[k].heat_trend = latest_dm[i].write_count - less_latest_dm[j].write_count;
-            i++;
-            j++;
+            diffmap[k].heat_level = latest_dm[i].write_count;
+            diffmap[k].heat_trend = latest_dm[i].write_count;
         }
-        k++;
+    } else if (less_latest_dm && less_latest_size > 0) {
+        // 仅less_latest_dm存在，latest_dm为空
+        for (; j < less_latest_size; j++, k++) {
+            diffmap[k].address = less_latest_dm[j].address;
+            diffmap[k].heat_level = 0;
+            diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
     }
 
-    // 处理剩余的 latest_dm 条目
-    while (i < latest_size) {
-        diffmap[k].address = latest_dm[i].address;
-        diffmap[k].heat_level = (latest_dm[i].write_count);
-        diffmap[k].heat_trend = (latest_dm[i].write_count);
-        i++;
-        k++;
-    }
-
-    // 处理剩余的 less_latest_dm 条目
-    while (j < less_latest_size) {
-        diffmap[k].address = less_latest_dm[j].address;
-        diffmap[k].heat_level = 0;
-        diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
-        j++;
-        k++;
-    }
-
-    // 更新实际的 diffmap 大小
+    // 更新实际的diffmap大小
     *diffmap_size = k;
+
+    // 如果没有任何条目，释放分配的内存并返回NULL
+    if (k == 0) {
+        free(diffmap);
+        return NULL;
+    }
 
     // 重新分配内存以节省空间
     resized_diffmap = (struct dirty_diffmap *)realloc(diffmap, k * sizeof(struct dirty_diffmap));
@@ -298,18 +349,35 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
 }
 
 /**
+ * @brief debug输出dirty_map数组
+ *
+ * @param dirtymap dirty_map数组（默认已按地址排序）
+ * @param dirtymap_size dirty_map数组的大小
+ * @param pid dirtymap所属的进程PID
+ * @return void
+ */
+static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size, pid_t pid) {
+    int i;
+    
+    if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
+		return;
+    
+    pr_debug("Diffmap for pid %d:\n", pid);
+	for (i = 0; i < dirtymap_size; i++) {
+		pr_debug("\taddress: %#llx, write count: %d\n", 
+            dirtymap[i].address, dirtymap[i].write_count);
+	}
+}
+
+/**
  * @brief debug输出dirty_diffmap数组
  *
- * @param latest_dm 最新的dirty_map数组（默认已按地址排序）
- * @param ldm_size 最新dirty_map数组的大小
- * @param less_latest_dm 次新的dirty_map数组（默认已按地址排序）
- * @param lldm_size 次新dirty_map数组的大小
- * @param dirty_map_dir dirty_map目录的路径
- * @param dl 指向dirty_log结构体的指针
- * @return struct dirty_diffmap* 生成的diffmap
+ * @param diffmap dirty_diffmap数组（默认已按地址排序）
+ * @param diffmap_size dirty_diffmap数组的大小
+ * @param pid diffmap所属的进程PID
+ * @return void
  */
 static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_size, pid_t pid) {
-    struct dirty_diffmap *dm_entry;
     int i;
     
     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
@@ -317,12 +385,11 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_siz
     
     pr_debug("Diffmap for pid %d:\n", pid);
 	for (i = 0; i < diffmap_size; i++) {
-        dm_entry = diffmap + i;
-		pr_debug("\taddress: %lu, heat level: %d, heat trend: %d\n", 
-            dm_entry->address, dm_entry->heat_level, dm_entry->heat_trend);
+		pr_debug("\taddress: %#llx, heat level: %d, heat trend: %d\n", 
+            diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
 	}
-
 }
+
 /**
  * @brief 为特定 pid 进程初始化其 dirty_map，读取最新和次新的 dirtymap 文件。
  *
@@ -360,38 +427,12 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
     
-    // 通过service传递的是dirty-map-dir-fd（/proc/pid/fd/num）
-    // // 通过 ioctl 获取当前 dirty_map 路径
-    // ret = ioctl(fd, IOCTL_GET_DIRTY_MAP_PATH, current_dirty_map_path);
-    // if (ret < 0) {
-    //     pr_perror("[Obsidian0215]Error getting dirty_map_path for dirty-track\n");
-    //     close(fd);
-    //     return -1;
-    // } else if (strcmp(current_dirty_map_path, dirty_map_dir) != 0) {
-    //     pr_perror("[Obsidian0215]Error: dirty_map_dir %s does not match dirty-track LKM path %s\n", 
-    //             dirty_map_dir, current_dirty_map_path);
-    //     close(fd);
-    //     return -1;
-    // }
-    
     // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
     ret = read_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
     if (ret < 0) {
         pr_perror("[Obsidian0215]Failed to read timestamp_list for pid %d", pid);
         return -1;
     }
-    
-    // // 初始化latest_timestamp和less_latest_timestamp
-    // if (dl->ts_list_size >= 2) {
-    //     dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
-    //     dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-2];
-    // } else if (dl->ts_list_size == 1) {
-    //     dl->latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
-    //     // dl->less_latest_timestamp = 0;
-    // } else {
-    //     // dl->latest_timestamp = 0;
-    //     // dl->less_latest_timestamp = 0;
-    // }
 
     // 若timestamp_list不为空则将记录的最后一个timestamp作为less_latest_timestamp
     if (dl->ts_list_size) {
@@ -474,25 +515,16 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
     regfree(&regex);
     closedir(dir);
-    
-    // // 更新 latest_timestamp 和 less_latest_timestamp
-    // if (timestamp > 0) {
-    //     // 将当前 latest 移动到 less_latest
-    //     dl->less_latest_timestamp = dl->latest_timestamp;
-    //     // 更新 latest_timestamp
-    //     dl->latest_timestamp = timestamp;
-    // } else {
-    //     // 未找到新的dirtymap文件，latest_timestamp更新为0
-    //     dl->less_latest_timestamp = dl->latest_timestamp;
-    //     dl->latest_timestamp = 0;
-    // }
 
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d", 
+        pr_perror("[Obsidian0215]Failed to append latest timestamp %llu to timestamp_list.%d", 
                 dl->latest_timestamp, pid);
         // 追加失败也继续执行
+    } else {
+        pr_info("[Obsidian0215]PID %d: latest timestamp = %llu, less-latest timestamp = %llu\n", 
+                pid, dl->latest_timestamp, dl->less_latest_timestamp);
     }
 
     // 解除映射的timestamp_list
@@ -516,6 +548,12 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         dl->latest_dm = NULL;
         dl->ldm_size = 0;
     }
+
+    if (dl->latest_dm && dl->ldm_size) {
+        // pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
+        debug_show_dirtymap(dl->latest_dm, dl->ldm_size, pid);
+    } else if (!dl->latest_dm || !dl->ldm_size)
+        pr_info("[Obsidian0215]No latest dirtymap for pid %d\n", pid);
     
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
@@ -532,7 +570,16 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         dl->lldm_size = 0;
     }
 
-    // 使用less_latest_dm和latest_dm生成dirty_diffmap
+    if (dl->less_latest_dm && dl->lldm_size) {
+        // pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
+        debug_show_dirtymap(dl->less_latest_dm, dl->lldm_size, pid);
+    } else if (!dl->less_latest_dm || !dl->lldm_size)
+        pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
+
+    // // 生成dirty_diffmap先保证两个dirtymap都按升序排列
+    // 使用升序的less_latest_dm和latest_dm生成dirty_diffmap
+    // sort_dirty_map(latest_dm, latest_size);
+    // sort_dirty_map(less_latest_dm, less_latest_size);
     dl->diffmap = merge_dirty_maps(
         dl->latest_dm, dl->ldm_size,
         dl->less_latest_dm, dl->lldm_size,
@@ -668,9 +715,9 @@ void fini_dirty_map(struct pstree_item *item){
 /**
  * @brief 查找dirty_map中包含指定address的dirty_diffmap结构体
  *
- * @param item 指向per-process结构<pid>的指针
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的diffmap
  * @param addr 要查找的线性地址
- * @return struct dirty_diffmap * 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
+ * @return struct dirty_diffmap* 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
  */
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr) {
     struct dirty_diffmap *map = dl->diffmap;
