@@ -196,7 +196,7 @@ static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_ma
         return 0;
     }
     
-    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%llu.dirtymap", dirty_map_dir, pid, timestamp);
+    snprintf(dm_filepath, sizeof(dm_filepath), "%s/%d-%lu.dirtymap", dirty_map_dir, pid, timestamp);
     
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
@@ -325,13 +325,14 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
             diffmap[k].address = less_latest_dm[j].address;
             diffmap[k].heat_level = 0;
             diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+        }
     }
 
     // 更新实际的diffmap大小
     *diffmap_size = k;
 
     // 如果没有任何条目，释放分配的内存并返回NULL
-    if (k == 0) {
+    if (!k) {
         free(diffmap);
         return NULL;
     }
@@ -364,7 +365,7 @@ static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size
     
     pr_debug("Diffmap for pid %d:\n", pid);
 	for (i = 0; i < dirtymap_size; i++) {
-		pr_debug("\taddress: %#llx, write count: %d\n", 
+		pr_debug("\taddress: %#lx, write count: %d\n", 
             dirtymap[i].address, dirtymap[i].write_count);
 	}
 }
@@ -385,7 +386,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_siz
     
     pr_debug("Diffmap for pid %d:\n", pid);
 	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#llx, heat level: %d, heat trend: %d\n", 
+		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
 	}
 }
@@ -519,11 +520,11 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to append latest timestamp %llu to timestamp_list.%d", 
+        pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d", 
                 dl->latest_timestamp, pid);
         // 追加失败也继续执行
     } else {
-        pr_info("[Obsidian0215]PID %d: latest timestamp = %llu, less-latest timestamp = %llu\n", 
+        pr_info("[Obsidian0215]PID %d: latest timestamp = %lu, less-latest timestamp = %lu\n", 
                 pid, dl->latest_timestamp, dl->less_latest_timestamp);
     }
 
