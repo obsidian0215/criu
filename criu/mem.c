@@ -801,8 +801,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		goto out_xfer;
 	exit_code = 0;
 	
-	//[Obsidian0215]update pid's dirty-map
-	if (mdc->use_dirty_map)
+	//[Obsidian0215]destory pid's dirty-log for non-predump
+	if (mdc->use_dirty_map && !mdc->pre_dump)
 		fini_dirty_map(item);
 
 out_xfer:

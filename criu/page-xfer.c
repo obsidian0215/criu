@@ -298,7 +298,7 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, stru
 
 		ret = p->seek_pagemap(p, off);
 		if (ret <= 0 || !p->pe) {
-			if (!dl) {
+			if (!dl && !opts.use_dirty_map) {
 				pr_err("Missing %lx in parent pagemap\n", off);
 			} else {
 				dhm = search_dirty_map(dl, off);

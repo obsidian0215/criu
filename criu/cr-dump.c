@@ -1900,16 +1900,16 @@ static int cr_pre_dump_finish(int status)
 			ret = page_xfer_dump_pages(&xfer, mem_pp);
 		}
 
-		// [Obsidian0215] destory dirty_log for pre-dump
-		if(opts.use_dirty_map)
-			fini_dirty_map(item);
-
 		xfer.close(&xfer);
 
 		if (ret)
 			goto err;
 
 		timing_stop(TIME_MEMWRITE);
+		
+		// [Obsidian0215] destory dirty_log for pre-dump
+		if(opts.use_dirty_map)
+			fini_dirty_map(item);
 
 		destroy_page_pipe(mem_pp);
 		if (compel_cure_local(ctl))
