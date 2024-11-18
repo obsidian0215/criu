@@ -363,7 +363,7 @@ static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size
     if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
 		return;
     
-    pr_debug("Diffmap for pid %d:\n", pid);
+    pr_debug("Dirtymap for pid %d:(size: %d)\n", pid, dirtymap_size);
 	for (i = 0; i < dirtymap_size; i++) {
 		pr_debug("\taddress: %#lx, write count: %d\n", 
             dirtymap[i].address, dirtymap[i].write_count);
@@ -384,7 +384,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_siz
     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
 		return;
     
-    pr_debug("Diffmap for pid %d:\n", pid);
+    pr_debug("Diffmap for pid %d:(size: %d)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
 		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
