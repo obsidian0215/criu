@@ -397,13 +397,16 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 */
 	if (req->use_dirty_map) {
 		if (req->dirty_map_dir)
-			strncpy(dirty_map_dir_path, req->dirty_map_dir, PATH_MAX - 1);
+			// strncpy(dirty_map_dir_path, req->dirty_map_dir, PATH_MAX - 1);
+			SET_CHAR_OPTS(dirty_map_dir, req->dirty_map_dir);
 		else {
 			pr_err("While --use-dirty-map, no dirty_map_dir was passed by RPC client.\n");
 			goto err;
 		}
 		opts.use_dirty_map = true;
-		opts.dirty_map_dir = dirty_map_dir_path;
+		// opts.dirty_map_dir = dirty_map_dir_path;
+		// SET_CHAR_OPTS(dirty_map_dir, req->dirty_map_dir);
+		pr_info("[Obsidian0215]Use dirty_map in dir %s\n", opts.dirty_map_dir);
 	}
 
 	if (req->parent_img)
