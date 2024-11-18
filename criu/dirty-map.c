@@ -317,7 +317,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_siz
     
     pr_debug("Diffmap for pid %d:\n", pid);
 	for (i = 0; i < diffmap_size; i++) {
-        dm_entry = diffmap[i];
+        dm_entry = diffmap + i;
 		pr_debug("\taddress: %lu, heat level: %d, heat trend: %d\n", 
             dm_entry->address, dm_entry->heat_level, dm_entry->heat_trend);
 	}
