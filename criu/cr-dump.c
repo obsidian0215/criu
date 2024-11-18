@@ -1887,6 +1887,10 @@ static int cr_pre_dump_finish(int status)
 		if (ret < 0)
 			goto err;
 
+		// [Obsidian0215] init dirty_log for pre-dump
+		if(opts.use_dirty_map)
+			xfer.dl = item->dl;
+			
 		mem_pp = dmpi(item)->mem_pp;
 
 		if (opts.pre_dump_mode == PRE_DUMP_READ) {

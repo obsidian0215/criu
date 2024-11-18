@@ -723,13 +723,17 @@ void fini_dirty_map(struct pstree_item *item){
  * @return struct dirty_diffmap* 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
  */
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr) {
-    struct dirty_diffmap *map = dl->diffmap;
-    unsigned long left = 0;
-    unsigned long right = dl->diffmap_size;
+    struct dirty_diffmap *map;
+    unsigned long left = 0, right = 0;
 
     // diffmap为空，直接返回NULL
-    if (!dl || !map || !right) {
+    if (!dl)
         return NULL;
+    else {
+        map = dl->diffmap;
+        right = dl->diffmap_size;
+        if (!map || !right)
+            return NULL;
     }
 
     while (left < right) {
