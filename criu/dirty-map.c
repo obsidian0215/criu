@@ -225,9 +225,9 @@ static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_ma
     
     close(fd);
     *dm = (struct dirty_map *)mapped;
-    *dm_size = st.st_size;
-    printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n", 
-           dm_filepath, *dm_size, *dm);
+    *dm_size = st.st_size / sizeof(struct dirty_map);
+    // printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n", 
+    //        dm_filepath, *dm_size * sizeof(struct dirty_map), *dm);
     return 0;
 }
 
@@ -544,7 +544,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): 0x%p\n", pid, dl->ldm_size, dl->latest_dm);
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): 0x%p\n", 
+                    pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
     } else {
         dl->latest_dm = NULL;
         dl->ldm_size = 0;
@@ -565,7 +566,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): 0x%p\n", pid, dl->lldm_size, dl->less_latest_dm);
+            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): 0x%p\n",
+                     pid, dl->lldm_size * sizeof(struct dirty_map), dl->less_latest_dm);
     } else {
         dl->less_latest_dm = NULL;
         dl->lldm_size = 0;
