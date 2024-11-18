@@ -292,7 +292,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	socklen_t ids_len = sizeof(struct ucred);
 	char images_dir_path[PATH_MAX];
 	char work_dir_path[PATH_MAX];
-	char dirty_map_dir_path[PATH_MAX];
+	// char dirty_map_dir_path[PATH_MAX];
 	char status_fd[PATH_MAX];
 	bool output_changed_by_rpc_conf = false;
 	bool work_changed_by_rpc_conf = false;
