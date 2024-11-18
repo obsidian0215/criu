@@ -574,7 +574,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		bool softdirty = false;
 		u64 next;
 		int st;
-		struct dirty_diffmap *dhm = search_dirty_map(item, vaddr);
+		struct dirty_diffmap *dhm = search_dirty_map(item->dl, vaddr);
 
 		/* If dump_all_pages is true, should_dump_page is called to get pme. */
 		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);

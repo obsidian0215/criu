@@ -276,7 +276,7 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	return 0;
 }
 
-static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, struct ditry_log *dl)
+static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, struct dirty_log *dl)
 {
 	int ret;
 	unsigned long off, end;

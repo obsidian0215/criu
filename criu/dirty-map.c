@@ -672,14 +672,13 @@ void fini_dirty_map(struct pstree_item *item){
  * @param addr 要查找的线性地址
  * @return struct dirty_diffmap * 返回指向dirty_diffmap结构体的指针，如果未找到则返回NULL
  */
-struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr) {
-    struct dirty_log *dl = item->dl;
+struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr) {
     struct dirty_diffmap *map = dl->diffmap;
     unsigned long left = 0;
     unsigned long right = dl->diffmap_size;
 
     // diffmap为空，直接返回NULL
-    if (!map || !right) {
+    if (!dl || !map || !right) {
         return NULL;
     }
 

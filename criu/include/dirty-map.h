@@ -103,6 +103,6 @@ int init_dirty_track(struct dirty_log *dl);
 int start_dirty_track(struct dirty_log* dl);
 int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
 int stop_dirty_track(struct dirty_log* dl);
-struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long addr);
+struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
 
 #endif

@@ -53,7 +53,6 @@ struct page_xfer {
 
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
 struct page_pipe;
-struct dirty_log; // [Obsidian0215] use dirty-map
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int connect_to_page_server_to_send(void);

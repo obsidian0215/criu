@@ -12,7 +12,8 @@
         "restorer.h": "c",
         "pagemap-cache.h": "c",
         "cr_options.h": "c",
-        "page.h": "c"
+        "page.h": "c",
+        "page-pipe.h": "c"
     },
     "makefile.configureOnOpen": false
 }
