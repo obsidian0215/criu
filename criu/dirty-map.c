@@ -234,7 +234,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
         pr_perror("[Obsidian0215] Failed to allocate memory for diffmap");
-        exit(EXIT_FAILURE);
+        // exit(EXIT_FAILURE);
+        return NULL;
     }
 
     while (i < latest_size && j < less_latest_size) {
@@ -289,12 +290,39 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
     if (!resized_diffmap && k > 0) {
         pr_perror("[Obsidian0215]re-alloc diffmap failed");
         free(diffmap);
-        exit(EXIT_FAILURE);
+        // exit(EXIT_FAILURE);
+        return NULL;
     }
 
     return resized_diffmap;
 }
 
+/**
+ * @brief debug输出dirty_diffmap数组
+ *
+ * @param latest_dm 最新的dirty_map数组（默认已按地址排序）
+ * @param ldm_size 最新dirty_map数组的大小
+ * @param less_latest_dm 次新的dirty_map数组（默认已按地址排序）
+ * @param lldm_size 次新dirty_map数组的大小
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param dl 指向dirty_log结构体的指针
+ * @return struct dirty_diffmap* 生成的diffmap
+ */
+static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_size, pid_t pid) {
+    struct dirty_diffmap *dm_entry;
+    int i;
+    
+    if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
+		return;
+    
+    pr_debug("Diffmap for pid %d:\n", pid);
+	for (i = 0; i < diffmap_size; i++) {
+        dm_entry = diffmap[i];
+		pr_debug("\taddress: %lu, heat level: %d, heat trend: %d\n", 
+            dm_entry->address, dm_entry->heat_level, dm_entry->heat_trend);
+	}
+
+}
 /**
  * @brief 为特定 pid 进程初始化其 dirty_map，读取最新和次新的 dirtymap 文件。
  *
@@ -511,6 +539,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         &(dl->diffmap_size)
     );
 
+    debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
     return 0;
 }
 
@@ -649,6 +678,11 @@ struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long a
     unsigned long left = 0;
     unsigned long right = dl->diffmap_size;
 
+    // diffmap为空，直接返回NULL
+    if (!map || !right) {
+        return NULL;
+    }
+
     while (left < right) {
         unsigned long mid = left + (right - left) / 2;
 
@@ -664,6 +698,6 @@ struct dirty_diffmap *search_dirty_map(struct pstree_item *item, unsigned long a
         }
     }
 
-    // 如果未找到包含地址的范围，返回 NULL
+    // 如果未找到包含地址的范围，返回NULL
     return NULL;
 }

@@ -276,10 +276,11 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	return 0;
 }
 
-static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
+static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, struct ditry_log *dl)
 {
 	int ret;
 	unsigned long off, end;
+	struct dirty_diffmap *dhm;
 
 	/*
 	 * Try to find pagemap entry in parent, from which
@@ -297,7 +298,21 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 
 		ret = p->seek_pagemap(p, off);
 		if (ret <= 0 || !p->pe) {
-			pr_err("Missing %lx in parent pagemap\n", off);
+			if (!dl) {
+				pr_err("Missing %lx in parent pagemap\n", off);
+			} else {
+				dhm = search_dirty_map(dl, off);
+				if (dhm) {
+				    pr_info("[Obsidian0215] Found %lx in dirty map\n", off);
+					if (off >= end) {
+						return 0;
+					} else {
+						off += PAGE_SIZE;
+						continue;
+					}
+				}
+				pr_err("[Obsidian0215] Missing %lx both in dirtymap and parent pagemap\n", off);
+			}
 			return -1;
 		}
 
@@ -338,7 +353,7 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 		}
 	} else if (flags & PE_PARENT) {
 		if (xfer->parent != NULL) {
-			ret = check_pagehole_in_parent(xfer->parent, iov);
+			ret = check_pagehole_in_parent(xfer->parent, iov, xfer->dl);
 			if (ret) {
 				pr_err("Hole %p/%zu not found in parent\n", iov->iov_base, iov->iov_len);
 				return -1;

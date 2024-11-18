@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_XFER__H__
 #define __CR_PAGE_XFER__H__
 #include "pagemap.h"
+#include "dirty-map.h"
 
 struct ps_info {
 	int pid;
@@ -45,6 +46,8 @@ struct page_xfer {
 		};
 	};
 
+	// [Obsidian0215] use dirty-map
+	struct dirty_log *dl;
 	struct page_read *parent;
 };
 
