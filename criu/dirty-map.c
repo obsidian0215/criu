@@ -357,18 +357,18 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
  * @param pid dirtymap所属的进程PID
  * @return void
  */
-static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size, pid_t pid) {
-    int i;
+// static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size, pid_t pid) {
+//     int i;
     
-    if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
-		return;
+//     if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
+// 		return;
     
-    pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
-	for (i = 0; i < dirtymap_size; i++) {
-		pr_debug("\taddress: %#lx, write count: %d\n", 
-            dirtymap[i].address, dirtymap[i].write_count);
-	}
-}
+//     pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
+// 	for (i = 0; i < dirtymap_size; i++) {
+// 		pr_debug("\taddress: %#lx, write count: %d\n", 
+//             dirtymap[i].address, dirtymap[i].write_count);
+// 	}
+// }
 
 /**
  * @brief debug输出dirty_diffmap数组
