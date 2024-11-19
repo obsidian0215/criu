@@ -544,18 +544,18 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): 0x%p\n", 
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n", 
                     pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
     } else {
         dl->latest_dm = NULL;
         dl->ldm_size = 0;
     }
 
-    if (dl->latest_dm && dl->ldm_size) {
-        // pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
-        debug_show_dirtymap(dl->latest_dm, dl->ldm_size, pid);
-    } else if (!dl->latest_dm || !dl->ldm_size)
-        pr_info("[Obsidian0215]No latest dirtymap for pid %d\n", pid);
+    // if (dl->latest_dm && dl->ldm_size) {
+    //     // pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
+    //     debug_show_dirtymap(dl->latest_dm, dl->ldm_size, pid);
+    // } else if (!dl->latest_dm || !dl->ldm_size)
+    //     pr_info("[Obsidian0215]No latest dirtymap for pid %d\n", pid);
     
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
@@ -566,18 +566,18 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): 0x%p\n",
+            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): %p\n",
                      pid, dl->lldm_size * sizeof(struct dirty_map), dl->less_latest_dm);
     } else {
         dl->less_latest_dm = NULL;
         dl->lldm_size = 0;
     }
 
-    if (dl->less_latest_dm && dl->lldm_size) {
-        // pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
-        debug_show_dirtymap(dl->less_latest_dm, dl->lldm_size, pid);
-    } else if (!dl->less_latest_dm || !dl->lldm_size)
-        pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
+    // if (dl->less_latest_dm && dl->lldm_size) {
+    //     // pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
+    //     debug_show_dirtymap(dl->less_latest_dm, dl->lldm_size, pid);
+    // } else if (!dl->less_latest_dm || !dl->lldm_size)
+    //     pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
 
     // // 生成dirty_diffmap先保证两个dirtymap都按升序排列
     // 使用升序的less_latest_dm和latest_dm生成dirty_diffmap
