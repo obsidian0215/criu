@@ -508,7 +508,7 @@ again:
 
 // [Obsidian0215]make the decision whether to dump the pages
 static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty) {
-    struct dirty_diffmap *dhm = search_dirty_map(item->dl, vaddr);
+    struct dirty_diffmap *dhm = search_dirty_map(dl, vaddr);
 	
 	if (pre_dump) {
         if (!dhm) {
