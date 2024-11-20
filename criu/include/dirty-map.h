@@ -60,16 +60,17 @@ struct dirty_log {
 
         unsigned long latest_timestamp;
         struct dirty_map *latest_dm;
-	    unsigned long ldm_size;
+	    size_t ldm_size;
 
         unsigned long less_latest_timestamp;
         struct dirty_map *less_latest_dm;
-	    unsigned long lldm_size;
+	    size_t lldm_size;
     };
 
     // candidate list for warm address in pre-dump
     unsigned long *candidate_list;
-    unsigned long candidate_size;
+    size_t candidate_size;
+    size_t candidate_max;
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -87,6 +88,7 @@ struct dirty_log {
     (log).diffmap_size = 0; \
     (log).candidate_list = NULL; \
     (log).candidate_size = 0; \
+    (log).candidate_max = 0; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -104,6 +106,7 @@ struct dirty_log {
     (log_ptr)->diffmap_size = 0; \
     (log_ptr)->candidate_list = NULL; \
     (log_ptr)->candidate_size = 0; \
+    (log_ptr)->candidate_max = 0; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
@@ -114,5 +117,7 @@ int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
 int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
 int search_candidate_list(struct dirty_log *dl, unsigned long addr);
+void insert_candidate_list(struct dirty_log *dl, unsigned long addr);
+void delete_candidate_list(struct dirty_log *dl, unsigned long addr);
 
 #endif

@@ -27,8 +27,10 @@
 #include "protobuf.h"
 
 #define TIMESTAMP_LIST_PREFIX "timestamp_list"
+#define CANDIDATE_LIST_PREFIX "candidate_list"
 
 #define MAX_FILES 32
+#define EXPAND_CANDIDATE_BATCH 128
 
 // Comparator函数用于qsort
 int compare_dirty_map(const void *a, const void *b) {
@@ -57,19 +59,24 @@ void sort_dirty_map(struct dirty_map *dm, size_t size) {
  * @param candidate_size 指针，存储candidate_list的大小
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int load_candidate_list(const char *dirty_map_dir, pid_t pid, unsigned long **candidate_list, size_t *candidate_size) {
-    char timestamp_file_path[PATH_MAX];
+static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
+    char candidate_list_filepath[PATH_MAX];
     void *mmaped = NULL;
-    size_t current_size, current_count, required_size;
+    size_t current_count, required_size;
     int fd;
     struct stat st;
 
-    snprintf(timestamp_file_path, sizeof(timestamp_file_path), "%s/%s.%d", dirty_map_dir, TIMESTAMP_LIST_PREFIX, pid);
-    timestamp_file_path[sizeof(timestamp_file_path) - 1] = '\0';
-    // 打开文件，如果不存在则创建并初始化
-    fd = open(timestamp_file_path, O_RDWR | O_CREAT, 0666);
+    if (!dl) {
+        pr_perror("[Obsidian0215]Invalid dl pointer");
+        return -1;
+    }
+
+    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, pid);
+    candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+    // 打开文件，不存在时创建一个文件
+    fd = open(candidate_list_filepath, O_RDWR | O_CREAT, 0666);
     if (fd == -1) {
-        pr_perror("[Obsidian0215]open %s", timestamp_file_path);
+        pr_perror("[Obsidian0215]open %s", candidate_list_filepath);
         return -1;
     }
     
@@ -80,40 +87,19 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, unsigned lo
         return -1;
     }
     
-    current_size = st.st_size;
-    current_count = current_size / sizeof(unsigned long);
-    
-    // 如果文件大小不是整数倍的 sizeof(int)，修正
-    if (current_size % sizeof(unsigned long) != 0) {
-        pr_perror("[Obsidian0215]Invalid timestamp_list file size");
+    // 如果文件大小不是整数倍的sizeof(unsigned long)，修正
+    if (st.st_size % sizeof(unsigned long) != 0) {
+        pr_perror("[Obsidian0215]Invalid candidate_list file size");
         close(fd);
         return -1;
     }
     
-    // 需要映射的总大小为 current_count + 1 个 int
-    required_size = (current_count + 1) * sizeof(unsigned long);
+    current_count = st.st_size / sizeof(unsigned long);
+    dl->candidate_size = current_count;
     
-    // 如果当前文件大小小于 required_size，则扩展文件
-    if (current_size < required_size) {
-        if (ftruncate(fd, required_size) == -1) {
-            pr_perror("[Obsidian0215]ftruncate");
-            close(fd);
-            return -1;
-        }
-        // // 清零新增加的空间
-        // if (current_size == 0)
-        //     // 文件刚创建，初始化为 0
-        //     memset(&((*timestamp_list)[0]), 0, sizeof(int));
-        // else {
-            // // 其他情况，确保新的 int 空间为 0
-            // int zero = 0;
-            // if (pwrite(fd, &zero, sizeof(int), current_size) != sizeof(int)) {
-            //     perror("pwrite");
-            //     close(fd);
-            //     return -1;
-            // }
-        // }
-    }
+    // 需要映射的总大小为(current_count+EXPAND_CANDIDATE_BATCH)个unsigned long
+    // 增加32是用于减小candidate_list的扩展次数
+    required_size = (current_count + EXPAND_CANDIDATE_BATCH) * sizeof(unsigned long);
     
     // 映射文件到内存
     mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -124,9 +110,58 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, unsigned lo
     }
     close(fd);
     
-    *timestamp_list = (unsigned long *)mmaped;
-    *ts_list_size = current_count;
+    dl->candidate_list = (unsigned long *)mmaped;
+    dl->candidate_max = current_count + EXPAND_CANDIDATE_BATCH;
     
+    return 0;
+}
+
+/**
+ * @brief 将candidate_list更新到对应的文件中
+ *
+ * @param dl 进程dirty-log实例的指针
+ * @return int 成功返回0，失败返回-1并设置errno
+ */
+static int write_candidate_list(struct dirty_log *dl) {
+    char candidate_list_filepath[PATH_MAX];
+    size_t candidate_size;
+    int fd;
+    struct stat st;
+
+    if (!dl) {
+        pr_perror("[Obsidian0215]Invalid dl pointer");
+        return -1;
+    }
+
+    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, pid);
+    candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+    // 打开文件
+    fd = open(candidate_list_filepath, O_RDWR 0666);
+    if (fd == -1) {
+        pr_perror("[Obsidian0215]open %s", candidate_list_filepath);
+        return -1;
+    }
+    // 获取文件大小
+    if (fstat(fd, &st) == -1) {
+        pr_perror("[Obsidian0215]fstat");
+        close(fd);
+        return -1;
+    }
+    candidate_size = dl->candidate_size * sizeof(unsigned long);
+    // 若当前文件大小不足以容纳candidate_list，则扩展文件
+    if (st.st_size < candidate_size) {
+        if (ftruncate(fd, candidate_size) == -1) {
+            pr_perror("[Obsidian0215]ftruncate");
+            close(fd);
+            return -1;
+        }
+    }
+
+    // 同步更改到文件
+    if (msync(dl->candidate_list, candidate_size, MS_SYNC) == -1) {
+        perror("[Obsidian0215]msync");
+        return -1;
+    }
     return 0;
 }
 
@@ -165,14 +200,14 @@ static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned lo
     current_size = st.st_size;
     current_count = current_size / sizeof(unsigned long);
     
-    // 如果文件大小不是整数倍的 sizeof(int)，修正
+    // 如果文件大小不是整数倍的 sizeof(unsigned long)，修正
     if (current_size % sizeof(unsigned long) != 0) {
         pr_perror("[Obsidian0215]Invalid timestamp_list file size");
         close(fd);
         return -1;
     }
     
-    // 需要映射的总大小为 current_count + 1 个 int
+    // 需要映射的总大小为 current_count + 1 个 unsigned long
     required_size = (current_count + 1) * sizeof(unsigned long);
     
     // 如果当前文件大小小于 required_size，则扩展文件
@@ -200,7 +235,7 @@ static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned lo
     // 映射文件到内存
     mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mmaped == MAP_FAILED) {
-        perror("mmap");
+        perror("[Obsidian0215]mmap");
         close(fd);
         return -1;
     }
@@ -215,10 +250,10 @@ static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned lo
 /**
  * @brief 检查指定的时间戳是否存在于timestamp_list中
  *
- * @param timestamp_list 已映射的时间戳列表指针。
- * @param ts_list_size 时间戳列表的大小。
- * @param timestamp 要检查的时间戳。
- * @return int 返回 1 表示存在，0 表示不存在。
+ * @param timestamp_list 已映射的时间戳列表指针
+ * @param ts_list_size 时间戳列表的大小
+ * @param timestamp 要检查的时间戳
+ * @return int 返回1表示存在，0表示不存在
  */
 static int is_timestamp_in_list(unsigned long *timestamp_list, size_t ts_list_size, unsigned long timestamp) {
     // 如果timestamp_list为空直接覆盖ts_list内存的原有值
@@ -234,12 +269,12 @@ static int is_timestamp_in_list(unsigned long *timestamp_list, size_t ts_list_si
 }
 
 /**
- * @brief 将新的时间戳追加到已映射的 timestamp_list 中。
+ * @brief 将新的时间戳追加到已映射的timestamp_list中
  *
- * @param timestamp_list 已映射的时间戳列表指针，包含预留的一个 int 空间。
- * @param ts_list_size 指向当前时间戳数量的指针。
- * @param new_timestamp 要追加的新的时间戳。
- * @return int 成功返回 0，失败返回 -1 并设置 errno。
+ * @param timestamp_list 已映射的时间戳列表指针
+ * @param ts_list_size 指向当前时间戳数量的指针
+ * @param new_timestamp 要追加的新的时间戳
+ * @return int 成功返回 0，失败返回-1并设置errno
  */
 static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_list_size, unsigned long new_timestamp) {
     // 将 new_timestamp 写入预留的空间
@@ -250,7 +285,7 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_li
     
     // 同步更改到文件
     if (msync(timestamp_list, (*ts_list_size) * sizeof(unsigned long), MS_SYNC) == -1) {
-        perror("msync");
+        perror("[Obsidian0215]msync");
         return -1;
     }
     return 0;
@@ -267,7 +302,7 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_li
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
 static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
-                struct dirty_map **dm, unsigned long *dm_size) {
+                struct dirty_map **dm, size_t *dm_size) {
     char dm_filepath[PATH_MAX];
     int fd;
     struct stat st;
@@ -282,25 +317,25 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
     
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
-        pr_perror("Error opening dirtymap file %s", dm_filepath);
+        pr_perror("[Obsidian0215]Error opening dirtymap file %s", dm_filepath);
         return -1;
     }
     
     if (fstat(fd, &st) == -1) {
-        pr_perror("Error getting size of %s", dm_filepath);
+        pr_perror("[Obsidian0215]Error getting size of %s", dm_filepath);
         close(fd);
         return -1;
     }
     
     if (st.st_size == 0) {
-        pr_perror("Dirtymap file %s is empty", dm_filepath);
+        pr_perror("[Obsidian0215]Dirtymap file %s is empty", dm_filepath);
         close(fd);
         return -1;
     }
     
     mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
-        pr_perror("Error mapping dirtymap file %s", dm_filepath);
+        pr_perror("[Obsidian0215]Error mapping dirtymap file %s", dm_filepath);
         close(fd);
         return -1;
     }
@@ -345,7 +380,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
 
     diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
-        pr_perror("[Obsidian0215] Failed to allocate memory for diffmap");
+        pr_perror("[Obsidian0215]Failed to allocate memory for diffmap");
         // exit(EXIT_FAILURE);
         return NULL;
     }
@@ -791,6 +826,14 @@ void fini_dirty_map(struct pstree_item *item){
             dl->diffmap_size = 0;
         }
         
+        // 处理candidate_list
+        if (dl->candidate_list) {
+            write_candidate_list(dl);
+            free(dl->candidate_list);
+            dl->candidate_list = NULL;
+            dl->candidate_size = 0;
+            dl->candidate_max = 0;
+        }
         // 释放dl结构体
         free(dl);
         item->dl = NULL;
@@ -837,6 +880,13 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
     return NULL;
 }
 
+/**
+ * @brief 查找candidate_list中包含指定address
+ *
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param addr 要查找的线性地址
+ * @return int 找到则返回1，如果未找到则返回0
+ */
 int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
     unsigned long *cd_list, left = 0, right = 0;
 
@@ -867,5 +917,84 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
 
     // 未找到该地址
     return 0;
+}
 
+/**
+ * @brief 将指定address插入candidate_list中，并保持candidate_list升序
+ *
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param addr 要插入的线性地址
+ * @return void
+ */
+void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
+    size_t mid, left = 0, right, new_max, new_size;
+    if (!dl || !dl->candidate_list)
+        return;
+
+    right = dl->candidate_size;
+    // 二分查找插入位置
+    while (left < right) {
+        mid = left + (right - left) / 2;
+        if (dl->candidate_list[mid] < addr)
+            left = mid + 1;
+        else
+            right = mid;
+    }
+
+    // 检查地址是否已存在, 如果存在则无需插入
+    if (left < dl->candidate_size && dl->candidate_list[left] == addr)
+        return;
+
+    // 检查是否需要扩展
+    if (dl->candidate_size >= dl->candidate_max) {
+        new_max = dl->candidate_max + EXPAND_CANDIDATE_BATCH;
+        new_size = new_max * sizeof(unsigned long);
+
+        // 重新映射文件
+        void *new_map = mremap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long), new_size, MREMAP_MAYMOVE);
+        if (new_map == MAP_FAILED) {
+            perror("[Obsidian0215]mremap");
+            return;
+        }
+
+        dl->candidate_list = (unsigned long *)new_map;
+        dl->candidate_max = new_max;
+    }
+
+    // 移动元素以腾出插入位置
+    memmove(&dl->candidate_list[left + 1], &dl->candidate_list[left], (dl->candidate_size - left) * sizeof(unsigned long));
+    dl->candidate_list[left] = addr;
+    dl->candidate_size++;
+}
+
+/**
+ * @brief 将指定address从candidate_list中删除，并保持candidate_list升序
+ *
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param addr 要删除的线性地址
+ * @return void
+ */
+void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
+    size_t mid, left = 0, right;
+    if (!dl || !dl->candidate_list)
+        return;
+
+    right = dl->candidate_size;
+
+    // 二分查找目标地址
+    while (left < right) {
+        mid = left + (right - left) / 2;
+        if (dl->candidate_list[mid] < addr)
+            left = mid + 1;
+        else
+            right = mid;
+    }
+
+    // 检查是否找到地址
+    if (left >= dl->candidate_size || dl->candidate_list[left] != addr)
+        return;
+
+    // 移动元素以覆盖删除的位置
+    memmove(&dl->candidate_list[left], &dl->candidate_list[left + 1], (dl->candidate_size - left - 1) * sizeof(unsigned long));
+    dl->candidate_size--;
 }

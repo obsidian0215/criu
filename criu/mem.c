@@ -506,9 +506,11 @@ again:
 	return ret;
 }
 
-//[Obsidian0215]make the decision whether to dump the pages
-static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struct dirty_diffmap *dhm, bool softdirty) {
-    if (pre_dump) {
+// [Obsidian0215]make the decision whether to dump the pages
+static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty) {
+    struct dirty_diffmap *dhm = search_dirty_map(item->dl, vaddr);
+	
+	if (pre_dump) {
         if (!dhm) {
             // 未在dirty_map中找到，根据是否有父镜像决定
             if (!has_parent) {
@@ -527,13 +529,23 @@ static inline bool choose_page_by_dirtymap(bool pre_dump, bool has_parent, struc
             if (dhm->heat_level == 0) {
 				// 完全冷页（一般只会从第二次predump出现），选择从脏页变化下来的
 				if (dhm->heat_trend < 0) {
+					// 判断是否在候选列表中，若在则删除该地址
+					if (search_candidate_list(dl, vaddr)) {
+						pr_info("[Obsidian0215]delete 0x%lx in candidate list\n", vaddr);
+						delete_candidate_list(dl, vaddr);
+					}
                 	return true;
 				} else	// 一般情况下不会走该分支
 					return false;
             } else if (dhm->heat_level <= 4) {
 				// 温页，选择热度下降较快的（超过50%）
+				// 不直接选择传输，而是加入候选列表，由下次热度变化决定
                 if (dhm->heat_trend < -dhm->heat_level) {
-                    return true;
+					if (!search_candidate_list(dl, vaddr)) {
+						pr_info("[Obsidian0215]add 0x%lx to candidate list\n", vaddr);
+					    insert_candidate_list(dl, vaddr);
+					}
+                    return false;
                 } else
                 	return false;
             } else {
@@ -574,7 +586,6 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		bool softdirty = false;
 		u64 next;
 		int st;
-		struct dirty_diffmap *dhm = search_dirty_map(item->dl, vaddr);
 
 		/* If dump_all_pages is true, should_dump_page is called to get pme. */
 		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
@@ -592,7 +603,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		 * hole and expect the parent images to contain this
 		 * page. The latter would be checked in page-xfer.
 		 */
-		if (!choose_page_by_dirtymap(pre_dump, has_parent, dhm, softdirty)) {
+		if (!choose_page_by_dirtymap(item->dl, vaddr, pre_dump, has_parent, softdirty)) {
 			// ret = page_pipe_add_hole(pp, vaddr, pre_dump? PP_HOLE_SKIP: PP_HOLE_PARENT);
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
