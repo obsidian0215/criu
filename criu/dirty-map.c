@@ -122,7 +122,7 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
  * @param dl 进程dirty-log实例的指针
  * @return int 成功返回0，失败返回-1并设置errno
  */
-static int write_candidate_list(struct dirty_log *dl) {
+static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir) {
     char candidate_list_filepath[PATH_MAX];
     size_t candidate_size;
     int fd;
@@ -132,11 +132,10 @@ static int write_candidate_list(struct dirty_log *dl) {
         pr_perror("[Obsidian0215]Invalid dl pointer");
         return -1;
     }
-
-    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, pid);
+    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
     candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
     // 打开文件
-    fd = open(candidate_list_filepath, O_RDWR 0666);
+    fd = open(candidate_list_filepath, O_RDWR, 0666);
     if (fd == -1) {
         pr_perror("[Obsidian0215]open %s", candidate_list_filepath);
         return -1;
@@ -544,11 +543,18 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         pr_perror("[Obsidian0215]Failed to open dirty_track device %s", DT_DEV_PATH);
         return -1;
     }
+
+    // 读取candidate_list.<pid>文件，初始化candidate_list
+    ret = load_candidate_list(dirty_map_dir, pid, dl);
+    if (ret < 0) {
+        pr_perror("[Obsidian0215]Failed to load candidate_list for pid %d", pid);
+        return -1;
+    }
     
-    // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
+    // 读取timestamp_list.<pid>文件，初始化timestamp_list
     ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to read timestamp_list for pid %d", pid);
+        pr_perror("[Obsidian0215]Failed to load timestamp_list for pid %d", pid);
         return -1;
     }
 
@@ -828,7 +834,7 @@ void fini_dirty_map(struct pstree_item *item){
         
         // 处理candidate_list
         if (dl->candidate_list) {
-            write_candidate_list(dl);
+            write_candidate_list(dl, opts.dirty_map_dir);
             free(dl->candidate_list);
             dl->candidate_list = NULL;
             dl->candidate_size = 0;
@@ -928,6 +934,8 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
  */
 void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
     size_t mid, left = 0, right, new_max, new_size;
+    void *new_map;
+
     if (!dl || !dl->candidate_list)
         return;
 
@@ -951,7 +959,7 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
         new_size = new_max * sizeof(unsigned long);
 
         // 重新映射文件
-        void *new_map = mremap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long), new_size, MREMAP_MAYMOVE);
+        new_map = mremap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long), new_size, MREMAP_MAYMOVE);
         if (new_map == MAP_FAILED) {
             perror("[Obsidian0215]mremap");
             return;
@@ -976,6 +984,7 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
  */
 void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
     size_t mid, left = 0, right;
+    
     if (!dl || !dl->candidate_list)
         return;
 
