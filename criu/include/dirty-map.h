@@ -53,6 +53,7 @@ struct dirty_log {
     struct dirty_diffmap *diffmap;
     unsigned long diffmap_size;
 
+    // dirty-map and corresponding timestamp(file)
     struct {
         unsigned long *timestamp_list;
         size_t ts_list_size;
@@ -65,6 +66,10 @@ struct dirty_log {
         struct dirty_map *less_latest_dm;
 	    unsigned long lldm_size;
     };
+
+    // candidate list for warm address in pre-dump
+    unsigned long *candidate_list;
+    unsigned long candidate_size;
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -80,6 +85,8 @@ struct dirty_log {
     (log).lldm_size = 0; \
     (log).diffmap = NULL; \
     (log).diffmap_size = 0; \
+    (log).candidate_list = NULL; \
+    (log).candidate_size = 0; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -95,6 +102,8 @@ struct dirty_log {
     (log_ptr)->lldm_size = 0; \
     (log_ptr)->diffmap = NULL; \
     (log_ptr)->diffmap_size = 0; \
+    (log_ptr)->candidate_list = NULL; \
+    (log_ptr)->candidate_size = 0; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);

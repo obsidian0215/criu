@@ -49,6 +49,88 @@ void sort_dirty_map(struct dirty_map *dm, size_t size) {
 }
 
 /**
+ * @brief 从candidate.pid文件中读取candidate_list
+ *
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param pid 进程pid
+ * @param candidate_list 指向存储candidate_list的指针
+ * @param candidate_size 指针，存储candidate_list的大小
+ * @return int 成功返回0，失败返回-1并设置errno。
+ */
+static int load_candidate_list(const char *dirty_map_dir, pid_t pid, unsigned long **candidate_list, size_t *candidate_size) {
+    char timestamp_file_path[PATH_MAX];
+    void *mmaped = NULL;
+    size_t current_size, current_count, required_size;
+    int fd;
+    struct stat st;
+
+    snprintf(timestamp_file_path, sizeof(timestamp_file_path), "%s/%s.%d", dirty_map_dir, TIMESTAMP_LIST_PREFIX, pid);
+    timestamp_file_path[sizeof(timestamp_file_path) - 1] = '\0';
+    // 打开文件，如果不存在则创建并初始化
+    fd = open(timestamp_file_path, O_RDWR | O_CREAT, 0666);
+    if (fd == -1) {
+        pr_perror("[Obsidian0215]open %s", timestamp_file_path);
+        return -1;
+    }
+    
+    // 获取文件大小
+    if (fstat(fd, &st) == -1) {
+        pr_perror("[Obsidian0215]fstat");
+        close(fd);
+        return -1;
+    }
+    
+    current_size = st.st_size;
+    current_count = current_size / sizeof(unsigned long);
+    
+    // 如果文件大小不是整数倍的 sizeof(int)，修正
+    if (current_size % sizeof(unsigned long) != 0) {
+        pr_perror("[Obsidian0215]Invalid timestamp_list file size");
+        close(fd);
+        return -1;
+    }
+    
+    // 需要映射的总大小为 current_count + 1 个 int
+    required_size = (current_count + 1) * sizeof(unsigned long);
+    
+    // 如果当前文件大小小于 required_size，则扩展文件
+    if (current_size < required_size) {
+        if (ftruncate(fd, required_size) == -1) {
+            pr_perror("[Obsidian0215]ftruncate");
+            close(fd);
+            return -1;
+        }
+        // // 清零新增加的空间
+        // if (current_size == 0)
+        //     // 文件刚创建，初始化为 0
+        //     memset(&((*timestamp_list)[0]), 0, sizeof(int));
+        // else {
+            // // 其他情况，确保新的 int 空间为 0
+            // int zero = 0;
+            // if (pwrite(fd, &zero, sizeof(int), current_size) != sizeof(int)) {
+            //     perror("pwrite");
+            //     close(fd);
+            //     return -1;
+            // }
+        // }
+    }
+    
+    // 映射文件到内存
+    mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mmaped == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    
+    *timestamp_list = (unsigned long *)mmaped;
+    *ts_list_size = current_count;
+    
+    return 0;
+}
+
+/**
  * @brief 从timestamp_list.pid文件中读取timestamp_list
  *
  * @param dirty_map_dir dirty_map目录的路径
@@ -57,7 +139,7 @@ void sort_dirty_map(struct dirty_map *dm, size_t size) {
  * @param ts_list_size 指针，存储timestamp_list的大小
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int read_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, size_t *ts_list_size) {
+static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, size_t *ts_list_size) {
     char timestamp_file_path[PATH_MAX];
     void *mmaped = NULL;
     size_t current_size, current_count, required_size;
@@ -184,7 +266,7 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_li
  * @param dm_size 指向将存储映射大小的指针
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
-static int map_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
+static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
                 struct dirty_map **dm, unsigned long *dm_size) {
     char dm_filepath[PATH_MAX];
     int fd;
@@ -429,7 +511,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
     
     // 读取timestamp_list.<pid> 文件，初始化timestamp_list和ts_list_size
-    ret = read_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
+    ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
     if (ret < 0) {
         pr_perror("[Obsidian0215]Failed to read timestamp_list for pid %d", pid);
         return -1;
@@ -537,7 +619,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     
     // 映射latest_dm
     if (dl->latest_timestamp) {
-        ret = map_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
+        ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
                           &dl->latest_dm, &dl->ldm_size);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
@@ -559,7 +641,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
-        ret = map_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir, 
+        ret = load_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir, 
                           &dl->less_latest_dm, &dl->lldm_size);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map less latest dirtymap for pid %d", pid);
@@ -579,7 +661,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // } else if (!dl->less_latest_dm || !dl->lldm_size)
     //     pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
 
-    // // 生成dirty_diffmap先保证两个dirtymap都按升序排列
+    // 生成dirty_diffmap先保证两个dirtymap都按升序排列
     // 使用升序的less_latest_dm和latest_dm生成dirty_diffmap
     // sort_dirty_map(latest_dm, latest_size);
     // sort_dirty_map(less_latest_dm, less_latest_size);
@@ -753,4 +835,37 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 
     // 如果未找到包含地址的范围，返回NULL
     return NULL;
+}
+
+int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
+    unsigned long *cd_list, left = 0, right = 0;
+
+    // candidate_list为空，无法找到该地址
+    if (!dl)
+        return 0;
+    else {
+        cd_list = dl->candidate_list;
+        right = dl->candidate_size;
+        if (!map || !right)
+            return 0;
+    }
+
+    while (left < right) {
+        unsigned long mid = left + (right - left) / 2;
+
+        if (addr < cd_list[mid]) {
+            // 地址在当前范围左侧，缩小右边界
+            right = mid;
+        } else if (addr > cd_list[mid]) {
+            // 地址在当前范围右侧，缩小左边界
+            left = mid + 1;
+        } else {
+            // 找到该地址
+            return 1;
+        }
+    }
+
+    // 未找到该地址
+    return 0;
+
 }
