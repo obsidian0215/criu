@@ -969,10 +969,17 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
         dl->candidate_max = new_max;
     }
 
-    // 移动元素以腾出插入位置
-    memmove(&dl->candidate_list[left + 1], &dl->candidate_list[left], (dl->candidate_size - left) * sizeof(unsigned long));
-    dl->candidate_list[left] = addr;
-    dl->candidate_size++;
+    // 如果插入位置是末尾，直接赋值无需移动
+    if (left == dl->candidate_size) {
+        dl->candidate_list[left] = addr;
+        dl->candidate_size++;
+    } else {
+        // 移动元素以腾出插入位置
+        memmove(&dl->candidate_list[left + 1], &dl->candidate_list[left],
+                (dl->candidate_size - left) * sizeof(unsigned long));
+        dl->candidate_list[left] = addr;
+        dl->candidate_size++;
+    }
 }
 
 /**
@@ -1003,7 +1010,13 @@ void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
     if (left >= dl->candidate_size || dl->candidate_list[left] != addr)
         return;
 
-    // 移动元素以覆盖删除的位置
-    memmove(&dl->candidate_list[left], &dl->candidate_list[left + 1], (dl->candidate_size - left - 1) * sizeof(unsigned long));
-    dl->candidate_size--;
+    // 删除的是最后一个元素，直接减少大小
+    if (left == dl->candidate_size - 1) {
+        dl->candidate_size--;
+    } else {
+        // 移动元素以覆盖删除的位置
+        memmove(&dl->candidate_list[left], &dl->candidate_list[left + 1],
+                (dl->candidate_size - left - 1) * sizeof(unsigned long));
+        dl->candidate_size--;
+    }
 }
