@@ -902,7 +902,7 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
     else {
         cd_list = dl->candidate_list;
         right = dl->candidate_size;
-        if (!map || !right)
+        if (!cd_list || !right)
             return 0;
     }
 
@@ -984,7 +984,7 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
  */
 void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
     size_t mid, left = 0, right;
-    
+
     if (!dl || !dl->candidate_list)
         return;
 
