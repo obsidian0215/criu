@@ -161,6 +161,12 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
         perror("[Obsidian0215]msync");
         return -1;
     }
+
+    // 解除映射
+    if (munmap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long)) == -1) {
+        pr_perror("[Obsidian0215]Error unmapping candidate_list");
+        return -1;
+    }
     return 0;
 }
 
@@ -819,7 +825,7 @@ void fini_dirty_map(struct pstree_item *item){
         // 处理次新的dirtymap
         if (dl->less_latest_dm) {
             if (munmap(dl->less_latest_dm, dl->lldm_size) == -1) {
-                pr_perror("[Obsidian0215]Error unmapping second latest dirtymap");
+                pr_perror("[Obsidian0215]Error unmapping second-latest dirtymap");
             }
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
@@ -834,8 +840,9 @@ void fini_dirty_map(struct pstree_item *item){
         
         // 处理candidate_list
         if (dl->candidate_list) {
-            write_candidate_list(dl, opts.dirty_map_dir);
-            free(dl->candidate_list);
+            if (write_candidate_list(dl, opts.dirty_map_dir)) {
+                pr_perror("[Obsidian0215]Error updating candidate_list to file");
+            }
             dl->candidate_list = NULL;
             dl->candidate_size = 0;
             dl->candidate_max = 0;
