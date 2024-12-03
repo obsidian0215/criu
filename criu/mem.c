@@ -215,7 +215,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent)
+			 bool has_parent, bool pre_dump)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -239,7 +239,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			continue;
 		}
 
-		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr) && !pre_dump)
 			ppb_flags |= PPB_LAZY;
 
 		/*
@@ -490,7 +490,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -594,7 +594,8 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 			continue;
 		}
 
-		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+		/* Make criu restorer to use the parent image for this page. */
+		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr) && !pre_dump)
 			ppb_flags |= PPB_LAZY;
 
 		/*
