@@ -940,8 +940,10 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
  * @return void
  */
 void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
+    char candidate_list_filepath[PATH_MAX];
     size_t mid, left = 0, right, new_max, new_size;
     void *new_map;
+    int fd;
 
     if (!dl || !dl->candidate_list)
         return;
@@ -964,6 +966,21 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
     if (dl->candidate_size >= dl->candidate_max) {
         new_max = dl->candidate_max + EXPAND_CANDIDATE_BATCH;
         new_size = new_max * sizeof(unsigned long);
+
+        snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", opts.dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
+        candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+         // 扩展文件大小以匹配新的映射范围
+        fd = open(candidate_list_filepath, O_RDWR);
+        if (fd == -1) {
+            perror("[Obsidian0215]Error opening candidate list file");
+            return;
+        }
+        if (ftruncate(fd, new_size) == -1) {
+            perror("[Obsidian0215]ftruncate");
+            close(fd);
+            return;
+        }
+        close(fd);
 
         // 重新映射文件
         new_map = mremap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long), new_size, MREMAP_MAYMOVE);
