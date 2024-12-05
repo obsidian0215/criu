@@ -604,17 +604,33 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		 * hole and expect the parent images to contain this
 		 * page. The latter would be checked in page-xfer.
 		 */
-		if (!choose_page_by_dirtymap(item->dl, vaddr, pre_dump, has_parent, softdirty)) {
-			// ret = page_pipe_add_hole(pp, vaddr, pre_dump? PP_HOLE_SKIP: PP_HOLE_PARENT);
-			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-			st = 0;
+		// [Obsidian0215] for pages in writable vma, check dirty-map to decide whether to dump
+		if ((vma->e->prot & PROT_WRITE) || !(vma->e->status & VMA_NO_PROT_WRITE)) {
+			if (!choose_page_by_dirtymap(item->dl, vaddr, pre_dump, has_parent, softdirty)) {
+				// ret = page_pipe_add_hole(pp, vaddr, pre_dump? PP_HOLE_SKIP: PP_HOLE_PARENT);
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+				st = 0;
+			} else {
+				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+					st = 1;
+				else
+					st = 2;
+			}
 		} else {
-			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-				st = 1;
-			else
-				st = 2;
+		    // [Obsidian0215] for pages in non-writable vma, check soft-dirty bit and parent images
+			if (has_parent && page_in_parent(softdirty)) {
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+				st = 0;
+			} else {
+				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+					st = 1;
+				else
+					st = 2;
+			}
 		}
+
 
 		if (ret) {
 			/* Do not do pfn++, just bail out */
