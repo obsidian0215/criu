@@ -698,7 +698,7 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 	vaddr = vma->e->start;
 
 again:
-	BUG_ON(!has_parent && item->dl->diffmap);
+	BUG_ON(!has_parent && item->dl->diffmap && !pre_dump);
 	// [Obsidian0215]若没有父镜像，则无法使用dirty-map，退化为标准pre-copy
 	if (!xfer->parent && !pre_dump)
 		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
