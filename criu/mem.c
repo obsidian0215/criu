@@ -517,7 +517,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 				// 没有父镜像，选择没有变脏的冷页
 				if (!page_in_parent(softdirty))
                 	return true;
-				else	// 一般情况下不会走该分支
+				else	// 若之前没有被track，可以跳过
                 	return false;
             } else {
 				// (现在脏页追踪到进程冻结才结束，一般dirtymap不会遗漏脏页)
@@ -561,9 +561,15 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 			// 未被dirty-map记录但soft-dirty置位(发生过修改)——最后一次需要传输
 			// (目前这种情况应该不太可能触发，dirty-map能覆盖进程运行的所有脏页)
             return true;
-        } else
+        } else if (!dhm && !has_parent) {
+			// 未被dirty-map记录, 且无父镜像——需要传输
+			// 进程在dump前创建且未被track会产生这种情况
+			return true;
+		} else {
 			// 未被dirty-map记录且soft-dirty未置位(冷页)
+			// 若能找到父镜像，则可以跳过
 			return false;
+		}
     }
 }
 
@@ -631,7 +637,6 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 			}
 		}
 
-
 		if (ret) {
 			/* Do not do pfn++, just bail out */
 			pr_debug("Pagemap full\n");
@@ -651,6 +656,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 	return ret;
 }
 
+// [Obsidian0215] 使用dirty_map的generate_vma_iovs
 static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
@@ -692,7 +698,12 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 	vaddr = vma->e->start;
 
 again:
-	ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
+	BUG_ON(!has_parent && item->dl->diffmap);
+	// [Obsidian0215]若没有父镜像，则无法使用dirty-map，退化为标准pre-copy
+	if (!xfer->parent && !pre_dump)
+		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
+	else
+		ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
