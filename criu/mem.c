@@ -698,8 +698,8 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 	vaddr = vma->e->start;
 
 again:
-	// BUG_ON(!has_parent && item->dl->diffmap && !pre_dump);
-	// [Obsidian0215]若没有父镜像，则无法使用dirty-map，退化为标准pre-copy
+	// [Obsidian0215]若dump时没有父镜像，则无法使用dirty-map，退化为标准pre-copy
+	// 该情况会发生在：1. 上次pre-dump到dump之前才创建的进程；2. 共享内存(pre-dump不会转储)
 	if (!has_parent && !pre_dump)
 		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
 	else
