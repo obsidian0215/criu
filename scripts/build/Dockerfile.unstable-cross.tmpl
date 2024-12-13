@@ -4,6 +4,17 @@ COPY scripts/ci/apt-install /bin/apt-install
 RUN echo "deb http://deb.debian.org/debian/ unstable main" >> /etc/apt/sources.list && \
   dpkg --add-architecture ${DEBIAN_ARCH}
 
+# 配置 APT Pinning
+RUN bash -c 'cat <<EOF > /etc/apt/preferences.d/99-cross-compile
+Package: *
+Pin: release a=stable
+Pin-Priority: 900
+
+Package: crossbuild-essential-${DEBIAN_ARCH} libc6-dev-${DEBIAN_ARCH}-cross libc6-${DEBIAN_ARCH}-cross libbz2-dev:${DEBIAN_ARCH} libexpat1-dev:${DEBIAN_ARCH} ncurses-dev:${DEBIAN_ARCH} libssl-dev:${DEBIAN_ARCH} libnl-3-dev:${DEBIAN_ARCH} libprotobuf-dev:${DEBIAN_ARCH} libnet-dev:${DEBIAN_ARCH} libprotobuf-c-dev:${DEBIAN_ARCH} libcap-dev:${DEBIAN_ARCH} libaio-dev:${DEBIAN_ARCH} libnl-route-3-dev:${DEBIAN_ARCH} libgcc-s1:${DEBIAN_ARCH} libstdc++6:${DEBIAN_ARCH}
+Pin: release a=unstable
+Pin-Priority: 990
+EOF'
+
 # Update package lists
 RUN apt-get update
 

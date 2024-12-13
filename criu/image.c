@@ -619,7 +619,7 @@ int test_dirty_map_dir(char *dir)
 		pr_perror("Can't open dir %s", dir);
 		ret = -1;
 	} else
-		pr_info("dirty-map will be loaded from <%s>", opts.dirty_map_dir);
+		pr_info("dirty-map will be loaded from <%s>\n", opts.dirty_map_dir);
 
 	// ret = install_service_fd(DIRTY_MAP_OFF, fd);
 	// if (ret < 0) {
