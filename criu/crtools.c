@@ -193,7 +193,7 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (opts.work_dir == NULL)
 		SET_CHAR_OPTS(work_dir, opts.imgs_dir);
-	
+
 	if (opts.dirty_map_dir == NULL)
 		SET_CHAR_OPTS(dirty_map_dir, "./dirty_map");
 

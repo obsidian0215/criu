@@ -509,7 +509,7 @@ again:
 // [Obsidian0215]make the decision whether to dump the pages
 static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty) {
     struct dirty_diffmap *dhm = search_dirty_map(dl, vaddr);
-	
+
 	if (pre_dump) {
         if (!dhm) {
             // 未在dirty_map中找到，根据是否有父镜像决定
@@ -575,8 +575,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 
 //[Obsidian0215]put pages into page-pipe with dirty-map
 static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, bool pre_dump)
-{
+			 bool has_parent, bool pre_dump) {
 	int ret = 0;
 	// struct dirty_log *dl = &item->dirty_log;
 	unsigned long nr_scanned;
@@ -839,7 +838,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;
-	
+
 	//[Obsidian0215]destroy pid's dirty-log for non-predump
 	if (mdc->use_dirty_map && !mdc->pre_dump)
 		fini_dirty_map(item);

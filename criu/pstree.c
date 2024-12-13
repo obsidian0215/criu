@@ -214,7 +214,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 		vm_area_list_init(&rsti(item)->vmas);
 		INIT_LIST_HEAD(&rsti(item)->vma_io);
 		item->pid = (void *)item + sizeof(*item) + sizeof(struct rst_info);
-		
+
 		// [Obsidian0215] init dirty-log
 		item->dl = NULL;
 	}
