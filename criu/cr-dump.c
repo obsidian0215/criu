@@ -1908,7 +1908,7 @@ static int cr_pre_dump_finish(int status)
 
 		timing_stop(TIME_MEMWRITE);
 		
-		// [Obsidian0215] destory dirty_log for pre-dump
+		// [Obsidian0215] destroy dirty_log for pre-dump
 		if(opts.use_dirty_map)
 			fini_dirty_map(item);
 

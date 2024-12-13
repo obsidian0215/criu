@@ -61,7 +61,7 @@ void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
  */
 static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
     char candidate_list_filepath[PATH_MAX];
-    void *mmaped = NULL;
+    void *mapped = NULL;
     unsigned long current_count, required_size;
     int fd;
     struct stat st;
@@ -102,15 +102,15 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
     required_size = (current_count + EXPAND_CANDIDATE_BATCH) * sizeof(unsigned long);
     
     // 映射文件到内存
-    mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mmaped == MAP_FAILED) {
+    mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
         perror("mmap");
         close(fd);
         return -1;
     }
     close(fd);
     
-    dl->candidate_list = (unsigned long *)mmaped;
+    dl->candidate_list = (unsigned long *)mapped;
     dl->candidate_max = current_count + EXPAND_CANDIDATE_BATCH;
     
     return 0;
@@ -181,7 +181,7 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
  */
 static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, unsigned long *ts_list_size) {
     char timestamp_file_path[PATH_MAX];
-    void *mmaped = NULL;
+    void *mapped = NULL;
     unsigned long current_size, current_count, required_size;
     int fd;
     struct stat st;
@@ -238,15 +238,15 @@ static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned lo
     }
     
     // 映射文件到内存
-    mmaped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mmaped == MAP_FAILED) {
+    mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
         perror("[Obsidian0215]mmap");
         close(fd);
         return -1;
     }
     close(fd);
     
-    *timestamp_list = (unsigned long *)mmaped;
+    *timestamp_list = (unsigned long *)mapped;
     *ts_list_size = current_count;
     
     return 0;
@@ -577,7 +577,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     if (!ret && pc.is_tracked) {
         ret = ioctl(dl->dirty_track_fd, IOCTL_STOP_PID, &pid);
         if (ret < 0) {
-            pr_perror("[Obsidian0215]Error stoping dirty-track for pid %d", pid);
+            pr_perror("[Obsidian0215]Error stopping dirty-track for pid %d", pid);
             close(dl->dirty_track_fd);
             return -1;
         }
