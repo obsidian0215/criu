@@ -608,7 +608,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type != DT_REG)
             continue;
-        
+
         ret = regexec(&regex, entry->d_name, 2, matches, 0);
         if (ret == 0) {
             // 提取 timestamp
@@ -619,7 +619,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             }
             strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
             timestamp_str[len] = '\0';
-            
+
             timestamp = strtoul(timestamp_str, &endptr, 10);
             if (*endptr != '\0') { // 确保整个字符串都被转换
                 pr_perror("[Obsidian0215]Non-numeric characters in timestamp: %s", timestamp_str);
@@ -629,13 +629,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
                 pr_perror("[Obsidian0215]Invalid timestamp value: %s", timestamp_str);
                 continue;
             }
-            
+
             // 检查 timestamp 是否已在 timestamp_list 中
             in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, timestamp);
             if (in_list == 1) {
                 continue; // 已存在
             }
-            
+
             // 找到一个新的timestamp，更新latest_timestamp退出循环
             if (timestamp) {
                 dl->latest_timestamp = timestamp;
@@ -786,7 +786,7 @@ int check_dirty_track(struct dirty_log *dl, struct pid_check *pc) {
  */
 int stop_dirty_track(struct dirty_log *dl) {
     int ret = 0, fd = dl->dirty_track_fd;
-    
+
     if (fd == -1 && ((fd = open(DT_DEV_PATH, O_RDWR)) == -1)) {
         pr_perror("[Obsidian0215]Error opening dirty-track LKM");
         return -1;

@@ -47,7 +47,7 @@ static int task_reset_dirty_track(struct pstree_item *item, struct mem_dump_ctl 
 		return 0;
 
 	BUG_ON(!kdat.has_dirty_track);
-    
+
 	if (use_dirty_map && pre_dump) {
 		// fd = item->dl->dirty_track_fd;
 		if (!dl || (dl->dirty_track_fd == -1) || (dl->pid != pid)) {
