@@ -506,7 +506,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_siz
     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
 		return;
     
-    pr_debug("Diffmap for pid %d:(size: %ld)\n", pid, diffmap_size);
+    pr_debug("Diffmap for pid %d:(size: %d)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
 		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
@@ -673,7 +673,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n", 
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %u bytes): %p\n", 
                     pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
     } else {
         dl->latest_dm = NULL;
@@ -695,7 +695,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): %p\n",
+            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %u bytes): %p\n",
                      pid, dl->lldm_size * sizeof(struct dirty_map), dl->less_latest_dm);
     } else {
         dl->less_latest_dm = NULL;
@@ -862,7 +862,7 @@ void fini_dirty_map(struct pstree_item *item){
  */
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr) {
     struct dirty_diffmap *map;
-    unsigned long left = 0, right = 0;
+    size_t left = 0, right = 0;
 
     // diffmap为空，直接返回NULL
     if (!dl)
@@ -875,7 +875,7 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
     }
 
     while (left < right) {
-        unsigned long mid = left + (right - left) / 2;
+        size_t mid = left + (right - left) / 2;
 
         if (addr < map[mid].address) {
             // 地址在当前范围左侧，缩小右边界

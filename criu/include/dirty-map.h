@@ -51,7 +51,7 @@ struct dirty_log {
     pid_t pid;
     int dirty_track_fd;     // dirty-track设备文件描述符
     struct dirty_diffmap *diffmap;
-    unsigned long diffmap_size;
+    size_t diffmap_size;
 
     // dirty-map and corresponding timestamp(file)
     struct {
