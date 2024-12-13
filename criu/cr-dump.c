@@ -1713,7 +1713,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		mdc.use_dirty_map = true;
 	else
 		mdc.use_dirty_map = false;
-	
+
 	if (mdc.use_dirty_map) {
 		pr_info("[Obsidian0215]init dirty-track and dirty-map for %d\n", item->pid->real);
 		ret = init_dirty_map(item, opts.dirty_map_dir);
@@ -1907,7 +1907,7 @@ static int cr_pre_dump_finish(int status)
 			goto err;
 
 		timing_stop(TIME_MEMWRITE);
-		
+
 		// [Obsidian0215] destroy dirty_log for pre-dump
 		if(opts.use_dirty_map)
 			fini_dirty_map(item);
