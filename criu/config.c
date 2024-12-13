@@ -1139,7 +1139,7 @@ int check_options(void)
 		return 1;
 	}
 
-	if (opts.use_dirty_map && 
+	if (opts.use_dirty_map &&
 			!(opts.mode == CR_PRE_DUMP || opts.mode == CR_DUMP)) {
 		pr_err("Option --use-dirty-map is only valid on pre-dump or dump\n");
 		return 1;

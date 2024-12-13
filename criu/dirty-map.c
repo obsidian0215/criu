@@ -348,7 +348,7 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
     close(fd);
     *dm = (struct dirty_map *)mapped;
     *dm_size = st.st_size / sizeof(struct dirty_map);
-    // printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n", 
+    // printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n",
     //        dm_filepath, *dm_size * sizeof(struct dirty_map), *dm);
     return 0;
 }
@@ -487,7 +487,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, unsigned lon
     
 //     pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
 // 	for (i = 0; i < dirtymap_size; i++) {
-// 		pr_debug("\taddress: %#lx, write count: %d\n", 
+// 		pr_debug("\taddress: %#lx, write count: %d\n",
 //             dirtymap[i].address, dirtymap[i].write_count);
 // 	}
 // }
@@ -508,7 +508,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
     
     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
+		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n",
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
 	}
 }
@@ -649,11 +649,11 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d", 
+        pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d",
                 dl->latest_timestamp, pid);
         // 追加失败也继续执行
     } else {
-        pr_info("[Obsidian0215]PID %d: latest timestamp = %lu, less-latest timestamp = %lu\n", 
+        pr_info("[Obsidian0215]PID %d: latest timestamp = %lu, less-latest timestamp = %lu\n",
                 pid, dl->latest_timestamp, dl->less_latest_timestamp);
     }
 
@@ -666,14 +666,14 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     
     // 映射latest_dm
     if (dl->latest_timestamp) {
-        ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir, 
+        ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
                           &dl->latest_dm, &dl->ldm_size);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n", 
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n",
                     pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
     } else {
         dl->latest_dm = NULL;
@@ -967,7 +967,8 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
         new_max = dl->candidate_max + EXPAND_CANDIDATE_BATCH;
         new_size = new_max * sizeof(unsigned long);
 
-        snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", opts.dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
+        snprintf(candidate_list_filepath, sizeof(candidate_list_filepath),
+             "%s/%s.%d", opts.dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
         candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
          // 扩展文件大小以匹配新的映射范围
         fd = open(candidate_list_filepath, O_RDWR);

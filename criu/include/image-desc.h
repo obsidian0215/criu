@@ -115,10 +115,6 @@ enum {
 	CR_FD_MEMFD_FILE,
 
 	CR_FD_AUTOFS,
-
-	//[Obsidian0215]dirty-map image definition
-	CR_FD_DIRTY_MAP,
-	
 	CR_FD_MAX
 };
 
