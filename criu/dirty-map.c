@@ -506,7 +506,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
 		return;
     
-    pr_debug("Diffmap for pid %d:(size: %zu)\n", pid, diffmap_size);
+    pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
 		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
