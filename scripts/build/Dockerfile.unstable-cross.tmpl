@@ -4,6 +4,12 @@ COPY scripts/ci/apt-install /bin/apt-install
 RUN echo "deb http://deb.debian.org/debian/ unstable main" >> /etc/apt/sources.list && \
   dpkg --add-architecture ${DEBIAN_ARCH}
 
+# Update package lists
+RUN apt-get update
+
+# Install critical dependencies from unstable
+RUN apt-get install -y --no-install-recommends libgcc-s1:${DEBIAN_ARCH} libstdc++6:${DEBIAN_ARCH}
+
 RUN apt-install \
 	crossbuild-essential-${DEBIAN_ARCH}	\
 	libc6-dev-${DEBIAN_ARCH}-cross		\
