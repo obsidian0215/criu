@@ -51,26 +51,26 @@ struct dirty_log {
     pid_t pid;
     int dirty_track_fd;     // dirty-track设备文件描述符
     struct dirty_diffmap *diffmap;
-    size_t diffmap_size;
+    unsigned long diffmap_size;
 
     // dirty-map and corresponding timestamp(file)
     struct {
         unsigned long *timestamp_list;
-        size_t ts_list_size;
+        unsigned long ts_list_size;
 
         unsigned long latest_timestamp;
         struct dirty_map *latest_dm;
-	    size_t ldm_size;
+	    unsigned long ldm_size;
 
         unsigned long less_latest_timestamp;
         struct dirty_map *less_latest_dm;
-	    size_t lldm_size;
+	    unsigned long lldm_size;
     };
 
     // candidate list for warm address in pre-dump
     unsigned long *candidate_list;
-    size_t candidate_size;
-    size_t candidate_max;
+    unsigned long candidate_size;
+    unsigned long candidate_max;
 };
 
 #define INIT_DIRTY_LOG(log) do { \

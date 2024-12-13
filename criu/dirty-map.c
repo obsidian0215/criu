@@ -45,7 +45,7 @@ int compare_dirty_map(const void *a, const void *b) {
 }
 
 // 函数用于排序dirty_map数组
-void sort_dirty_map(struct dirty_map *dm, size_t size) {
+void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
     if (dm && size > 1)
         qsort(dm, size, sizeof(struct dirty_map), compare_dirty_map);
 }
@@ -62,7 +62,7 @@ void sort_dirty_map(struct dirty_map *dm, size_t size) {
 static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
     char candidate_list_filepath[PATH_MAX];
     void *mmaped = NULL;
-    size_t current_count, required_size;
+    unsigned long current_count, required_size;
     int fd;
     struct stat st;
 
@@ -124,7 +124,7 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
  */
 static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir) {
     char candidate_list_filepath[PATH_MAX];
-    size_t candidate_size;
+    unsigned long candidate_size;
     int fd;
     struct stat st;
 
@@ -179,10 +179,10 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
  * @param ts_list_size 指针，存储timestamp_list的大小
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, size_t *ts_list_size) {
+static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned long **timestamp_list, unsigned long *ts_list_size) {
     char timestamp_file_path[PATH_MAX];
     void *mmaped = NULL;
-    size_t current_size, current_count, required_size;
+    unsigned long current_size, current_count, required_size;
     int fd;
     struct stat st;
 
@@ -260,12 +260,12 @@ static int load_timestamp_list(const char *dirty_map_dir, pid_t pid, unsigned lo
  * @param timestamp 要检查的时间戳
  * @return int 返回1表示存在，0表示不存在
  */
-static int is_timestamp_in_list(unsigned long *timestamp_list, size_t ts_list_size, unsigned long timestamp) {
+static int is_timestamp_in_list(unsigned long *timestamp_list, unsigned long ts_list_size, unsigned long timestamp) {
     // 如果timestamp_list为空直接覆盖ts_list内存的原有值
     if (!ts_list_size)
         return 0;
     
-    for (size_t i = 0; i < ts_list_size; ++i) {
+    for (unsigned long i = 0; i < ts_list_size; ++i) {
         if (timestamp_list[i] == timestamp) {
             return 1; // 存在
         }
@@ -281,7 +281,7 @@ static int is_timestamp_in_list(unsigned long *timestamp_list, size_t ts_list_si
  * @param new_timestamp 要追加的新的时间戳
  * @return int 成功返回 0，失败返回-1并设置errno
  */
-static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_list_size, unsigned long new_timestamp) {
+static int append_timestamp_to_list(unsigned long *timestamp_list, unsigned long *ts_list_size, unsigned long new_timestamp) {
     // 将 new_timestamp 写入预留的空间
     timestamp_list[*ts_list_size] = new_timestamp;
     
@@ -307,7 +307,7 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, size_t *ts_li
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
 static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
-                struct dirty_map **dm, size_t *dm_size) {
+                struct dirty_map **dm, unsigned long *dm_size) {
     char dm_filepath[PATH_MAX];
     int fd;
     struct stat st;
@@ -364,9 +364,9 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
  * @param dl 指向dirty_log结构体的指针
  * @return struct dirty_diffmap* 生成的diffmap
  */
-struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t latest_size,
-        struct dirty_map *less_latest_dm, size_t less_latest_size, size_t *diffmap_size) {
-    size_t max_size, i = 0, j = 0, k = 0;
+struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, unsigned long latest_size,
+        struct dirty_map *less_latest_dm, unsigned long less_latest_size, unsigned long *diffmap_size) {
+    unsigned long max_size, i = 0, j = 0, k = 0;
     struct dirty_diffmap *diffmap, *resized_diffmap;
 
     // 两个dirty_map都为空，直接返回空diffmap
@@ -479,7 +479,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
  * @param pid dirtymap所属的进程PID
  * @return void
  */
-// static void debug_show_dirtymap(struct dirty_map *dirtymap, size_t dirtymap_size, pid_t pid) {
+// static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtymap_size, pid_t pid) {
 //     int i;
     
 //     if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
@@ -500,13 +500,13 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, size_t lates
  * @param pid diffmap所属的进程PID
  * @return void
  */
-static void debug_show_diffmap(struct dirty_diffmap *diffmap, size_t diffmap_size, pid_t pid) {
+static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
     int i;
     
     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
 		return;
     
-    pr_debug("Diffmap for pid %d:(size: %d)\n", pid, diffmap_size);
+    pr_debug("Diffmap for pid %d:(size: %zu)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
 		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n", 
             diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
@@ -673,7 +673,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %u bytes): %p\n", 
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n", 
                     pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
     } else {
         dl->latest_dm = NULL;
@@ -695,7 +695,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
         } else
-            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %u bytes): %p\n",
+            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): %p\n",
                      pid, dl->lldm_size * sizeof(struct dirty_map), dl->less_latest_dm);
     } else {
         dl->less_latest_dm = NULL;
@@ -862,7 +862,7 @@ void fini_dirty_map(struct pstree_item *item){
  */
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr) {
     struct dirty_diffmap *map;
-    size_t left = 0, right = 0;
+    unsigned long left = 0, right = 0;
 
     // diffmap为空，直接返回NULL
     if (!dl)
@@ -875,7 +875,7 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
     }
 
     while (left < right) {
-        size_t mid = left + (right - left) / 2;
+        unsigned long mid = left + (right - left) / 2;
 
         if (addr < map[mid].address) {
             // 地址在当前范围左侧，缩小右边界
@@ -941,7 +941,7 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
  */
 void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
     char candidate_list_filepath[PATH_MAX];
-    size_t mid, left = 0, right, new_max, new_size;
+    unsigned long mid, left = 0, right, new_max, new_size;
     void *new_map;
     int fd;
 
@@ -1014,7 +1014,7 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
  * @return void
  */
 void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
-    size_t mid, left = 0, right;
+    unsigned long mid, left = 0, right;
 
     if (!dl || !dl->candidate_list)
         return;
