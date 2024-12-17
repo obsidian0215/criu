@@ -13,7 +13,9 @@
         "pagemap-cache.h": "c",
         "cr_options.h": "c",
         "page.h": "c",
-        "page-pipe.h": "c"
+        "page-pipe.h": "c",
+        "bfd.h": "c",
+        "log.h": "c"
     },
     "makefile.configureOnOpen": false
 }

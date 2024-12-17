@@ -215,7 +215,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, bool pre_dump)
+			 bool has_parent)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -239,7 +239,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			continue;
 		}
 
-		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr) && !pre_dump)
+		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
 
 		/*
@@ -490,7 +490,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -700,7 +700,7 @@ again:
 	// [Obsidian0215]若dump时没有父镜像，则无法使用dirty-map，退化为标准pre-copy
 	// 该情况会发生在：1. 上次pre-dump到dump之前才创建的进程；2. 共享内存(pre-dump不会转储)
 	if (!has_parent && !pre_dump)
-		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
+		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
 	else
 		ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
 	if (ret == -EAGAIN) {

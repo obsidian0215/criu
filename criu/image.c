@@ -618,24 +618,13 @@ int test_dirty_map_dir(char *dir)
 	if (fd < 0) {
 		pr_perror("Can't open dir %s", dir);
 		ret = -1;
-	} else
+	} else {
 		pr_info("dirty-map will be loaded from <%s>\n", opts.dirty_map_dir);
-
-	// ret = install_service_fd(DIRTY_MAP_OFF, fd);
-	// if (ret < 0) {
-	// 	pr_err("install_service_fd failed.\n");
-	// 	return -1;
-	// }
-	// fd = ret;
+		close(fd);
+	}
 
 	return ret;
 }
-
-// //[Obsidian0215]for dirty-track, kill dirty-map-dir service fd
-// void close_dirty_map_dir(void)
-// {
-// 	close_service_fd(DIRTY_MAP_OFF);
-// }
 
 int open_parent(int dfd, int *pfd)
 {
