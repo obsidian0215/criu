@@ -27,12 +27,13 @@
 #include "protobuf.h"
 
 #define TIMESTAMP_LIST_PREFIX "timestamp_list"
-#define CANDIDATE_LIST_PREFIX "candidate_list"
+#define WARM_LIST_PREFIX "warm_list"
+#define THRESHOLD_PREFIX "threshold"
 
 #define MAX_FILES 32
-#define EXPAND_CANDIDATE_BATCH 128
+#define EXPAND_WARM_BATCH 128
 
-// Comparator函数用于qsort
+// 用于qsort的comparator函数
 int compare_dirty_map(const void *a, const void *b) {
     struct dirty_map *dm_a = (struct dirty_map *)a;
     struct dirty_map *dm_b = (struct dirty_map *)b;
@@ -51,16 +52,16 @@ void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
 }
 
 /**
- * @brief 从candidate.pid文件中读取candidate_list
+ * @brief 从warm.pid文件中读取warm_list
  *
  * @param dirty_map_dir dirty_map目录的路径
  * @param pid 进程pid
- * @param candidate_list 指向存储candidate_list的指针
- * @param candidate_size 指针，存储candidate_list的大小
+ * @param warm_list 指向存储warm_list的指针
+ * @param warm_size 指针，存储warm_list的大小
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
-    char candidate_list_filepath[PATH_MAX];
+static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
+    char warm_list_filepath[PATH_MAX];
     void *mapped = NULL;
     unsigned long current_count, required_size;
     int fd;
@@ -71,12 +72,12 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
         return -1;
     }
 
-    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, pid);
-    candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+    snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
+    warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
     // 打开文件，不存在时创建一个文件
-    fd = open(candidate_list_filepath, O_RDWR | O_CREAT, 0666);
+    fd = open(warm_list_filepath, O_RDWR | O_CREAT, 0666);
     if (fd == -1) {
-        pr_perror("[Obsidian0215]open %s", candidate_list_filepath);
+        pr_perror("[Obsidian0215]open %s", warm_list_filepath);
         return -1;
     }
 
@@ -89,17 +90,17 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
 
     // 如果文件大小不是整数倍的sizeof(unsigned long)，修正
     if (st.st_size % sizeof(unsigned long) != 0) {
-        pr_perror("[Obsidian0215]Invalid candidate_list file size");
+        pr_perror("[Obsidian0215]Invalid warm_list file size");
         close(fd);
         return -1;
     }
 
-    current_count = st.st_size / sizeof(unsigned long);
-    dl->candidate_size = current_count;
+    current_count = st.st_size / sizeof(warm_page_t);
+    dl->warm_size = current_count;
 
-    // 需要映射的总大小为(current_count+EXPAND_CANDIDATE_BATCH)个unsigned long
-    // 增加32是用于减小candidate_list的扩展次数
-    required_size = (current_count + EXPAND_CANDIDATE_BATCH) * sizeof(unsigned long);
+    // 需要映射的总大小为(current_count+EXPAND_WARM_BATCH)个unsigned long
+    // 增加32是用于减小warm_list的扩展次数
+    required_size = (current_count + EXPAND_WARM_BATCH) * sizeof(warm_page_t);
 
     // 映射文件到内存
     mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -110,21 +111,21 @@ static int load_candidate_list(const char *dirty_map_dir, pid_t pid, struct dirt
     }
     close(fd);
 
-    dl->candidate_list = (unsigned long *)mapped;
-    dl->candidate_max = current_count + EXPAND_CANDIDATE_BATCH;
+    dl->warm_list = (warm_page_t *)mapped;
+    dl->warm_max = current_count + EXPAND_WARM_BATCH;
 
     return 0;
 }
 
 /**
- * @brief 将candidate_list更新到对应的文件中
+ * @brief 将warm_list更新到对应的文件中
  *
  * @param dl 进程dirty-log实例的指针
  * @return int 成功返回0，失败返回-1并设置errno
  */
-static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir) {
-    char candidate_list_filepath[PATH_MAX];
-    unsigned long candidate_size;
+static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
+    char warm_list_filepath[PATH_MAX];
+    unsigned long warm_size;
     int fd;
     struct stat st;
 
@@ -132,12 +133,12 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
         pr_perror("[Obsidian0215]Invalid dl pointer");
         return -1;
     }
-    snprintf(candidate_list_filepath, sizeof(candidate_list_filepath), "%s/%s.%d", dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
-    candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+    snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
+    warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
     // 打开文件
-    fd = open(candidate_list_filepath, O_RDWR, 0666);
+    fd = open(warm_list_filepath, O_RDWR, 0666);
     if (fd == -1) {
-        pr_perror("[Obsidian0215]open %s", candidate_list_filepath);
+        pr_perror("[Obsidian0215]open %s", warm_list_filepath);
         return -1;
     }
     // 获取文件大小
@@ -146,10 +147,10 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
         close(fd);
         return -1;
     }
-    candidate_size = dl->candidate_size * sizeof(unsigned long);
-    // 若当前文件大小不足以容纳candidate_list，则扩展文件
-    if (st.st_size < candidate_size) {
-        if (ftruncate(fd, candidate_size) == -1) {
+    warm_size = dl->warm_size * sizeof(unsigned long);
+    // 若当前文件大小不足以容纳warm_list，则扩展文件
+    if (st.st_size < warm_size) {
+        if (ftruncate(fd, warm_size) == -1) {
             pr_perror("[Obsidian0215]ftruncate");
             close(fd);
             return -1;
@@ -157,14 +158,14 @@ static int write_candidate_list(struct dirty_log *dl, const char *dirty_map_dir)
     }
 
     // 同步更改到文件
-    if (msync(dl->candidate_list, candidate_size, MS_SYNC) == -1) {
+    if (msync(dl->warm_list, warm_size, MS_SYNC) == -1) {
         perror("[Obsidian0215]msync");
         return -1;
     }
 
     // 解除映射
-    if (munmap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long)) == -1) {
-        pr_perror("[Obsidian0215]Error unmapping candidate_list");
+    if (munmap(dl->warm_list, dl->warm_max * sizeof(unsigned long)) == -1) {
+        pr_perror("[Obsidian0215]Error unmapping warm_list");
         return -1;
     }
     return 0;
@@ -307,8 +308,9 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, unsigned long
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
 static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
-                struct dirty_map **dm, unsigned long *dm_size) {
+                struct dirty_map **dm, unsigned long *dm_size, dirtymap_header_t *header) {
     char dm_filepath[PATH_MAX];
+    file_header_t *tmp_header;
     int fd;
     struct stat st;
     void *mapped;
@@ -322,7 +324,7 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
 
     fd = open(dm_filepath, O_RDONLY);
     if (fd == -1) {
-        pr_perror("[Obsidian0215]Error opening dirtymap file %s", dm_filepath);
+        pr_perror("[Obsidian0215]Error opening dirtymap %s", dm_filepath);
         return -1;
     }
 
@@ -332,22 +334,25 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
         return -1;
     }
 
-    if (st.st_size == 0) {
-        pr_perror("[Obsidian0215]Dirtymap file %s is empty", dm_filepath);
+    if (st.st_size == 0 ||
+     (st.st_size - sizeof(dirtymap_header_t)) % sizeof(struct dirty_map) != 0) {
+        pr_perror("[Obsidian0215]Size of dirtymap %s is invalid", dm_filepath);
         close(fd);
         return -1;
     }
 
     mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
-        pr_perror("[Obsidian0215]Error mapping dirtymap file %s", dm_filepath);
+        pr_perror("[Obsidian0215]Error mapping dirtymap %s", dm_filepath);
         close(fd);
         return -1;
     }
 
     close(fd);
-    *dm = (struct dirty_map *)mapped;
-    *dm_size = st.st_size / sizeof(struct dirty_map);
+    tmp_header = (file_header_t *)mapped;
+    header->track_duration_ns = le64toh(tmp_header->total_duration_ns);
+    *dm = (struct dirty_map *)((char *)mapped + sizeof(file_header_t));
+    *dm_size = (st.st_size - sizeof(file_header_t)) / sizeof(struct dirty_map);
     // printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n",
     //        dm_filepath, *dm_size * sizeof(struct dirty_map), *dm);
     return 0;
@@ -364,24 +369,29 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
  * @param dl 指向dirty_log结构体的指针
  * @return struct dirty_diffmap* 生成的diffmap
  */
-struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, unsigned long latest_size,
-        struct dirty_map *less_latest_dm, unsigned long less_latest_size, unsigned long *diffmap_size) {
+struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
+    struct dirty_map * latest_dm = dl->latest_dm, *less_latest_dm = dl->less_latest_dm;
+    unsigned long lsize = dl->ldm_size, slsize = dl->lldm_size;
+    unsigned long ltd_ns = dl->ldm_header.track_duration_ns;
+    unsigned long lltd_ns = dl->lldm_header.track_duration_ns;
     unsigned long max_size, i = 0, j = 0, k = 0;
     struct dirty_diffmap *diffmap, *resized_diffmap;
+    float pre_heat = 0.0, cur_heat = 0.0;
 
     // 两个dirty_map都为空，直接返回空diffmap
-    if ((latest_dm == NULL || latest_size == 0) && (less_latest_dm == NULL || less_latest_size == 0)) {
-        *diffmap_size = 0;
+    if ((!latest_dm || !lsize || !ltd_ns)
+     && (!less_latest_dm || !slsize || !lltd_ns)) {
+        dl->diffmap_size = 0;
         return NULL;
     }
 
     // 估算diffmap的最大可能大小
     if (latest_dm && less_latest_dm)
-        max_size = latest_size + less_latest_size;
+        max_size = lsize + slsize;
     else if (latest_dm)
-        max_size = latest_size;
+        max_size = lsize;
     else
-        max_size = less_latest_size;
+        max_size = slsize;
 
     diffmap = malloc(max_size * sizeof(struct dirty_diffmap));
     if (!diffmap) {
@@ -390,27 +400,31 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, unsigned lon
         return NULL;
     }
 
-    if (latest_dm && latest_size > 0 && less_latest_dm && less_latest_size > 0) {
-        while (i < latest_size && j < less_latest_size) {
+    if (latest_dm && lsize > 0 && less_latest_dm && slsize > 0) {
+        while (i < lsize && j < slsize) {
             if (latest_dm[i].address < less_latest_dm[j].address) {
                 // 仅在latest_dm中存在
                 diffmap[k].address = latest_dm[i].address;
-                diffmap[k].heat_level = (latest_dm[i].write_count);
-                diffmap[k].heat_trend = (latest_dm[i].write_count);
+                cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1000.0);
+                diffmap[k].heat = cur_heat;
+                diffmap[k].heat_trend = cur_heat;
                 i++;
             }
             else if (latest_dm[i].address > less_latest_dm[j].address) {
                 // 仅在less_latest_dm中存在
                 diffmap[k].address = less_latest_dm[j].address;
-                diffmap[k].heat_level = 0;
-                diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+                pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
+                diffmap[k].heat = 0.0;
+                diffmap[k].heat_trend = -pre_heat;
                 j++;
             }
             else {
                 // 同时存在于两个数组中
                 diffmap[k].address = latest_dm[i].address;
-                diffmap[k].heat_level = (latest_dm[i].write_count);
-                diffmap[k].heat_trend = latest_dm[i].write_count - less_latest_dm[j].write_count;
+                cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
+                pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
+                diffmap[k].heat = cur_heat;
+                diffmap[k].heat_trend = cur_heat - pre_heat;
                 i++;
                 j++;
             }
@@ -418,40 +432,44 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_map *latest_dm, unsigned lon
         }
 
         // 处理剩余的 latest_dm 条目
-        while (i < latest_size) {
+        while (i < lsize) {
             diffmap[k].address = latest_dm[i].address;
-            diffmap[k].heat_level = (latest_dm[i].write_count);
-            diffmap[k].heat_trend = (latest_dm[i].write_count);
+            cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
+            diffmap[k].heat = cur_heat;
+            diffmap[k].heat_trend = cur_heat;
             i++;
             k++;
         }
 
         // 处理剩余的 less_latest_dm 条目
-        while (j < less_latest_size) {
+        while (j < slsize) {
             diffmap[k].address = less_latest_dm[j].address;
-            diffmap[k].heat_level = 0;
-            diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+            diffmap[k].heat = 0.0;
+            pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
+            diffmap[k].heat_trend = -pre_heat;
             j++;
             k++;
         }
-    } else if (latest_dm && latest_size > 0) {
+    } else if (latest_dm && lsize > 0) {
         // 仅latest_dm存在，less_latest_dm为空
-        for (; i < latest_size; i++, k++) {
+        for (; i < lsize; i++, k++) {
             diffmap[k].address = latest_dm[i].address;
-            diffmap[k].heat_level = latest_dm[i].write_count;
-            diffmap[k].heat_trend = latest_dm[i].write_count;
+            cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
+            diffmap[k].heat = cur_heat;
+            diffmap[k].heat_trend = cur_heat;
         }
-    } else if (less_latest_dm && less_latest_size > 0) {
+    } else if (less_latest_dm && slsize > 0) {
         // 仅less_latest_dm存在，latest_dm为空
-        for (; j < less_latest_size; j++, k++) {
+        for (; j < slsize; j++, k++) {
             diffmap[k].address = less_latest_dm[j].address;
-            diffmap[k].heat_level = 0;
-            diffmap[k].heat_trend = -(less_latest_dm[j].write_count);
+            diffmap[k].heat = 0.0;
+            pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
+            diffmap[k].heat_trend = -pre_heat;
         }
     }
 
     // 更新实际的diffmap大小
-    *diffmap_size = k;
+    dl->diffmap_size = k;
 
     // 如果没有任何条目，释放分配的内存并返回NULL
     if (!k) {
@@ -508,10 +526,183 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
 
     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#lx, heat level: %d, heat trend: %d\n",
-            diffmap[i].address, diffmap[i].heat_level, diffmap[i].heat_trend);
+		pr_debug("\taddress: %#lx, heat level: %f, heat trend: %f\n",
+            diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
 	}
 }
+
+/**
+ * @brief 从thresholds.pid加载dirty_log的温页判断阈值
+ *        若不存在则使用预设值初始化
+ * @param dl 进程的dirty-log结构体指针
+ */
+static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
+    char threshold_file_path[PATH_MAX];
+    int fd, ret;
+    struct stat st;
+
+    if (!dl) {
+        pr_perror("[Obsidian0215]load_thresholds: dl is NULL");
+        return;
+    }
+
+    snprintf(threshold_file_path, sizeof(threshold_file_path), "%s/%s.%d", dirty_map_dir, THRESHOLD_PREFIX, dl->pid);
+    threshold_file_path[sizeof(threshold_file_path) - 1] = '\0';
+    // 打开文件，如果不存在则创建并初始化
+    fd = open(threshold_file_path, O_RDWR | O_CREAT, 0666);
+    if (fd == -1) {
+        pr_perror("[Obsidian0215]open %s", threshold_file_path);
+        return;
+    }
+
+    // 获取文件大小
+    if (fstat(fd, &st) == -1) {
+        pr_perror("[Obsidian0215]fstat");
+        close(fd);
+        return;
+    }
+
+    if (st.st_size != 2 * sizeof(float)) {
+        pr_perror("[Obsidian0215]Size of thresholds %s is invalid", threshold_file_path);
+        close(fd);
+        return;
+    }
+
+    // read thresholds
+    ret = fread(&dl->heat_threshold, sizeof(float), 1, fd);
+    if (ret != 1) {
+        pr_perror("[Obsidian0215]load heat_threshold");
+        close(fd);
+        return;
+    }
+
+    ret = fread(&dl->trend_threshold, sizeof(float), 1, fd);
+    if (ret != 1) {
+        pr_perror("[Obsidian0215]load trend_threshold");
+        close(fd);
+        return;
+    }
+
+    close(fd);
+}
+
+/**
+ * @brief 更新dirty_log中判断温页的阈值
+ *
+ * @param dl 进程的dirty-log结构体指针
+ */
+static void update_thresholds(struct dirty_log *dl) {
+    struct dirty_diffmap *dirtymap = dl->diffmap;
+    warm_page_t *wl = dl->warm_list;
+    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
+    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
+    int i;
+
+    if (!wl || !dirtymap) {
+        pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
+        return;
+    }
+    min_in_dirtymap = dirtymap[0].heat;
+
+    // 遍历warm_list，更新hit_warm和miss_warm
+    for (i = 0 ; i < dl->warm_size; i++) {
+        if (!search_dirty_map(dl, wl[i].address)) {
+            hit_warm++;
+        } else {
+            miss_warm++;
+        }
+    }
+
+    // 当命中率不高于50%时，更新thresholds
+    if (hit_warm <= miss_warm) {
+        min_heat_threshold = 1.0 / (float)(dl->ldm_header.track_duration_ns / 1e9);
+        dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
+        dl->trend_threshold = 1.05 * dl->trend_threshold;
+    }
+
+    // 用更新的thresholds选择dirtymap的温页并更新new_warm
+    for (i = 0 ; i < dl->diffmap_size; i++) {
+        if (dirtymap[i].heat <= dl->heat_threshold
+         && -dirtymap[i].heat_trend >= dl->trend_threshold * dirtymap[i].heat
+         && !search_warm_list(dl, dirtymap[i].address)) {
+            new_warm++;
+        }
+        if (dirtymap[i].heat < min_in_dirtymap) {
+            min_in_dirtymap = dirtymap[i].heat;
+        }
+    }
+
+    // 新温页过少(<32页或5%)时，适当放宽选择阈值
+    if (new_warm < 32 || new_warm < 0.054 * miss_warm) {
+        if (min_in_dirtymap > min_heat_threshold) {
+            dl->heat_threshold = min_in_dirtymap;
+        } else {
+            dl->trend_threshold = 0.9025 * dl->trend_threshold;
+        }
+    } else if (new_warm >= 32 && new_warm > 0.25 * miss_warm) {
+        dl->trend_threshold = 1.06 * dl->trend_threshold;
+        dl->heat_threshold = max(min_in_dirtymap, 0.925 * dl->heat_threshold);
+    }
+}
+
+/**
+ * @brief 将dirty_log的温页判断阈值写入thresholds.pid
+ *        若不存在则使用预设值初始化
+ * @param dl 进程的dirty-log结构体指针
+ */
+static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
+    char threshold_file_path[PATH_MAX];
+    int fd, ret;
+    struct stat st;
+
+    if (!dl) {
+        pr_perror("[Obsidian0215]write_thresholds: dl is NULL");
+        return -1;
+    }
+
+    snprintf(threshold_file_path, sizeof(threshold_file_path), "%s/%s.%d", dirty_map_dir, THRESHOLD_PREFIX, dl->pid);
+    threshold_file_path[sizeof(threshold_file_path) - 1] = '\0';
+    // 打开文件，如果不存在则创建并初始化
+    fd = open(threshold_file_path, O_RDWR | O_CREAT, 0666);
+    if (fd == -1) {
+        pr_perror("[Obsidian0215]open %s", threshold_file_path);
+        return -1;
+    }
+
+    // 获取文件大小
+    if (fstat(fd, &st) == -1) {
+        pr_perror("[Obsidian0215]fstat");
+        close(fd);
+        return -1;
+    }
+
+    if (st.st_size != 2 * sizeof(float)) {
+        if (ftruncate(fd, 2 * sizeof(float)) == -1) {
+            perror("[Obsidian0215]adjust thresholds file size");
+            close(fd);
+            return -1;
+        }
+    }
+
+    // write thresholds
+    ret = fwrite(&dl->heat_threshold, sizeof(float), 1, fd);
+    if (ret != 1) {
+        pr_perror("[Obsidian0215]write heat_threshold");
+        close(fd);
+        return -1;
+    }
+
+    ret = fread(&dl->trend_threshold, sizeof(float), 1, fd);
+    if (ret != 1) {
+        pr_perror("[Obsidian0215]write trend_threshold");
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
 
 /**
  * @brief 为特定 pid 进程初始化其 dirty_map，读取最新和次新的 dirtymap 文件。
@@ -550,10 +741,10 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
 
-    // 读取candidate_list.<pid>文件，初始化candidate_list
-    ret = load_candidate_list(dirty_map_dir, pid, dl);
+    // 读取warm_list.<pid>文件，初始化warm_list
+    ret = load_warm_list(dirty_map_dir, pid, dl);
     if (ret < 0) {
-        pr_perror("[Obsidian0215]Failed to load candidate_list for pid %d", pid);
+        pr_perror("[Obsidian0215]Failed to load warm_list for pid %d", pid);
         return -1;
     }
 
@@ -667,14 +858,17 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射latest_dm
     if (dl->latest_timestamp) {
         ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
-                          &dl->latest_dm, &dl->ldm_size);
+                          &dl->latest_dm, &dl->ldm_siz, &dl->ldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
             dl->ldm_size = 0;
-        } else
-            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map (size: %lu bytes): %p\n",
-                    pid, dl->ldm_size * sizeof(struct dirty_map), dl->latest_dm);
+        } else {
+            pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map: %p\n",
+                    pid, dl->latest_dm);
+            pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
+                    dl->ldm_header.track_duration, dl->ldm_size * sizeof(struct dirty_map));
+        }
     } else {
         dl->latest_dm = NULL;
         dl->ldm_size = 0;
@@ -689,14 +883,17 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
         ret = load_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir,
-                          &dl->less_latest_dm, &dl->lldm_size);
+                          &dl->less_latest_dm, &dl->lldm_size, &dl->lldm_header);
         if (ret < 0) {
-            pr_perror("[Obsidian0215]Failed to map less latest dirtymap for pid %d", pid);
+            pr_perror("[Obsidian0215]Failed to map previous dirtymap for pid %d", pid);
             dl->less_latest_dm = NULL;
             dl->lldm_size = 0;
-        } else
-            pr_info("[Obsidian0215]successfully loaded %d's less-latest dirty-map (size: %lu bytes): %p\n",
-                     pid, dl->lldm_size * sizeof(struct dirty_map), dl->less_latest_dm);
+        } else {
+            pr_info("[Obsidian0215]successfully loaded %d's previous dirty-map: %p\n",
+                    pid, dl->latest_dm);
+            pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
+                    dl->ldm_header.track_duration, dl->ldm_size * sizeof(struct dirty_map));
+        }
     } else {
         dl->less_latest_dm = NULL;
         dl->lldm_size = 0;
@@ -710,15 +907,15 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 
     // 生成dirty_diffmap先保证两个dirtymap都按升序排列
     // 使用升序的less_latest_dm和latest_dm生成dirty_diffmap
-    // sort_dirty_map(latest_dm, latest_size);
-    // sort_dirty_map(less_latest_dm, less_latest_size);
-    dl->diffmap = merge_dirty_maps(
-        dl->latest_dm, dl->ldm_size,
-        dl->less_latest_dm, dl->lldm_size,
-        &(dl->diffmap_size)
-    );
+    // sort_dirty_map(latest_dm, lsize);
+    // sort_dirty_map(less_latest_dm, slsize);
+    dl->diffmap = merge_dirty_maps(dl);
 
     debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
+
+    // 加载上次的阈值并更新
+    load_thresholds(dl, dirty_map_dir);
+    update_thresholds(dl);
     return 0;
 }
 
@@ -838,14 +1035,19 @@ void fini_dirty_map(struct pstree_item *item){
             dl->diffmap_size = 0;
         }
 
-        // 处理candidate_list
-        if (dl->candidate_list) {
-            if (write_candidate_list(dl, opts.dirty_map_dir)) {
-                pr_perror("[Obsidian0215]Error updating candidate_list to file");
+        // 处理warm_list
+        if (dl->warm_list) {
+            if (write_warm_list(dl, opts.dirty_map_dir)) {
+                pr_perror("[Obsidian0215]Error updating warm_list to file");
             }
-            dl->candidate_list = NULL;
-            dl->candidate_size = 0;
-            dl->candidate_max = 0;
+            dl->warm_list = NULL;
+            dl->warm_size = 0;
+            dl->warm_max = 0;
+        }
+
+        // 处理thresholds
+        if (write_thresholds(dl, opts.dirty_map_dir)) {
+            pr_perror("[Obsidian0215]Error updating thresholds to file");
         }
         // 释放dl结构体
         free(dl);
@@ -894,21 +1096,21 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 }
 
 /**
- * @brief 查找candidate_list中包含指定address
+ * @brief 查找warm_list中包含指定address
  *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
  * @param addr 要查找的线性地址
  * @return int 找到则返回1，如果未找到则返回0
  */
-int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
+int search_warm_list(struct dirty_log *dl, unsigned long addr) {
     unsigned long *cd_list, left = 0, right = 0;
 
-    // candidate_list为空，无法找到该地址
+    // warm_list为空，无法找到该地址
     if (!dl)
         return 0;
     else {
-        cd_list = dl->candidate_list;
-        right = dl->candidate_size;
+        cd_list = dl->warm_list;
+        right = dl->warm_size;
         if (!cd_list || !right)
             return 0;
     }
@@ -933,47 +1135,49 @@ int search_candidate_list(struct dirty_log *dl, unsigned long addr) {
 }
 
 /**
- * @brief 将指定address插入candidate_list中，并保持candidate_list升序
+ * @brief 将指定address插入warm_list中，并保持warm_list升序
  *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
  * @param addr 要插入的线性地址
  * @return void
  */
-void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
-    char candidate_list_filepath[PATH_MAX];
+void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
+    char warm_list_filepath[PATH_MAX];
     unsigned long mid, left = 0, right, new_max, new_size;
     void *new_map;
     int fd;
 
-    if (!dl || !dl->candidate_list)
+    if (!dl || !dl->warm_list)
         return;
 
-    right = dl->candidate_size;
+    right = dl->warm_size;
     // 二分查找插入位置
     while (left < right) {
         mid = left + (right - left) / 2;
-        if (dl->candidate_list[mid] < addr)
+        if (dl->warm_list[mid] < addr)
             left = mid + 1;
         else
             right = mid;
     }
 
-    // 检查地址是否已存在, 如果存在则无需插入
-    if (left < dl->candidate_size && dl->candidate_list[left] == addr)
+    // 检查地址是否已存在, 如果存在则直接增加记录，无需插入
+    if (left < dl->warm_size && dl->warm_list[left] == addr) {
+        dl->warm_list[left].s_count++;
         return;
+    }
 
     // 检查是否需要扩展
-    if (dl->candidate_size >= dl->candidate_max) {
-        new_max = dl->candidate_max + EXPAND_CANDIDATE_BATCH;
-        new_size = new_max * sizeof(unsigned long);
+    if (dl->warm_size >= dl->warm_max) {
+        new_max = dl->warm_max + EXPAND_WARM_BATCH;
+        new_size = new_max * sizeof(warm_page_t);
 
-        snprintf(candidate_list_filepath, sizeof(candidate_list_filepath),
-             "%s/%s.%d", opts.dirty_map_dir, CANDIDATE_LIST_PREFIX, dl->pid);
-        candidate_list_filepath[sizeof(candidate_list_filepath) - 1] = '\0';
+        snprintf(warm_list_filepath, sizeof(warm_list_filepath),
+             "%s/%s.%d", opts.dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
+        warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
          // 扩展文件大小以匹配新的映射范围
-        fd = open(candidate_list_filepath, O_RDWR);
+        fd = open(warm_list_filepath, O_RDWR);
         if (fd == -1) {
-            perror("[Obsidian0215]Error opening candidate list file");
+            perror("[Obsidian0215]Error opening warm list file");
             return;
         }
         if (ftruncate(fd, new_size) == -1) {
@@ -984,64 +1188,64 @@ void insert_candidate_list(struct dirty_log *dl, unsigned long addr) {
         close(fd);
 
         // 重新映射文件
-        new_map = mremap(dl->candidate_list, dl->candidate_max * sizeof(unsigned long), new_size, MREMAP_MAYMOVE);
+        new_map = mremap(dl->warm_list, dl->warm_max * sizeof(warm_page_t), new_size, MREMAP_MAYMOVE);
         if (new_map == MAP_FAILED) {
             perror("[Obsidian0215]mremap");
             return;
         }
 
-        dl->candidate_list = (unsigned long *)new_map;
-        dl->candidate_max = new_max;
+        dl->warm_list = (warm_page_t *)new_map;
+        dl->warm_max = new_max;
     }
 
     // 如果插入位置是末尾，直接赋值无需移动
-    if (left == dl->candidate_size) {
-        dl->candidate_list[left] = addr;
-        dl->candidate_size++;
+    if (left == dl->warm_size) {
+        dl->warm_list[left] = addr;
+        dl->warm_size++;
     } else {
         // 移动元素以腾出插入位置
-        memmove(&dl->candidate_list[left + 1], &dl->candidate_list[left],
-                (dl->candidate_size - left) * sizeof(unsigned long));
-        dl->candidate_list[left] = addr;
-        dl->candidate_size++;
+        memmove(&dl->warm_list[left + 1], &dl->warm_list[left],
+                (dl->warm_size - left) * sizeof(warm_page_t));
+        dl->warm_list[left] = addr;
+        dl->warm_size++;
     }
 }
 
 /**
- * @brief 将指定address从candidate_list中删除，并保持candidate_list升序
+ * @brief 将指定address从warm_list中删除，并保持warm_list升序
  *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的candidate_list
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
  * @param addr 要删除的线性地址
  * @return void
  */
-void delete_candidate_list(struct dirty_log *dl, unsigned long addr) {
+void delete_warm_list(struct dirty_log *dl, unsigned long addr) {
     unsigned long mid, left = 0, right;
 
-    if (!dl || !dl->candidate_list)
+    if (!dl || !dl->warm_list)
         return;
 
-    right = dl->candidate_size;
+    right = dl->warm_size;
 
     // 二分查找目标地址
     while (left < right) {
         mid = left + (right - left) / 2;
-        if (dl->candidate_list[mid] < addr)
+        if (dl->warm_list[mid] < addr)
             left = mid + 1;
         else
             right = mid;
     }
 
     // 检查是否找到地址
-    if (left >= dl->candidate_size || dl->candidate_list[left] != addr)
+    if (left >= dl->warm_size || dl->warm_list[left] != addr)
         return;
 
     // 删除的是最后一个元素，直接减少大小
-    if (left == dl->candidate_size - 1) {
-        dl->candidate_size--;
+    if (left == dl->warm_size - 1) {
+        dl->warm_size--;
     } else {
         // 移动元素以覆盖删除的位置
-        memmove(&dl->candidate_list[left], &dl->candidate_list[left + 1],
-                (dl->candidate_size - left - 1) * sizeof(unsigned long));
-        dl->candidate_size--;
+        memmove(&dl->warm_list[left], &dl->warm_list[left + 1],
+                (dl->warm_size - left - 1) * sizeof(warm_page_t));
+        dl->warm_size--;
     }
 }

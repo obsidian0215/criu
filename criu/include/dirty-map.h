@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <endian.h> // 用于字节序转换
 #include "int.h"
 #include "pid.h"
 #include "page.h"
@@ -19,6 +20,9 @@
 
 #define DT_DEV_PATH "/dev/dirty-track"
 
+#define INITIAL_HEAT_THRESHOLD 15.0
+#define INITIAL_TREND_THRESHOLD 1.0
+
 // 检查pid是否被dirty-track中
 struct pid_check {
     pid_t pid;
@@ -26,26 +30,30 @@ struct pid_check {
 };
 
 // 纪录被选择传输的页地址和次数
-struct __attribute__((__packed__)) selected_page
+typedef struct __attribute__((__packed__)) warm_page
 {
     unsigned long address;
     unsigned char s_count;  // 被选择转储的次数
-};
+} warm_page_t;
 
 // 脏页heatmap信息
-struct __attribute__((__packed__)) dirty_diffmap
+typedef struct __attribute__((__packed__)) dirty_diffmap
 {
     unsigned long address;          // 页地址
-    unsigned char heat_level;       // 热度
-    char heat_trend;                // 热度变化
-};
+    float heat;       // 热度
+    float heat_trend;                // 热度变化
+} ddm_t;
 
 // 脏页dirtymap信息
-struct __attribute__((__packed__)) dirty_map
+typedef struct __attribute__((__packed__)) dirty_map
 {
 	unsigned long address;
     unsigned int write_count;
-};
+} dm_t;
+
+typedef struct {
+    u64 track_duration_ns;
+} dirtymap_header_t;
 
 struct dirty_log {
     pid_t pid;
@@ -61,16 +69,22 @@ struct dirty_log {
         unsigned long latest_timestamp;
         struct dirty_map *latest_dm;
 	    unsigned long ldm_size;
+        dirtymap_header_t ldm_header;
 
         unsigned long less_latest_timestamp;
         struct dirty_map *less_latest_dm;
 	    unsigned long lldm_size;
+        dirtymap_header_t lldm_header;
     };
 
-    // candidate list for warm address in pre-dump
-    unsigned long *candidate_list;
-    unsigned long candidate_size;
-    unsigned long candidate_max;
+    // list for addresses of warm pages in pre-dump
+    warm_page_t *warm_list;
+    unsigned long warm_size;
+    unsigned long warm_max;
+
+    // thresholds for warm page selection
+    float heat_threshold;
+    float trend_threshold;
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -86,9 +100,11 @@ struct dirty_log {
     (log).lldm_size = 0; \
     (log).diffmap = NULL; \
     (log).diffmap_size = 0; \
-    (log).candidate_list = NULL; \
-    (log).candidate_size = 0; \
-    (log).candidate_max = 0; \
+    (log).warm_list = NULL; \
+    (log).warm_size = 0; \
+    (log).warm_max = 0; \
+    (log).heat_threshold = INITIAL_HEAT_THRESHOLD; \
+    (log).trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -104,9 +120,11 @@ struct dirty_log {
     (log_ptr)->lldm_size = 0; \
     (log_ptr)->diffmap = NULL; \
     (log_ptr)->diffmap_size = 0; \
-    (log_ptr)->candidate_list = NULL; \
-    (log_ptr)->candidate_size = 0; \
-    (log_ptr)->candidate_max = 0; \
+    (log_ptr)->warm_list = NULL; \
+    (log_ptr)->warm_size = 0; \
+    (log_ptr)->warm_max = 0; \
+    (log_ptr)->heat_threshold = INITIAL_HEAT_THRESHOLD; \
+    (log_ptr)->trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
@@ -116,8 +134,8 @@ int start_dirty_track(struct dirty_log* dl);
 int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
 int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
-int search_candidate_list(struct dirty_log *dl, unsigned long addr);
-void insert_candidate_list(struct dirty_log *dl, unsigned long addr);
-void delete_candidate_list(struct dirty_log *dl, unsigned long addr);
+int search_warm_list(struct dirty_log *dl, unsigned long addr);
+void insert_warm_list(struct dirty_log *dl, unsigned long addr);
+void delete_warm_list(struct dirty_log *dl, unsigned long addr);
 
 #endif

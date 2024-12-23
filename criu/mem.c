@@ -35,6 +35,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "dirty-map.h"
+#include  <math.h>
 
 static int task_reset_dirty_track(struct pstree_item *item, struct mem_dump_ctl *mdc) {
 	int ret, pid = item->pid->real;
@@ -526,30 +527,36 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
             }
         } else {
             // 被dirty_map记录则基于热度和热度变化确定
-            if (dhm->heat_level == 0) {
-				// 完全冷页（一般只会从第二次predump出现），选择从脏页变化下来的
+            if (!dhm->heat) {
+				// 冷页（一般只会从第二次predump出现）, 选择变冷的
 				if (dhm->heat_trend < 0) {
-					// 判断是否在候选列表中，若在则删除该地址
-					if (search_candidate_list(dl, vaddr)) {
-						pr_info("[Obsidian0215]delete 0x%lx in candidate list\n", vaddr);
-						delete_candidate_list(dl, vaddr);
+					// 判断是否在温页列表中，若在则删除该地址
+					if (search_warm_list(dl, vaddr)) {
+						pr_info("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
+						delete_warm_list(dl, vaddr);
 					}
                 	return true;
-				} else	// 一般情况下不会走该分支
+				} else {	// 一般不会走该分支
 					return false;
-            } else if (dhm->heat_level <= 4) {
-				// 温页，选择热度下降较快的（超过50%）
-				// 不直接选择传输，而是加入候选列表，由下次热度变化决定
-                if (dhm->heat_trend < -dhm->heat_level) {
-					if (!search_candidate_list(dl, vaddr)) {
-						pr_info("[Obsidian0215]add 0x%lx to candidate list\n", vaddr);
-					    insert_candidate_list(dl, vaddr);
+				}
+            } else if (dhm->heat <= dl->heat_threshold) {
+				// 温页，选择热度下降较快的（超过trend_threshold）
+				// 并加入温页列表
+                if (-dhm->heat_trend >= dl->trend_threshold * dhm->heat) {
+					if (!search_warm_list(dl, vaddr)) {
+						pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
+					    insert_warm_list(dl, vaddr);
 					}
-                    return false;
+                    return true;
                 } else
                 	return false;
             } else {
 				 // 热页被跳过
+				// 判断是否在温页列表中，若在则删除该地址
+				if (search_warm_list(dl, vaddr)) {
+					pr_info("[Obsidian0215]0x%lx in warm list get hot\n", vaddr);
+					delete_warm_list(dl, vaddr);
+				}
                 return false;
             }
         }
@@ -567,7 +574,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 			return true;
 		} else {
 			// 未被dirty-map记录且soft-dirty未置位(冷页)
-			// 若能找到父镜像，则可以跳过
+			// 能找到父镜像则可以跳过
 			return false;
 		}
     }
