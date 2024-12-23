@@ -379,14 +379,17 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
     float pre_heat = 0.0, cur_heat = 0.0;
 
     // 两个dirty_map都为空，直接返回空diffmap
-    if ((!latest_dm || !lsize || !ltd_ns)
-     && (!less_latest_dm || !slsize || !lltd_ns)) {
+    if ((!latest_dm || !lsize)
+     && (!less_latest_dm || !slsize)) {
         dl->diffmap_size = 0;
         return NULL;
     }
 
     ltd_ns = !dl->ldm_header ? 0 : dl->ldm_header->track_duration_ns;
     lltd_ns = !dl->lldm_header ? 0 : dl->lldm_header->track_duration_ns;
+
+    BUG_ON(!ltd_ns && (lsize || latest_dm));
+    BUG_ON(!lltd_ns && (slsize || less_latest_dm));
 
     // 估算diffmap的最大可能大小
     if (latest_dm && less_latest_dm)
