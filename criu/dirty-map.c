@@ -575,6 +575,8 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
                 close(fd);
                 return;
             }
+            dl->heat_threshold = (float)2 / (float)(dl->ldm_header->track_duration_ns / 1e9);
+            dl->trend_threshold = INITIAL_TREND_THRESHOLD;
         } else {
             pr_perror("[Obsidian0215]Size of thresholds %s is invalid", threshold_file_path);
             close(fd);
