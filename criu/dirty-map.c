@@ -310,10 +310,11 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, unsigned long
 static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
                 struct dirty_map **dm, unsigned long *dm_size, dirtymap_header_t *header) {
     char dm_filepath[PATH_MAX];
-    file_header_t *tmp_header;
     int fd;
     struct stat st;
     void *mapped;
+    // dirtymap_header_t *tmp_header;
+
     if (timestamp == 0) {
         *dm = NULL;
         *dm_size = 0;
@@ -349,10 +350,10 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
     }
 
     close(fd);
-    tmp_header = (file_header_t *)mapped;
-    header->track_duration_ns = le64toh(tmp_header->total_duration_ns);
-    *dm = (struct dirty_map *)((char *)mapped + sizeof(file_header_t));
-    *dm_size = (st.st_size - sizeof(file_header_t)) / sizeof(struct dirty_map);
+    header = (dirtymap_header_t *)mapped;
+    // header->track_duration_ns = le64toh(tmp_header->total_duration_ns);
+    *dm = (struct dirty_map *)((char *)mapped + sizeof(dirtymap_header_t));
+    *dm_size = (st.st_size - sizeof(dirtymap_header_t)) / sizeof(struct dirty_map);
     // printf("[Obsidian0215] Successfully loaded dirtymap file %s (size: %lu bytes): %p\n",
     //        dm_filepath, *dm_size * sizeof(struct dirty_map), *dm);
     return 0;
@@ -372,8 +373,7 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
 struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
     struct dirty_map * latest_dm = dl->latest_dm, *less_latest_dm = dl->less_latest_dm;
     unsigned long lsize = dl->ldm_size, slsize = dl->lldm_size;
-    unsigned long ltd_ns = dl->ldm_header.track_duration_ns;
-    unsigned long lltd_ns = dl->lldm_header.track_duration_ns;
+    u64 ltd_ns, lltd_ns;
     unsigned long max_size, i = 0, j = 0, k = 0;
     struct dirty_diffmap *diffmap, *resized_diffmap;
     float pre_heat = 0.0, cur_heat = 0.0;
@@ -384,6 +384,9 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
         dl->diffmap_size = 0;
         return NULL;
     }
+
+    unsigned long ltd_ns = !dl->ldm_header ? 0 : dl->ldm_header->total_duration_ns;
+    unsigned long lltd_ns = !dl->lldm_header ? 0 : dl->lldm_header->track_duration_ns;
 
     // 估算diffmap的最大可能大小
     if (latest_dm && less_latest_dm)
@@ -569,14 +572,14 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     }
 
     // read thresholds
-    ret = fread(&dl->heat_threshold, sizeof(float), 1, fd);
+    ret = read(fd, &dl->heat_threshold, sizeof(float));
     if (ret != 1) {
         pr_perror("[Obsidian0215]load heat_threshold");
         close(fd);
         return;
     }
 
-    ret = fread(&dl->trend_threshold, sizeof(float), 1, fd);
+    ret = read(fd, &dl->trend_threshold, sizeof(float));
     if (ret != 1) {
         pr_perror("[Obsidian0215]load trend_threshold");
         close(fd);
@@ -615,7 +618,7 @@ static void update_thresholds(struct dirty_log *dl) {
 
     // 当命中率不高于50%时，更新thresholds
     if (hit_warm <= miss_warm) {
-        min_heat_threshold = 1.0 / (float)(dl->ldm_header.track_duration_ns / 1e9);
+        min_heat_threshold = 1.0 / (float)(dl->ldm_header->track_duration_ns / 1e9);
         dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
         dl->trend_threshold = 1.05 * dl->trend_threshold;
     }
@@ -685,14 +688,14 @@ static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     }
 
     // write thresholds
-    ret = fwrite(&dl->heat_threshold, sizeof(float), 1, fd);
+    ret = write(fd, &dl->heat_threshold, sizeof(float));
     if (ret != 1) {
         pr_perror("[Obsidian0215]write heat_threshold");
         close(fd);
         return -1;
     }
 
-    ret = fread(&dl->trend_threshold, sizeof(float), 1, fd);
+    ret = write(fd, &dl->trend_threshold, sizeof(float));
     if (ret != 1) {
         pr_perror("[Obsidian0215]write trend_threshold");
         close(fd);
@@ -858,7 +861,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射latest_dm
     if (dl->latest_timestamp) {
         ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
-                          &dl->latest_dm, &dl->ldm_siz, &dl->ldm_header);
+                          &dl->latest_dm, &dl->ldm_size, &dl->ldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
@@ -867,7 +870,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map: %p\n",
                     pid, dl->latest_dm);
             pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
-                    dl->ldm_header.track_duration, dl->ldm_size * sizeof(struct dirty_map));
+                    dl->ldm_header->track_duration_ns, dl->ldm_size * sizeof(struct dirty_map));
         }
     } else {
         dl->latest_dm = NULL;
@@ -892,7 +895,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             pr_info("[Obsidian0215]successfully loaded %d's previous dirty-map: %p\n",
                     pid, dl->latest_dm);
             pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
-                    dl->ldm_header.track_duration, dl->ldm_size * sizeof(struct dirty_map));
+                    dl->lldm_header->track_duration_ns, dl->lldm_size * sizeof(struct dirty_map));
         }
     } else {
         dl->less_latest_dm = NULL;
@@ -1090,7 +1093,6 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
             return &map[mid];
         }
     }
-
     // 如果未找到包含地址的范围，返回NULL
     return NULL;
 }
@@ -1103,7 +1105,8 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
  * @return int 找到则返回1，如果未找到则返回0
  */
 int search_warm_list(struct dirty_log *dl, unsigned long addr) {
-    unsigned long *cd_list, left = 0, right = 0;
+    unsigned long left = 0, right = 0;
+    warm_page_t *cd_list;
 
     // warm_list为空，无法找到该地址
     if (!dl)
@@ -1118,10 +1121,10 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
     while (left < right) {
         unsigned long mid = left + (right - left) / 2;
 
-        if (addr < cd_list[mid]) {
+        if (addr < cd_list[mid].address) {
             // 地址在当前范围左侧，缩小右边界
             right = mid;
-        } else if (addr > cd_list[mid]) {
+        } else if (addr > cd_list[mid].address) {
             // 地址在当前范围右侧，缩小左边界
             left = mid + 1;
         } else {
@@ -1129,7 +1132,6 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
             return 1;
         }
     }
-
     // 未找到该地址
     return 0;
 }
@@ -1154,7 +1156,7 @@ void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
     // 二分查找插入位置
     while (left < right) {
         mid = left + (right - left) / 2;
-        if (dl->warm_list[mid] < addr)
+        if (dl->warm_list[mid].address < addr)
             left = mid + 1;
         else
             right = mid;
@@ -1200,13 +1202,15 @@ void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
 
     // 如果插入位置是末尾，直接赋值无需移动
     if (left == dl->warm_size) {
-        dl->warm_list[left] = addr;
+        dl->warm_list[left].address = addr;
+        dl->warm_list[left].s_count = 1;
         dl->warm_size++;
     } else {
         // 移动元素以腾出插入位置
         memmove(&dl->warm_list[left + 1], &dl->warm_list[left],
                 (dl->warm_size - left) * sizeof(warm_page_t));
-        dl->warm_list[left] = addr;
+        dl->warm_list[left].address = addr;
+        dl->warm_list[left].s_count = 1;
         dl->warm_size++;
     }
 }
@@ -1229,14 +1233,14 @@ void delete_warm_list(struct dirty_log *dl, unsigned long addr) {
     // 二分查找目标地址
     while (left < right) {
         mid = left + (right - left) / 2;
-        if (dl->warm_list[mid] < addr)
+        if (dl->warm_list[mid].address < addr)
             left = mid + 1;
         else
             right = mid;
     }
 
     // 检查是否找到地址
-    if (left >= dl->warm_size || dl->warm_list[left] != addr)
+    if (left >= dl->warm_size || dl->warm_list[left].address != addr)
         return;
 
     // 删除的是最后一个元素，直接减少大小

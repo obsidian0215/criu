@@ -69,12 +69,12 @@ struct dirty_log {
         unsigned long latest_timestamp;
         struct dirty_map *latest_dm;
 	    unsigned long ldm_size;
-        dirtymap_header_t ldm_header;
+        dirtymap_header_t *ldm_header;
 
         unsigned long less_latest_timestamp;
         struct dirty_map *less_latest_dm;
 	    unsigned long lldm_size;
-        dirtymap_header_t lldm_header;
+        dirtymap_header_t *lldm_header;
     };
 
     // list for addresses of warm pages in pre-dump
@@ -103,6 +103,8 @@ struct dirty_log {
     (log).warm_list = NULL; \
     (log).warm_size = 0; \
     (log).warm_max = 0; \
+    (log).ldm_header = NULL; \
+    (log).lldm_header = NULL; \
     (log).heat_threshold = INITIAL_HEAT_THRESHOLD; \
     (log).trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
@@ -123,6 +125,8 @@ struct dirty_log {
     (log_ptr)->warm_list = NULL; \
     (log_ptr)->warm_size = 0; \
     (log_ptr)->warm_max = 0; \
+    (log_ptr)->ldm_header = NULL; \
+    (log_ptr)->lldm_header = NULL; \
     (log_ptr)->heat_threshold = INITIAL_HEAT_THRESHOLD; \
     (log_ptr)->trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
