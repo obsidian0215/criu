@@ -385,8 +385,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
         return NULL;
     }
 
-    unsigned long ltd_ns = !dl->ldm_header ? 0 : dl->ldm_header->total_duration_ns;
-    unsigned long lltd_ns = !dl->lldm_header ? 0 : dl->lldm_header->track_duration_ns;
+    ltd_ns = !dl->ldm_header ? 0 : dl->ldm_header->track_duration_ns;
+    lltd_ns = !dl->lldm_header ? 0 : dl->lldm_header->track_duration_ns;
 
     // 估算diffmap的最大可能大小
     if (latest_dm && less_latest_dm)
@@ -644,7 +644,7 @@ static void update_thresholds(struct dirty_log *dl) {
         }
     } else if (new_warm >= 32 && new_warm > 0.25 * miss_warm) {
         dl->trend_threshold = 1.06 * dl->trend_threshold;
-        dl->heat_threshold = max(min_in_dirtymap, 0.925 * dl->heat_threshold);
+        dl->heat_threshold = max(min_in_dirtymap, (float)0.925 * dl->heat_threshold);
     }
 }
 
@@ -861,7 +861,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射latest_dm
     if (dl->latest_timestamp) {
         ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
-                          &dl->latest_dm, &dl->ldm_size, &dl->ldm_header);
+                          &dl->latest_dm, &dl->ldm_size, dl->ldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
@@ -869,7 +869,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         } else {
             pr_info("[Obsidian0215]successfully loaded %d's latest dirty-map: %p\n",
                     pid, dl->latest_dm);
-            pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
+            pr_info("\ttrack_duration: %lu ns, size: %lu bytes\n",
                     dl->ldm_header->track_duration_ns, dl->ldm_size * sizeof(struct dirty_map));
         }
     } else {
@@ -886,7 +886,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
         ret = load_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir,
-                          &dl->less_latest_dm, &dl->lldm_size, &dl->lldm_header);
+                          &dl->less_latest_dm, &dl->lldm_size, dl->lldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map previous dirtymap for pid %d", pid);
             dl->less_latest_dm = NULL;
@@ -894,7 +894,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         } else {
             pr_info("[Obsidian0215]successfully loaded %d's previous dirty-map: %p\n",
                     pid, dl->latest_dm);
-            pr_info("\ttrack_duration: %llu ns, size: %lu bytes\n",
+            pr_info("\ttrack_duration: %lu ns, size: %lu bytes\n",
                     dl->lldm_header->track_duration_ns, dl->lldm_size * sizeof(struct dirty_map));
         }
     } else {
@@ -1163,7 +1163,7 @@ void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
     }
 
     // 检查地址是否已存在, 如果存在则直接增加记录，无需插入
-    if (left < dl->warm_size && dl->warm_list[left] == addr) {
+    if (left < dl->warm_size && dl->warm_list[left].address == addr) {
         dl->warm_list[left].s_count++;
         return;
     }
