@@ -308,7 +308,7 @@ static int append_timestamp_to_list(unsigned long *timestamp_list, unsigned long
  * @return int 成功返回 0，失败返回 -1 并设置errno
  */
 static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_map_dir,
-                struct dirty_map **dm, unsigned long *dm_size, dirtymap_header_t *header) {
+                struct dirty_map **dm, unsigned long *dm_size, dirtymap_header_t **header) {
     char dm_filepath[PATH_MAX];
     int fd;
     struct stat st;
@@ -350,7 +350,7 @@ static int load_dirtymap(pid_t pid, unsigned long timestamp, const char *dirty_m
     }
 
     close(fd);
-    header = (dirtymap_header_t *)mapped;
+    *header = (dirtymap_header_t *)mapped;
     // header->track_duration_ns = le64toh(tmp_header->total_duration_ns);
     *dm = (struct dirty_map *)((char *)mapped + sizeof(dirtymap_header_t));
     *dm_size = (st.st_size - sizeof(dirtymap_header_t)) / sizeof(struct dirty_map);
@@ -875,7 +875,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射latest_dm
     if (dl->latest_timestamp) {
         ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
-                          &dl->latest_dm, &dl->ldm_size, dl->ldm_header);
+                          &dl->latest_dm, &dl->ldm_size, &dl->ldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
@@ -900,7 +900,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
         ret = load_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir,
-                          &dl->less_latest_dm, &dl->lldm_size, dl->lldm_header);
+                          &dl->less_latest_dm, &dl->lldm_size, &dl->lldm_header);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map previous dirtymap for pid %d", pid);
             dl->less_latest_dm = NULL;
