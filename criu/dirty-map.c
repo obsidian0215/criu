@@ -703,14 +703,14 @@ static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
 
     // write thresholds
     ret = write(fd, &dl->heat_threshold, sizeof(float));
-    if (ret != 1) {
+    if (ret != sizeof(float)) {
         pr_perror("[Obsidian0215]write heat_threshold");
         close(fd);
         return -1;
     }
 
     ret = write(fd, &dl->trend_threshold, sizeof(float));
-    if (ret != 1) {
+    if (ret != sizeof(float)) {
         pr_perror("[Obsidian0215]write trend_threshold");
         close(fd);
         return -1;
@@ -1019,6 +1019,7 @@ int stop_dirty_track(struct dirty_log *dl) {
  */
 void fini_dirty_map(struct pstree_item *item){
     struct dirty_log *dl = item->dl;
+    unsigned long ldm_mmap_size, lldm_mmap_size;
 
     if (dl) {
         // 关闭打开的dirty-track设备fd
@@ -1029,7 +1030,8 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 卸载最新的dirtymap
         if (dl->latest_dm) {
-            if (munmap(dl->latest_dm, dl->ldm_size) == -1) {
+            ldm_mmap_size = (dl->ldm_size * sizeof(struct dirty_map) + sizeof(struct dirty_map_header));
+            if (munmap((void *)dl->ldm_header, ldm_mmap_size)== -1) {
                 pr_perror("[Obsidian0215]Error unmapping latest dirtymap");
             }
             dl->latest_dm = NULL;
@@ -1038,7 +1040,8 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 处理次新的dirtymap
         if (dl->less_latest_dm) {
-            if (munmap(dl->less_latest_dm, dl->lldm_size) == -1) {
+            lldm_mmap_size = (dl->lldm_size * sizeof(struct dirty_map) + sizeof(struct dirty_map_header));
+            if (munmap((void *)dl->less_latest_dm, lldm_mmap_size) == -1) {
                 pr_perror("[Obsidian0215]Error unmapping second-latest dirtymap");
             }
             dl->less_latest_dm = NULL;

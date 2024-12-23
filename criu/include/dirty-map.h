@@ -105,8 +105,6 @@ struct dirty_log {
     (log).warm_max = 0; \
     (log).ldm_header = NULL; \
     (log).lldm_header = NULL; \
-    (log).heat_threshold = INITIAL_HEAT_THRESHOLD; \
-    (log).trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -127,8 +125,6 @@ struct dirty_log {
     (log_ptr)->warm_max = 0; \
     (log_ptr)->ldm_header = NULL; \
     (log_ptr)->lldm_header = NULL; \
-    (log_ptr)->heat_threshold = INITIAL_HEAT_THRESHOLD; \
-    (log_ptr)->trend_threshold = INITIAL_TREND_THRESHOLD; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
