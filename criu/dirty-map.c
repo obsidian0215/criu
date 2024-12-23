@@ -569,9 +569,17 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     }
 
     if (st.st_size != 2 * sizeof(float)) {
-        pr_perror("[Obsidian0215]Size of thresholds %s is invalid", threshold_file_path);
-        close(fd);
-        return;
+        if (!st.st_size) {
+            if (ftruncate(fd, 2 * sizeof(float)) == -1) {
+                pr_perror("[Obsidian0215]ftruncate");
+                close(fd);
+                return;
+            }
+        } else {
+            pr_perror("[Obsidian0215]Size of thresholds %s is invalid", threshold_file_path);
+            close(fd);
+            return;
+        }
     }
 
     // read thresholds
@@ -669,7 +677,7 @@ static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     snprintf(threshold_file_path, sizeof(threshold_file_path), "%s/%s.%d", dirty_map_dir, THRESHOLD_PREFIX, dl->pid);
     threshold_file_path[sizeof(threshold_file_path) - 1] = '\0';
     // 打开文件，如果不存在则创建并初始化
-    fd = open(threshold_file_path, O_RDWR | O_CREAT, 0666);
+    fd = open(threshold_file_path, O_RDWR, 0666);
     if (fd == -1) {
         pr_perror("[Obsidian0215]open %s", threshold_file_path);
         return -1;
