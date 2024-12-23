@@ -1030,7 +1030,7 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 卸载最新的dirtymap
         if (dl->latest_dm) {
-            ldm_mmap_size = (dl->ldm_size * sizeof(struct dirty_map) + sizeof(struct dirty_map_header));
+            ldm_mmap_size = dl->ldm_size * sizeof(struct dirty_map) + sizeof(dirtymap_header_t);
             if (munmap((void *)dl->ldm_header, ldm_mmap_size)== -1) {
                 pr_perror("[Obsidian0215]Error unmapping latest dirtymap");
             }
@@ -1040,7 +1040,7 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 处理次新的dirtymap
         if (dl->less_latest_dm) {
-            lldm_mmap_size = (dl->lldm_size * sizeof(struct dirty_map) + sizeof(struct dirty_map_header));
+            lldm_mmap_size = dl->lldm_size * sizeof(struct dirty_map) + sizeof(dirtymap_header_t);
             if (munmap((void *)dl->less_latest_dm, lldm_mmap_size) == -1) {
                 pr_perror("[Obsidian0215]Error unmapping second-latest dirtymap");
             }
