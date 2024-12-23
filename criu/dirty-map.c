@@ -593,7 +593,7 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     if (lseek(fd, 0, SEEK_SET) == -1) {
         pr_perror("[Obsidian0215]lseek");
         close(fd);
-        return -1;
+        return;
     }
 
     ret = read(fd, &dl->heat_threshold, sizeof(float));
