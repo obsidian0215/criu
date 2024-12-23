@@ -575,7 +575,10 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
                 close(fd);
                 return;
             }
-            dl->heat_threshold = (float)2 / (float)(dl->ldm_header->track_duration_ns / 1e9);
+            if (!dl->ldm_header) {
+                dl->heat_threshold = INITIAL_HEAT_THRESHOLD;
+            } else
+                dl->heat_threshold = (float)2 / (float)(dl->ldm_header->track_duration_ns / 1e9);
             dl->trend_threshold = INITIAL_TREND_THRESHOLD;
             return;
         } else {
@@ -586,15 +589,22 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     }
 
     // read thresholds
+    // 重置文件偏移到开头
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+        pr_perror("[Obsidian0215]lseek");
+        close(fd);
+        return -1;
+    }
+
     ret = read(fd, &dl->heat_threshold, sizeof(float));
-    if (ret != 1) {
+    if (ret != sizeof(float)) {
         pr_perror("[Obsidian0215]load heat_threshold");
         close(fd);
         return;
     }
 
     ret = read(fd, &dl->trend_threshold, sizeof(float));
-    if (ret != 1) {
+    if (ret != sizeof(float)) {
         pr_perror("[Obsidian0215]load trend_threshold");
         close(fd);
         return;
@@ -702,6 +712,13 @@ static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     }
 
     // write thresholds
+    // 重置文件偏移到开头
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+        pr_perror("[Obsidian0215]lseek");
+        close(fd);
+        return -1;
+    }
+
     ret = write(fd, &dl->heat_threshold, sizeof(float));
     if (ret != sizeof(float)) {
         pr_perror("[Obsidian0215]write heat_threshold");
@@ -1041,7 +1058,7 @@ void fini_dirty_map(struct pstree_item *item){
         // 处理次新的dirtymap
         if (dl->less_latest_dm) {
             lldm_mmap_size = dl->lldm_size * sizeof(struct dirty_map) + sizeof(dirtymap_header_t);
-            if (munmap((void *)dl->less_latest_dm, lldm_mmap_size) == -1) {
+            if (munmap((void *)dl->lldm_header, lldm_mmap_size) == -1) {
                 pr_perror("[Obsidian0215]Error unmapping second-latest dirtymap");
             }
             dl->less_latest_dm = NULL;
