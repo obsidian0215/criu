@@ -542,7 +542,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
             } else if (dhm->heat <= dl->heat_threshold) {
 				// 温页，选择热度下降较快的（超过trend_threshold）
 				// 并加入温页列表
-                if (-dhm->heat_trend >= dl->trend_threshold * dhm->heat) {
+                if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
 					if (!search_warm_list(dl, vaddr)) {
 						pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
 					    insert_warm_list(dl, vaddr);

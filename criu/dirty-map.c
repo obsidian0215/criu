@@ -640,17 +640,17 @@ static void update_thresholds(struct dirty_log *dl) {
         }
     }
 
-    // 当命中率不高于50%时，更新thresholds
-    if (hit_warm <= miss_warm) {
+    // 当命中率不高于50%时(不包括空warm_list)，更新thresholds
+    if (hit_warm <= miss_warm && miss_warm > 0) {
         min_heat_threshold = 1.0 / (float)(dl->ldm_header->track_duration_ns / 1e9);
         dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
-        dl->trend_threshold = 1.05 * dl->trend_threshold;
+        dl->trend_threshold = 0.55 + 0.45 * dl->trend_threshold;
     }
 
     // 用更新的thresholds选择dirtymap的温页并更新new_warm
     for (i = 0 ; i < dl->diffmap_size; i++) {
         if (dirtymap[i].heat <= dl->heat_threshold
-         && -dirtymap[i].heat_trend >= dl->trend_threshold * dirtymap[i].heat
+         && -dirtymap[i].heat_trend > dl->trend_threshold * dirtymap[i].heat
          && !search_warm_list(dl, dirtymap[i].address)) {
             new_warm++;
         }

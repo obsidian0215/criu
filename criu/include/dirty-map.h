@@ -21,7 +21,7 @@
 #define DT_DEV_PATH "/dev/dirty-track"
 
 #define INITIAL_HEAT_THRESHOLD 5.0
-#define INITIAL_TREND_THRESHOLD 1.0
+#define INITIAL_TREND_THRESHOLD 0.0
 
 // 检查pid是否被dirty-track中
 struct pid_check {
