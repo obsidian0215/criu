@@ -1257,7 +1257,6 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @return void
  */
 static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
-    unsigned long mid, left = 0, right;
 
     if (!dl || !dl->warm_list || index >= dl->warm_size)
         return;
