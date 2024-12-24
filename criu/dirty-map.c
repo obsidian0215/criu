@@ -1177,7 +1177,7 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @param addr 要插入的线性地址
  * @return void
  */
-void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
+void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     char warm_list_filepath[PATH_MAX];
     unsigned long mid, left = 0, right, new_max, new_size;
     void *new_map;
@@ -1256,7 +1256,31 @@ void insert_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @param addr 要删除的线性地址
  * @return void
  */
-void delete_warm_list(struct dirty_log *dl, unsigned long addr) {
+static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
+    unsigned long mid, left = 0, right;
+
+    if (!dl || !dl->warm_list || index >= dl->warm_size)
+        return;
+
+    // 删除的是最后一个元素，直接减少大小
+    if (index == dl->warm_size - 1) {
+        dl->warm_size--;
+    } else {
+        // 移动元素以覆盖删除的位置
+        memmove(&dl->warm_list[index], &dl->warm_list[index + 1],
+                (dl->warm_size - index - 1) * sizeof(warm_page_t));
+        dl->warm_size--;
+    }
+}
+
+/**
+ * @brief 将warm_list中指定address的s_count减1，若为0则删除保持warm_list升序
+ *
+ * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
+ * @param addr 要操作的线性地址
+ * @return void
+ */
+void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
     unsigned long mid, left = 0, right;
 
     if (!dl || !dl->warm_list)
@@ -1277,13 +1301,17 @@ void delete_warm_list(struct dirty_log *dl, unsigned long addr) {
     if (left >= dl->warm_size || dl->warm_list[left].address != addr)
         return;
 
-    // 删除的是最后一个元素，直接减少大小
-    if (left == dl->warm_size - 1) {
-        dl->warm_size--;
+    if (dl->warm_list[left].s_count > 0) {
+        if (zero) {
+            dl->warm_list[left].s_count = 0;
+        } else {
+            dl->warm_list[left].s_count--;
+        }
+        if (dl->warm_list[left].s_count == 0) {
+            del_in_warm_list(dl, addr);
+        }
     } else {
-        // 移动元素以覆盖删除的位置
-        memmove(&dl->warm_list[left], &dl->warm_list[left + 1],
-                (dl->warm_size - left - 1) * sizeof(warm_page_t));
-        dl->warm_size--;
+        // s_count为0，删除该元素
+        del_in_warm_list(dl, addr);
     }
 }

@@ -135,7 +135,7 @@ int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
 int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
 int search_warm_list(struct dirty_log *dl, unsigned long addr);
-void insert_warm_list(struct dirty_log *dl, unsigned long addr);
-void delete_warm_list(struct dirty_log *dl, unsigned long addr);
+void inc_warm_list(struct dirty_log *dl, unsigned long addr);
+void sub_warm_list(struct dirty_log *dl, unsigned long addr);
 
 #endif
