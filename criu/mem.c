@@ -533,7 +533,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 					// 判断是否在温页列表中，若在则删除该地址
 					if (search_warm_list(dl, vaddr)) {
 						pr_info("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
-						sub_warm_list(dl, vaddr, true);
+						// sub_warm_list(dl, vaddr, true);
 						return false;
 					}
                 	return true;
@@ -555,7 +555,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 				// 判断是否在温页列表中，若在则删除该地址
 				if (search_warm_list(dl, vaddr)) {
 					pr_info("[Obsidian0215]0x%lx in warm list get hot\n", vaddr);
-					sub_warm_list(dl, vaddr, false);
+					// sub_warm_list(dl, vaddr, false);
 				}
                 return false;
             }
