@@ -924,7 +924,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             dl->lldm_size = 0;
         } else {
             pr_info("[Obsidian0215]successfully loaded %d's previous dirty-map: %p\n",
-                    pid, dl->latest_dm);
+                    pid, dl->less_latest_dm);
             pr_info("\ttrack_duration: %lu ns, size: %lu bytes\n",
                     dl->lldm_header->track_duration_ns, dl->lldm_size * sizeof(struct dirty_map));
         }
