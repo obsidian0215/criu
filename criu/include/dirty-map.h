@@ -35,7 +35,7 @@ struct pid_check {
 typedef struct __attribute__((__packed__)) warm_page
 {
     unsigned long address;
-    unsigned char s_count;  // 被选择转储的次数
+    char s_count;  // 被选择转储的次数
 } warm_page_t;
 
 // 脏页heatmap信息
