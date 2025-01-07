@@ -733,9 +733,10 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
  * @return gboolean 返回 TRUE 以继续遍历，返回 FALSE 以停止遍历
  */
 gboolean print_warm_page(gpointer key, gpointer value, gpointer user_data) {
-    warm_page_t *wp = (warm_page_t *)key;
-    if (wp) {
-        pr_info("Address: 0x%lx, s_count: %d\n", wp->address, wp->s_count);
+    unsigned long *addr = (unsigned long *)key;
+    char *s_count = (char *)value;
+    if (addr) {
+        pr_info("Address: 0x%lx, s_count: %d\n", *addr, *s_count);
     } else {
         pr_perror("Invalid warm_page_t pointer.\n");
         return TRUE;
