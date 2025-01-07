@@ -175,7 +175,7 @@ static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
     pid_t pid;
     FILE *file = NULL;
     int ret = 0;
-    gboolean traverse_status;
+    // gboolean traverse_status;
 
     if (!dl) {
         fprintf(stderr, "[Obsidian0215] Invalid dl pointer\n");
