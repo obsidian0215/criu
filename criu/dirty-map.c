@@ -1296,49 +1296,6 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 }
 
 /**
- * @brief 在warm_list中插入或更新一个地址
- *
- * @param dl 指向存储warm_list的dirty_log结构体
- * @param addr 要插入或更新的地址
- * @return int 成功返回0，失败返回-1并设置errno。
- */
-static int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
-    warm_page_t key = { .address = addr, .s_count = 0 };
-    warm_page_t *existing = NULL;
-
-    if (!dl || !dl->warm_list) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    pthread_mutex_lock(&dl->warm_list_mutex);
-
-    existing = g_tree_lookup(dl->warm_list, &key);
-    if (existing) {
-        existing->s_count++;
-    } else {
-        warm_page_t *new_wp = malloc(sizeof(warm_page_t));
-        if (!new_wp) {
-            perror("[Obsidian0215] malloc failed");
-            pthread_mutex_unlock(&dl->warm_list_mutex);
-            return -1;
-        }
-        new_wp->address = addr;
-        new_wp->s_count = 1;
-        if (!g_tree_insert(dl->warm_list, new_wp, new_wp)) {
-            fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
-            free(new_wp);
-            pthread_mutex_unlock(&dl->warm_list_mutex);
-            return -1;
-        }
-        dl->warm_size++;
-    }
-
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-    return 0;
-}
-
-/**
  * @brief 查找warm_list中包含指定address
  *
  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
@@ -1386,7 +1343,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         if (!new_wp) {
             perror("[Obsidian0215] malloc failed");
             pthread_mutex_unlock(&dl->warm_list_mutex);
-            return -1;
+            return;
         }
         new_wp->address = addr;
         new_wp->s_count = 1;
@@ -1395,7 +1352,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
             fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
             free(new_wp);
             pthread_mutex_unlock(&dl->warm_list_mutex);
-            return -1;
+            return;
         }
         dl->warm_size++;
     }
