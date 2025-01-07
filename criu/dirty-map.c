@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <math.h>
 
 #include "types.h"
 #include "image.h"
@@ -72,6 +73,18 @@ gpointer duplicate_warm_page(gpointer key, gpointer value, gpointer user_data) {
         wp->s_count = ((warm_page_t *)value)->s_count;
     }
     return wp;
+}
+
+// 回调函数，用于遍历 GTree 并写入文件
+static gboolean write_warm_page(gpointer key, gpointer value, gpointer user_data) {
+    FILE *f = (FILE *)user_data;
+    warm_page_t *wp = (warm_page_t *)value;
+
+    if (fwrite(wp, sizeof(warm_page_t), 1, f) != 1) {
+        perror("[Obsidian0215] fwrite");
+        return FALSE;  // 停止遍历
+    }
+    return TRUE;  // 继续遍历
 }
 
 /**
@@ -189,14 +202,14 @@ static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
     pthread_mutex_lock(&dl->warm_list_mutex);
 
     // 遍历GTree并写入文件
-    g_tree_foreach(dl->warm_list, (GTraverseFunc) [](gpointer key, gpointer value, gpointer user_data) -> gboolean {
-        FILE *f = (FILE *)user_data;
-        if (fwrite(value, sizeof(warm_page_t), 1, f) != 1) {
-            perror("[Obsidian0215] fwrite");
-            return FALSE;  // 停止遍历
-        }
-        return TRUE;  // 继续遍历
-    }, file);
+    traverse_status = g_tree_foreach(dl->warm_list, write_warm_page, file);
+
+    if (!traverse_status) {
+        fprintf(stderr, "[Obsidian0215] Error during g_tree_foreach\n");
+        fclose(file);
+        pthread_mutex_unlock(&dl->warm_list_mutex);
+        return -1;
+    }
 
     if (ferror(file)) {
         perror("[Obsidian0215] fwrite");
@@ -802,8 +815,9 @@ static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_dat
 static void update_thresholds(struct dirty_log *dl) {
     struct dirty_diffmap *dirtymap = dl->diffmap;
     unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
-    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
+    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0, new_heat_threshold = 0.0;
     int i;
+    traversal_data_t data;
 
     // 检查warm_list和dirtymap是否存在
     if (!dl->warm_list || !dirtymap) {
@@ -821,7 +835,7 @@ static void update_thresholds(struct dirty_log *dl) {
     }
 
     // 初始化遍历数据
-    traversal_data_t data = { .dl = dl, .hit_warm = 0, .miss_warm = 0 };
+    data = { .dl = dl, .hit_warm = 0, .miss_warm = 0 };
 
     // 加锁并遍历warm_list
     pthread_mutex_lock(&dl->warm_list_mutex);
@@ -841,7 +855,7 @@ static void update_thresholds(struct dirty_log *dl) {
         }
 
         // 更新heat_threshold
-        float new_heat_threshold = (float)hit_warm / (hit_warm + miss_warm);
+        new_heat_threshold = (float)hit_warm / (hit_warm + miss_warm);
         dl->heat_threshold = fmaxf(min_heat_threshold, dl->heat_threshold * new_heat_threshold);
 
         // 更新trend_threshold
@@ -1447,12 +1461,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         new_wp->address = addr;
         new_wp->s_count = 1;
 
-        if (!g_tree_insert(dl->warm_list, new_wp, new_wp)) {
-            fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
-            free(new_wp);
-            pthread_mutex_unlock(&dl->warm_list_mutex);
-            return;
-        }
+        g_tree_insert(dl->warm_list, new_wp, new_wp);
         dl->warm_size++;
     }
 
