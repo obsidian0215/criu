@@ -566,6 +566,9 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
     BUG_ON(!ltd_ns && (lsize || latest_dm));
     BUG_ON(!lltd_ns && (slsize || less_latest_dm));
 
+    // 更新最小的可能热度
+    dl->min_heat = 1.0f / (float)(ltd_ns / 1e9);
+
     // 估算diffmap的最大可能大小
     if (latest_dm && less_latest_dm)
         max_size = lsize + slsize;
@@ -586,7 +589,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
             if (latest_dm[i].address < less_latest_dm[j].address) {
                 // 仅在latest_dm中存在
                 diffmap[k].address = latest_dm[i].address;
-                cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1000.0);
+                cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
                 diffmap[k].heat = cur_heat;
                 diffmap[k].heat_trend = cur_heat;
                 i++;
