@@ -527,7 +527,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
             }
         } else {
             // 被dirty_map记录则基于热度和热度变化确定
-            if (dhm->heat < HEAT_EPSILON) {
+            if (dhm->heat < dl->min_heat) {
 				// 冷页（一般只会从第二次predump出现）, 选择变冷的
 				if (dhm->heat_trend < 0) {
 					// 判断是否在温页列表中，若在则删除该地址
