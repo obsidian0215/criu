@@ -119,7 +119,7 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
 
     // 读取文件中的warm_page_t记录并插入到GTree
     while (fread(&wp, sizeof(warm_page_t), 1, file) == 1) {
-        warm_page_t *existing = g_tree_lookup(dl->warm_tree, &wp);
+        warm_page_t *existing = g_tree_lookup(dl->warm_list, &wp);
         if (existing) {
             existing->s_count += wp.s_count;
         } else {
@@ -131,7 +131,7 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
                 return -1;
             }
             memcpy(new_wp, &wp, sizeof(warm_page_t));
-            g_tree_insert(dl->warm_tree, new_wp, new_wp);
+            g_tree_insert(dl->warm_list, new_wp, new_wp);
             dl->warm_size++;
         }
     }
@@ -189,7 +189,7 @@ static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
     pthread_mutex_lock(&dl->warm_list_mutex);
 
     // 遍历GTree并写入文件
-    g_tree_foreach(dl->warm_tree, (GTraverseFunc) [](gpointer key, gpointer value, gpointer user_data) -> gboolean {
+    g_tree_foreach(dl->warm_list, (GTraverseFunc) [](gpointer key, gpointer value, gpointer user_data) -> gboolean {
         FILE *f = (FILE *)user_data;
         if (fwrite(value, sizeof(warm_page_t), 1, f) != 1) {
             perror("[Obsidian0215] fwrite");
@@ -936,7 +936,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     pthread_mutex_init(&dl->warm_list_mutex, NULL);
-    dl->warm_tree = g_tree_new_full(compare_warm_page, NULL, free, free);
+    dl->warm_list = g_tree_new_full(compare_warm_page, NULL, free, free);
     // 读取warm_list.<pid>文件，初始化warm_list
     ret = load_warm_list(dirty_map_dir, pid, dl);
     if (ret < 0) {
@@ -1296,24 +1296,24 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 }
 
 /**
- * @brief 在warm_tree中插入或更新一个地址
+ * @brief 在warm_list中插入或更新一个地址
  *
  * @param dl 指向存储warm_list的dirty_log结构体
  * @param addr 要插入或更新的地址
  * @return int 成功返回0，失败返回-1并设置errno。
  */
-static int inc_warm_tree(struct dirty_log *dl, unsigned long addr) {
+static int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     warm_page_t key = { .address = addr, .s_count = 0 };
     warm_page_t *existing = NULL;
 
-    if (!dl || !dl->warm_tree) {
+    if (!dl || !dl->warm_list) {
         errno = EINVAL;
         return -1;
     }
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    existing = g_tree_lookup(dl->warm_tree, &key);
+    existing = g_tree_lookup(dl->warm_list, &key);
     if (existing) {
         existing->s_count++;
     } else {
@@ -1325,7 +1325,7 @@ static int inc_warm_tree(struct dirty_log *dl, unsigned long addr) {
         }
         new_wp->address = addr;
         new_wp->s_count = 1;
-        if (!g_tree_insert(dl->warm_tree, new_wp, new_wp)) {
+        if (!g_tree_insert(dl->warm_list, new_wp, new_wp)) {
             fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
             free(new_wp);
             pthread_mutex_unlock(&dl->warm_list_mutex);
@@ -1354,7 +1354,7 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    found = g_tree_lookup(dl->warm_tree, &key);
+    found = g_tree_lookup(dl->warm_list, &key);
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
 
@@ -1378,7 +1378,7 @@ int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    found = g_tree_lookup(dl->warm_tree, &key);
+    found = g_tree_lookup(dl->warm_list, &key);
     if (found) {
         found->s_count++;
     } else {
@@ -1391,7 +1391,7 @@ int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         new_wp->address = addr;
         new_wp->s_count = 1;
 
-        if (!g_tree_insert(dl->warm_tree, new_wp, new_wp)) {
+        if (!g_tree_insert(dl->warm_list, new_wp, new_wp)) {
             fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
             free(new_wp);
             pthread_mutex_unlock(&dl->warm_list_mutex);
@@ -1420,7 +1420,7 @@ int sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    found = g_tree_lookup(dl->warm_tree, &key);
+    found = g_tree_lookup(dl->warm_list, &key);
     if (found) {
         if (found->s_count > 0) {
             if (zero) {
@@ -1430,7 +1430,7 @@ int sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
             }
 
             if (found->s_count == 0) {
-                g_tree_remove(dl->warm_tree, &key);
+                g_tree_remove(dl->warm_list, &key);
                 dl->warm_size--;
             }
         }
