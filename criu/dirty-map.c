@@ -773,6 +773,27 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     close(fd);
 }
 
+// 定义遍历数据结构
+typedef struct {
+    struct dirty_log *dl;
+    unsigned int hit_warm;
+    unsigned int miss_warm;
+} traversal_data_t;
+
+// 遍历回调函数，用于统计hit_warm和miss_warm
+static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
+    traversal_data_t *data = (traversal_data_t *)user_data;
+    warm_page_t *wp = (warm_page_t *)value;
+
+    if (!search_dirty_map(data->dl, wp->address)) {
+        data->hit_warm++;
+    } else {
+        data->miss_warm++;
+    }
+
+    return TRUE; // 继续遍历
+}
+
 /**
  * @brief 更新dirty_log中判断温页的阈值
  *
@@ -780,31 +801,51 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
  */
 static void update_thresholds(struct dirty_log *dl) {
     struct dirty_diffmap *dirtymap = dl->diffmap;
-    warm_page_t *wl = dl->warm_list;
     unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
     float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
     int i;
 
-    if (!wl || !dirtymap) {
+    // 检查warm_list和dirtymap是否存在
+    if (!dl->warm_list || !dirtymap) {
         pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
         return;
     }
-    min_in_dirtymap = dirtymap[0].heat;
 
-    // 遍历warm_list，更新hit_warm和miss_warm
-    for (i = 0 ; i < dl->warm_size; i++) {
-        if (!search_dirty_map(dl, wl[i].address)) {
-            hit_warm++;
-        } else {
-            miss_warm++;
-        }
+    // 初始化min_in_dirtymap
+    if (dl->diffmap_size > 0) {
+        min_in_dirtymap = dirtymap[0].heat;
+    } else {
+        // 如果dirtymap为空，无法更新阈值
+        pr_info("[Obsidian0215] dirtymap is empty for %d, thresholds not updated\n", dl->pid);
+        return;
     }
+
+    // 初始化遍历数据
+    traversal_data_t data = { .dl = dl, .hit_warm = 0, .miss_warm = 0 };
+
+    // 加锁并遍历warm_list
+    pthread_mutex_lock(&dl->warm_list_mutex);
+    g_tree_foreach(dl->warm_list, count_warm_pages, &data);
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+
+    hit_warm = data.hit_warm;
+    miss_warm = data.miss_warm;
 
     // 当命中率不高于50%时(不包括空warm_list)，更新thresholds
     if (hit_warm <= miss_warm && miss_warm > 0) {
-        min_heat_threshold = 1.0 / (float)(dl->ldm_header->track_duration_ns / 1e9);
-        dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
-        dl->trend_threshold = 0.55 + 0.45 * dl->trend_threshold;
+        // 计算min_heat_threshold
+        if (dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
+            min_heat_threshold = 1.0f / ((float)dl->ldm_header->track_duration_ns / 1e9f);
+        } else {
+            min_heat_threshold = 0.0f; // 默认值或其他处理
+        }
+
+        // 更新heat_threshold
+        float new_heat_threshold = (float)hit_warm / (hit_warm + miss_warm);
+        dl->heat_threshold = fmaxf(min_heat_threshold, dl->heat_threshold * new_heat_threshold);
+
+        // 更新trend_threshold
+        dl->trend_threshold = 0.55f + 0.45f * dl->trend_threshold;
     }
 
     // 用更新的thresholds选择dirtymap的温页并更新new_warm
@@ -820,17 +861,76 @@ static void update_thresholds(struct dirty_log *dl) {
     }
 
     // 新温页过少(<32页或5%)时，适当放宽选择阈值
-    if (new_warm < 32 || new_warm < 0.054 * miss_warm) {
+    if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
         if (min_in_dirtymap > min_heat_threshold) {
             dl->heat_threshold = min_in_dirtymap;
         } else {
-            dl->trend_threshold = 0.9025 * dl->trend_threshold;
+            dl->trend_threshold = 0.9025f * dl->trend_threshold;
         }
-    } else if (new_warm >= 32 && new_warm > 0.25 * miss_warm) {
-        dl->trend_threshold = 1.06 * dl->trend_threshold;
-        dl->heat_threshold = max(min_in_dirtymap, (float)0.925 * dl->heat_threshold);
+    } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
+        dl->trend_threshold = 1.06f * dl->trend_threshold;
+        dl->heat_threshold = fmaxf(min_in_dirtymap, 0.925f * dl->heat_threshold);
     }
 }
+
+// /**
+//  * @brief 更新dirty_log中判断温页的阈值
+//  *
+//  * @param dl 进程的dirty-log结构体指针
+//  */
+// static void update_thresholds(struct dirty_log *dl) {
+//     struct dirty_diffmap *dirtymap = dl->diffmap;
+//     warm_page_t *wl = dl->warm_list;
+//     unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
+//     float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
+//     int i;
+
+//     if (!wl || !dirtymap) {
+//         pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
+//         return;
+//     }
+//     min_in_dirtymap = dirtymap[0].heat;
+
+//     // 遍历warm_list，更新hit_warm和miss_warm
+//     for (i = 0 ; i < dl->warm_size; i++) {
+//         if (!search_dirty_map(dl, wl[i].address)) {
+//             hit_warm++;
+//         } else {
+//             miss_warm++;
+//         }
+//     }
+
+//     // 当命中率不高于50%时(不包括空warm_list)，更新thresholds
+//     if (hit_warm <= miss_warm && miss_warm > 0) {
+//         min_heat_threshold = 1.0 / (float)(dl->ldm_header->track_duration_ns / 1e9);
+//         dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
+//         dl->trend_threshold = 0.55 + 0.45 * dl->trend_threshold;
+//     }
+
+//     // 用更新的thresholds选择dirtymap的温页并更新new_warm
+//     for (i = 0 ; i < dl->diffmap_size; i++) {
+//         if (dirtymap[i].heat <= dl->heat_threshold
+//          && -dirtymap[i].heat_trend > dl->trend_threshold * dirtymap[i].heat
+//          && !search_warm_list(dl, dirtymap[i].address)) {
+//             new_warm++;
+//         }
+//         if (dirtymap[i].heat < min_in_dirtymap) {
+//             min_in_dirtymap = dirtymap[i].heat;
+//         }
+//     }
+
+//     // 新温页过少(<32页或5%)时，适当放宽选择阈值
+//     if (new_warm < 32 || new_warm < 0.054 * miss_warm) {
+//         if (min_in_dirtymap > min_heat_threshold) {
+//             dl->heat_threshold = min_in_dirtymap;
+//         } else {
+//             dl->trend_threshold = 0.9025 * dl->trend_threshold;
+//         }
+//     } else if (new_warm >= 32 && new_warm > 0.25 * miss_warm) {
+//         dl->trend_threshold = 1.06 * dl->trend_threshold;
+//         dl->heat_threshold = max(min_in_dirtymap, (float)0.925 * dl->heat_threshold);
+//     }
+// }
 
 /**
  * @brief 将dirty_log的温页判断阈值写入thresholds.pid
@@ -1243,7 +1343,6 @@ void fini_dirty_map(struct pstree_item *item){
             pthread_mutex_destroy(&dl->warm_list_mutex);
             dl->warm_list = NULL;
             dl->warm_size = 0;
-            dl->warm_max = 0;
         }
 
         // 处理thresholds
