@@ -203,14 +203,15 @@ static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
     pthread_mutex_lock(&dl->warm_list_mutex);
 
     // 遍历GTree并写入文件
-    traverse_status = g_tree_foreach(dl->warm_list, write_warm_page, file);
+    g_tree_foreach(dl->warm_list, write_warm_page, file);
+    // traverse_status = g_tree_foreach(dl->warm_list, write_warm_page, file);
 
-    if (!traverse_status) {
-        fprintf(stderr, "[Obsidian0215] Error during g_tree_foreach\n");
-        fclose(file);
-        pthread_mutex_unlock(&dl->warm_list_mutex);
-        return -1;
-    }
+    // if (!traverse_status) {
+    //     fprintf(stderr, "[Obsidian0215] Error during g_tree_foreach\n");
+    //     fclose(file);
+    //     pthread_mutex_unlock(&dl->warm_list_mutex);
+    //     return -1;
+    // }
 
     if (ferror(file)) {
         perror("[Obsidian0215] fwrite");
