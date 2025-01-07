@@ -57,9 +57,9 @@ void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
 gint compare_warm_page(gconstpointer a, gconstpointer b, gpointer user_data) {
     unsigned long addr_a = *(const unsigned long *)a;
     unsigned long addr_b = *(const unsigned long *)b;
-    if (wp_a->address < wp_b->address)
+    if (addr_a < addr_b)
         return -1;
-    else if (wp_a->address > wp_b->address)
+    else if (addr_a > addr_b)
         return 1;
     else
         return 0;
@@ -1489,7 +1489,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     found_s_count = g_tree_lookup(dl->warm_list, &key_addr);
     if (found_s_count) {
         (*found_s_count)++;
-        pr_info("[Obsidian0215] Updated 0x%lx in warm_list: %d\n", addr, found_s_count);
+        pr_info("[Obsidian0215] Updated 0x%lx in warm_list: %d\n", addr, *found_s_count);
     } else {
         new_key = malloc(sizeof(unsigned long));
         if (!new_key) {
@@ -1526,7 +1526,6 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
 void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
     char *found_s_count = NULL;
     unsigned long key_addr = addr;
-    gboolean removed = FALSE;
 
     if (!dl)
         return;
