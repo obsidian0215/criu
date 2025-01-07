@@ -1083,7 +1083,6 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     printf("[Obsidian0215]Traversing warm_list:\n");
     g_tree_foreach(dl->warm_list, print_warm_page, NULL);
     printf("End of warm_list traversal.\n");
-}
 
     // 读取timestamp_list.<pid>文件，初始化timestamp_list
     ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
