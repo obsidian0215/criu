@@ -735,7 +735,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
 gboolean print_warm_page(gpointer key, gpointer value, gpointer user_data) {
     warm_page_t *wp = (warm_page_t *)key;
     if (wp) {
-        pr_info("Address: 0x%lx, s_count: %d", wp->address, wp->s_count);
+        pr_info("Address: 0x%lx, s_count: %d\n", wp->address, wp->s_count);
     } else {
         pr_perror("Invalid warm_page_t pointer.\n");
         return TRUE;
@@ -1091,9 +1091,9 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         pr_perror("[Obsidian0215]Failed to load warm_list for pid %d", pid);
         return -1;
     }
-    pr_info("[Obsidian0215]Traversing warm_list:");
+    pr_info("[Obsidian0215]Traversing warm_list:\n");
     g_tree_foreach(dl->warm_list, print_warm_page, NULL);
-    pr_info("End of warm_list traversal.");
+    pr_info("End of warm_list traversal.\n");
 
     // 读取timestamp_list.<pid>文件，初始化timestamp_list
     ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
