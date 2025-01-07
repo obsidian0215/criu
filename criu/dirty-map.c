@@ -70,7 +70,7 @@ gpointer duplicate_warm_page(gpointer key, gpointer value, gpointer user_data) {
     warm_page_t *wp = malloc(sizeof(warm_page_t));
     if (wp) {
         wp->address = ((warm_page_t *)key)->address;
-        wp->s_count = ((warm_page_t *)value)->s_count;
+        wp->s_count = ((warm_page_t *)key)->s_count;
     }
     return wp;
 }
@@ -78,7 +78,7 @@ gpointer duplicate_warm_page(gpointer key, gpointer value, gpointer user_data) {
 // 回调函数，用于遍历 GTree 并写入文件
 static gboolean write_warm_page(gpointer key, gpointer value, gpointer user_data) {
     FILE *f = (FILE *)user_data;
-    warm_page_t *wp = (warm_page_t *)value;
+    warm_page_t *wp = (warm_page_t *)key;
 
     if (fwrite(wp, sizeof(warm_page_t), 1, f) != 1) {
         perror("[Obsidian0215] fwrite");
@@ -144,7 +144,7 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
                 return -1;
             }
             memcpy(new_wp, &wp, sizeof(warm_page_t));
-            g_tree_insert(dl->warm_list, new_wp, new_wp);
+            g_tree_insert(dl->warm_list, new_wp, NULL);
             dl->warm_size++;
         }
     }
@@ -798,7 +798,7 @@ typedef struct {
 // 遍历回调函数，用于统计hit_warm和miss_warm
 static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
     traversal_data_t *data = (traversal_data_t *)user_data;
-    warm_page_t *wp = (warm_page_t *)value;
+    warm_page_t *wp = (warm_page_t *)key;
 
     if (!search_dirty_map(data->dl, wp->address)) {
         data->hit_warm++;
@@ -1052,7 +1052,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     pthread_mutex_init(&dl->warm_list_mutex, NULL);
-    dl->warm_list = g_tree_new_full(compare_warm_page, NULL, free, free);
+    dl->warm_list = g_tree_new_full(compare_warm_page, NULL, free, NULL);
     // 读取warm_list.<pid>文件，初始化warm_list
     ret = load_warm_list(dirty_map_dir, pid, dl);
     if (ret < 0) {
@@ -1463,7 +1463,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         new_wp->address = addr;
         new_wp->s_count = 1;
 
-        g_tree_insert(dl->warm_list, new_wp, new_wp);
+        g_tree_insert(dl->warm_list, new_wp, NULL);
         dl->warm_size++;
     }
 
