@@ -716,6 +716,24 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
 }
 
 /**
+ * @brief 回调函数，用于打印每个 warm_page_t 节点
+ *
+ * @param key 指向 warm_page_t 的指针
+ * @param value 此处为 NULL（根据您的 GTree 初始化方式）
+ * @param user_data 额外用户数据，此处未使用
+ * @return gboolean 返回 TRUE 以继续遍历，返回 FALSE 以停止遍历
+ */
+gboolean print_warm_page(gpointer key, gpointer value, gpointer user_data) {
+    warm_page_t *wp = (warm_page_t *)key;
+    if (wp) {
+        printf("Address: 0x%lx, s_count: %d\n", wp->address, wp->s_count);
+    } else {
+        printf("Invalid warm_page_t pointer.\n");
+    }
+    return TRUE; // 继续遍历
+}
+
+/**
  * @brief 从thresholds.pid加载dirty_log的温页判断阈值
  *        若不存在则使用预设值初始化
  * @param dl 进程的dirty-log结构体指针
@@ -1062,6 +1080,10 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         pr_perror("[Obsidian0215]Failed to load warm_list for pid %d", pid);
         return -1;
     }
+    printf("[Obsidian0215]Traversing warm_list:\n");
+    g_tree_foreach(dl->warm_list, print_warm_page, NULL);
+    printf("End of warm_list traversal.\n");
+}
 
     // 读取timestamp_list.<pid>文件，初始化timestamp_list
     ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
@@ -1434,6 +1456,12 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
     found = g_tree_lookup(dl->warm_list, &key);
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
+
+    if (found) {
+        pr_info("[Obsidian0215] Found 0x%lx in warm_list with s_count: %d\n", addr, found->s_count);
+    } else {
+        pr_info("[Obsidian0215] 0x%lx not found in warm_list\n", addr);
+    }
 
     return (found != NULL) ? 1 : 0;
 }
