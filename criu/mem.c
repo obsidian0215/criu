@@ -540,7 +540,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 				} else {	// 一般不会走该分支
 					return false;
 				}
-            } else if (dhm->heat <= dl->heat_threshold) {
+            } else if (dhm->heat <= dl->heat_threshold && dhm->heat >= dl->min_heat) {
 				// 温页，选择热度下降较快的（超过trend_threshold）
 				// 并加入温页列表
                 if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
@@ -557,6 +557,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 				// 判断是否在温页列表中，若在则删除该地址
 				if (search_warm_list(dl, vaddr)) {
 					pr_info("[Obsidian0215]0x%lx in warm list get hot\n", vaddr);
+					// inc_warm_list(dl, vaddr);
 					// sub_warm_list(dl, vaddr, false);
 				}
                 return false;
