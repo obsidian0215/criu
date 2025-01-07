@@ -1368,13 +1368,13 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @param addr 要插入的线性地址
  * @return void
  */
-int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
+void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     warm_page_t key = { .address = addr, .s_count = 0 };
     warm_page_t *found = NULL;
     warm_page_t *new_wp = NULL;
 
     if (!dl)
-        return -1;
+        return;
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
@@ -1401,7 +1401,6 @@ int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     }
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
-    return 0;
 }
 
 /**
@@ -1411,12 +1410,12 @@ int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @param addr 要操作的线性地址
  * @return void
  */
-int sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
+void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
     warm_page_t key = { .address = addr, .s_count = 0 };
     warm_page_t *found = NULL;
 
     if (!dl)
-        return -1;
+        return;
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
@@ -1437,7 +1436,6 @@ int sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
     }
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
-    return 0;
 }
 
 // /**
