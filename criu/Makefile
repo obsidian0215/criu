@@ -50,7 +50,7 @@ GLIB_LIBS := $(shell pkg-config --libs glib-2.0)
 CFLAGS += $(GLIB_CFLAGS)
 
 # 全局链接标志
-LIBS += $(GLIB_LIBS)
+LIBS += $(GLIB_LIBS) -lm
 
 #
 # Architecture dependent part.
