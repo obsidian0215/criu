@@ -42,6 +42,16 @@ include $(__nmk_dir)msg.mk
 # Needed libraries checks
 include criu/Makefile.packages
 
+# 使用 pkg-config 获取 glib-2.0 的编译和链接标志
+GLIB_CFLAGS := $(shell pkg-config --cflags glib-2.0)
+GLIB_LIBS := $(shell pkg-config --libs glib-2.0)
+
+# 全局编译标志
+CFLAGS += $(GLIB_CFLAGS)
+
+# 全局链接标志
+LIBS += $(GLIB_LIBS)
+
 #
 # Architecture dependent part.
 ARCH-LIB		:= $(ARCH_DIR)/crtools.built-in.o

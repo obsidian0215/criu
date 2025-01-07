@@ -51,125 +51,285 @@ void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
         qsort(dm, size, sizeof(struct dirty_map), compare_dirty_map);
 }
 
+
+// 比较函数，用于GTree排序
+gint compare_warm_page(gconstpointer a, gconstpointer b, gpointer user_data) {
+    const warm_page_t *wp_a = a;
+    const warm_page_t *wp_b = b;
+    if (wp_a->address < wp_b->address)
+        return -1;
+    else if (wp_a->address > wp_b->address)
+        return 1;
+    else
+        return 0;
+}
+
+// 插入函数，用于GTree的key和value
+gpointer duplicate_warm_page(gpointer key, gpointer value, gpointer user_data) {
+    warm_page_t *wp = malloc(sizeof(warm_page_t));
+    if (wp) {
+        wp->address = ((warm_page_t *)key)->address;
+        wp->s_count = ((warm_page_t *)value)->s_count;
+    }
+    return wp;
+}
+
 /**
- * @brief 从warm.pid文件中读取warm_list
+ * @brief 从warm.pid文件中读取warm_list到GTree
  *
  * @param dirty_map_dir dirty_map目录的路径
  * @param pid 进程pid
- * @param warm_list 指向存储warm_list的指针
- * @param warm_size 指针，存储warm_list的大小
+ * @param dl 指向存储warm_list的dirty_log结构体
  * @return int 成功返回0，失败返回-1并设置errno。
  */
 static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
     char warm_list_filepath[PATH_MAX];
-    void *mapped = NULL;
-    unsigned long current_count, required_size;
-    int fd;
-    struct stat st;
+    FILE *file = NULL;
+    warm_page_t wp;
+    int ret;
 
     if (!dl) {
-        pr_perror("[Obsidian0215]Invalid dl pointer");
+        fprintf(stderr, "[Obsidian0215] Invalid dl pointer\n");
+        errno = EINVAL;
         return -1;
     }
 
-    snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
-    warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-    // 打开文件，不存在时创建一个文件
-    fd = open(warm_list_filepath, O_RDWR | O_CREAT, 0666);
-    if (fd == -1) {
-        pr_perror("[Obsidian0215]open %s", warm_list_filepath);
+    // 构造文件路径
+    ret = snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
+    if (ret < 0 || ret >= sizeof(warm_list_filepath)) {
+        fprintf(stderr, "[Obsidian0215] Error constructing warm list file path\n");
+        errno = EINVAL;
         return -1;
     }
 
-    // 获取文件大小
-    if (fstat(fd, &st) == -1) {
-        pr_perror("[Obsidian0215]fstat");
-        close(fd);
+    // 打开文件，不存在时创建一个空文件
+    file = fopen(warm_list_filepath, "rb");
+    if (!file) {
+        if (errno == ENOENT) {
+            // 文件不存在，初始化空的GTree
+            return 0;
+        } else {
+            perror("[Obsidian0215] fopen");
+            return -1;
+        }
+    }
+
+    // 加锁
+    pthread_mutex_lock(&dl->warm_list_mutex);
+
+    // 读取文件中的warm_page_t记录并插入到GTree
+    while (fread(&wp, sizeof(warm_page_t), 1, file) == 1) {
+        warm_page_t *existing = g_tree_lookup(dl->warm_tree, &wp);
+        if (existing) {
+            existing->s_count += wp.s_count;
+        } else {
+            warm_page_t *new_wp = malloc(sizeof(warm_page_t));
+            if (!new_wp) {
+                perror("[Obsidian0215] malloc");
+                fclose(file);
+                pthread_mutex_unlock(&dl->warm_list_mutex);
+                return -1;
+            }
+            memcpy(new_wp, &wp, sizeof(warm_page_t));
+            g_tree_insert(dl->warm_tree, new_wp, new_wp);
+            dl->warm_size++;
+        }
+    }
+
+    if (ferror(file)) {
+        perror("[Obsidian0215] fread");
+        fclose(file);
+        pthread_mutex_unlock(&dl->warm_list_mutex);
         return -1;
     }
 
-    // 如果文件大小不是整数倍的sizeof(unsigned long)，修正
-    if (st.st_size % sizeof(unsigned long) != 0) {
-        pr_perror("[Obsidian0215]Invalid warm_list file size");
-        close(fd);
-        return -1;
-    }
-
-    current_count = st.st_size / sizeof(warm_page_t);
-    dl->warm_size = current_count;
-
-    // 需要映射的总大小为(current_count+EXPAND_WARM_BATCH)个unsigned long
-    // 增加32是用于减小warm_list的扩展次数
-    required_size = (current_count + EXPAND_WARM_BATCH) * sizeof(warm_page_t);
-
-    // 映射文件到内存
-    mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapped == MAP_FAILED) {
-        perror("mmap");
-        close(fd);
-        return -1;
-    }
-    close(fd);
-
-    dl->warm_list = (warm_page_t *)mapped;
-    dl->warm_max = current_count + EXPAND_WARM_BATCH;
+    fclose(file);
+    pthread_mutex_unlock(&dl->warm_list_mutex);
 
     return 0;
 }
 
 /**
- * @brief 将warm_list更新到对应的文件中
+ * @brief 将warm_list保存到warm.pid文件中
  *
- * @param dl 进程dirty-log实例的指针
- * @return int 成功返回0，失败返回-1并设置errno
+ * @param dirty_map_dir dirty_map目录的路径
+ * @param pid 进程pid
+ * @param dl 指向存储warm_list的dirty_log结构体
+ * @return int 成功返回0，失败返回-1并设置errno。
  */
 static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
     char warm_list_filepath[PATH_MAX];
-    unsigned long warm_size;
-    int fd;
-    struct stat st;
+    pid_t pid;
+    FILE *file = NULL;
+    int ret = 0;
 
     if (!dl) {
-        pr_perror("[Obsidian0215]Invalid dl pointer");
+        fprintf(stderr, "[Obsidian0215] Invalid dl pointer\n");
+        errno = EINVAL;
         return -1;
     }
-    snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
-    warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-    // 打开文件
-    fd = open(warm_list_filepath, O_RDWR, 0666);
-    if (fd == -1) {
-        pr_perror("[Obsidian0215]open %s", warm_list_filepath);
+
+    pid = dl->pid;
+    // 构造文件路径
+    ret = snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
+    if (ret < 0 || ret >= sizeof(warm_list_filepath)) {
+        fprintf(stderr, "[Obsidian0215] Error constructing warm list file path\n");
+        errno = EINVAL;
         return -1;
     }
-    // 获取文件大小
-    if (fstat(fd, &st) == -1) {
-        pr_perror("[Obsidian0215]fstat");
-        close(fd);
+
+    // 打开文件用于写入（覆盖）
+    file = fopen(warm_list_filepath, "wb");
+    if (!file) {
+        perror("[Obsidian0215] fopen");
         return -1;
     }
-    warm_size = dl->warm_size * sizeof(unsigned long);
-    // 若当前文件大小不足以容纳warm_list，则扩展文件
-    if (st.st_size < warm_size) {
-        if (ftruncate(fd, warm_size) == -1) {
-            pr_perror("[Obsidian0215]ftruncate");
-            close(fd);
-            return -1;
+
+    // 加锁
+    pthread_mutex_lock(&dl->warm_list_mutex);
+
+    // 遍历GTree并写入文件
+    g_tree_foreach(dl->warm_tree, (GTraverseFunc) [](gpointer key, gpointer value, gpointer user_data) -> gboolean {
+        FILE *f = (FILE *)user_data;
+        if (fwrite(value, sizeof(warm_page_t), 1, f) != 1) {
+            perror("[Obsidian0215] fwrite");
+            return FALSE;  // 停止遍历
         }
-    }
+        return TRUE;  // 继续遍历
+    }, file);
 
-    // 同步更改到文件
-    if (msync(dl->warm_list, warm_size, MS_SYNC) == -1) {
-        perror("[Obsidian0215]msync");
+    if (ferror(file)) {
+        perror("[Obsidian0215] fwrite");
+        fclose(file);
+        pthread_mutex_unlock(&dl->warm_list_mutex);
         return -1;
     }
 
-    // 解除映射
-    if (munmap(dl->warm_list, dl->warm_max * sizeof(unsigned long)) == -1) {
-        pr_perror("[Obsidian0215]Error unmapping warm_list");
-        return -1;
-    }
+    fclose(file);
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+
     return 0;
 }
+
+// /**
+//  * @brief 从warm.pid文件中读取warm_list
+//  *
+//  * @param dirty_map_dir dirty_map目录的路径
+//  * @param pid 进程pid
+//  * @param warm_list 指向存储warm_list的指针
+//  * @param warm_size 指针，存储warm_list的大小
+//  * @return int 成功返回0，失败返回-1并设置errno。
+//  */
+// static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
+//     char warm_list_filepath[PATH_MAX];
+//     void *mapped = NULL;
+//     unsigned long current_count, required_size;
+//     int fd;
+//     struct stat st;
+
+//     if (!dl) {
+//         pr_perror("[Obsidian0215]Invalid dl pointer");
+//         return -1;
+//     }
+
+//     snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
+//     warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
+//     // 打开文件，不存在时创建一个文件
+//     fd = open(warm_list_filepath, O_RDWR | O_CREAT, 0666);
+//     if (fd == -1) {
+//         pr_perror("[Obsidian0215]open %s", warm_list_filepath);
+//         return -1;
+//     }
+
+//     // 获取文件大小
+//     if (fstat(fd, &st) == -1) {
+//         pr_perror("[Obsidian0215]fstat");
+//         close(fd);
+//         return -1;
+//     }
+
+//     // 如果文件大小不是整数倍的sizeof(unsigned long)，修正
+//     if (st.st_size % sizeof(unsigned long) != 0) {
+//         pr_perror("[Obsidian0215]Invalid warm_list file size");
+//         close(fd);
+//         return -1;
+//     }
+
+//     current_count = st.st_size / sizeof(warm_page_t);
+//     dl->warm_size = current_count;
+
+//     // 需要映射的总大小为(current_count+EXPAND_WARM_BATCH)个unsigned long
+//     // 增加32是用于减小warm_list的扩展次数
+//     required_size = (current_count + EXPAND_WARM_BATCH) * sizeof(warm_page_t);
+
+//     // 映射文件到内存
+//     mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+//     if (mapped == MAP_FAILED) {
+//         perror("mmap");
+//         close(fd);
+//         return -1;
+//     }
+//     close(fd);
+
+//     dl->warm_list = (warm_page_t *)mapped;
+//     dl->warm_max = current_count + EXPAND_WARM_BATCH;
+
+//     return 0;
+// }
+
+// /**
+//  * @brief 将warm_list更新到对应的文件中
+//  *
+//  * @param dl 进程dirty-log实例的指针
+//  * @return int 成功返回0，失败返回-1并设置errno
+//  */
+// static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
+//     char warm_list_filepath[PATH_MAX];
+//     unsigned long warm_size;
+//     int fd;
+//     struct stat st;
+
+//     if (!dl) {
+//         pr_perror("[Obsidian0215]Invalid dl pointer");
+//         return -1;
+//     }
+//     snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
+//     warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
+//     // 打开文件
+//     fd = open(warm_list_filepath, O_RDWR, 0666);
+//     if (fd == -1) {
+//         pr_perror("[Obsidian0215]open %s", warm_list_filepath);
+//         return -1;
+//     }
+//     // 获取文件大小
+//     if (fstat(fd, &st) == -1) {
+//         pr_perror("[Obsidian0215]fstat");
+//         close(fd);
+//         return -1;
+//     }
+//     warm_size = dl->warm_size * sizeof(unsigned long);
+//     // 若当前文件大小不足以容纳warm_list，则扩展文件
+//     if (st.st_size < warm_size) {
+//         if (ftruncate(fd, warm_size) == -1) {
+//             pr_perror("[Obsidian0215]ftruncate");
+//             close(fd);
+//             return -1;
+//         }
+//     }
+
+//     // 同步更改到文件
+//     if (msync(dl->warm_list, warm_size, MS_SYNC) == -1) {
+//         perror("[Obsidian0215]msync");
+//         return -1;
+//     }
+
+//     // 解除映射
+//     if (munmap(dl->warm_list, dl->warm_max * sizeof(unsigned long)) == -1) {
+//         pr_perror("[Obsidian0215]Error unmapping warm_list");
+//         return -1;
+//     }
+//     return 0;
+// }
 
 /**
  * @brief 从timestamp_list.pid文件中读取timestamp_list
@@ -775,6 +935,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
 
+    pthread_mutex_init(&dl->warm_list_mutex, NULL);
+    dl->warm_tree = g_tree_new_full(compare_warm_page, NULL, free, free);
     // 读取warm_list.<pid>文件，初始化warm_list
     ret = load_warm_list(dirty_map_dir, pid, dl);
     if (ret < 0) {
@@ -1077,6 +1239,8 @@ void fini_dirty_map(struct pstree_item *item){
             if (write_warm_list(dl, opts.dirty_map_dir)) {
                 pr_perror("[Obsidian0215]Error updating warm_list to file");
             }
+            g_tree_destroy(dl->warm_list);
+            pthread_mutex_destroy(&dl->warm_list_mutex);
             dl->warm_list = NULL;
             dl->warm_size = 0;
             dl->warm_max = 0;
@@ -1132,6 +1296,49 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 }
 
 /**
+ * @brief 在warm_tree中插入或更新一个地址
+ *
+ * @param dl 指向存储warm_list的dirty_log结构体
+ * @param addr 要插入或更新的地址
+ * @return int 成功返回0，失败返回-1并设置errno。
+ */
+static int inc_warm_tree(struct dirty_log *dl, unsigned long addr) {
+    warm_page_t key = { .address = addr, .s_count = 0 };
+    warm_page_t *existing = NULL;
+
+    if (!dl || !dl->warm_tree) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&dl->warm_list_mutex);
+
+    existing = g_tree_lookup(dl->warm_tree, &key);
+    if (existing) {
+        existing->s_count++;
+    } else {
+        warm_page_t *new_wp = malloc(sizeof(warm_page_t));
+        if (!new_wp) {
+            perror("[Obsidian0215] malloc failed");
+            pthread_mutex_unlock(&dl->warm_list_mutex);
+            return -1;
+        }
+        new_wp->address = addr;
+        new_wp->s_count = 1;
+        if (!g_tree_insert(dl->warm_tree, new_wp, new_wp)) {
+            fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
+            free(new_wp);
+            pthread_mutex_unlock(&dl->warm_list_mutex);
+            return -1;
+        }
+        dl->warm_size++;
+    }
+
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+    return 0;
+}
+
+/**
  * @brief 查找warm_list中包含指定address
  *
  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
@@ -1139,35 +1346,19 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
  * @return int 找到则返回1，如果未找到则返回0
  */
 int search_warm_list(struct dirty_log *dl, unsigned long addr) {
-    unsigned long left = 0, right = 0;
-    warm_page_t *cd_list;
+    warm_page_t key = { .address = addr, .s_count = 0 };
+    warm_page_t *found = NULL;
 
-    // warm_list为空，无法找到该地址
     if (!dl)
         return 0;
-    else {
-        cd_list = dl->warm_list;
-        right = dl->warm_size;
-        if (!cd_list || !right)
-            return 0;
-    }
 
-    while (left < right) {
-        unsigned long mid = left + (right - left) / 2;
+    pthread_mutex_lock(&dl->warm_list_mutex);
 
-        if (addr < cd_list[mid].address) {
-            // 地址在当前范围左侧，缩小右边界
-            right = mid;
-        } else if (addr > cd_list[mid].address) {
-            // 地址在当前范围右侧，缩小左边界
-            left = mid + 1;
-        } else {
-            // 找到该地址
-            return 1;
-        }
-    }
-    // 未找到该地址
-    return 0;
+    found = g_tree_lookup(dl->warm_tree, &key);
+
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+
+    return (found != NULL) ? 1 : 0;
 }
 
 /**
@@ -1177,99 +1368,40 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @param addr 要插入的线性地址
  * @return void
  */
-void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
-    char warm_list_filepath[PATH_MAX];
-    unsigned long mid, left = 0, right, new_max, new_size;
-    void *new_map;
-    int fd;
+int inc_warm_list(struct dirty_log *dl, unsigned long addr) {
+    warm_page_t key = { .address = addr, .s_count = 0 };
+    warm_page_t *found = NULL;
+    warm_page_t *new_wp = NULL;
 
-    if (!dl || !dl->warm_list)
-        return;
+    if (!dl)
+        return -1;
 
-    right = dl->warm_size;
-    // 二分查找插入位置
-    while (left < right) {
-        mid = left + (right - left) / 2;
-        if (dl->warm_list[mid].address < addr)
-            left = mid + 1;
-        else
-            right = mid;
-    }
+    pthread_mutex_lock(&dl->warm_list_mutex);
 
-    // 检查地址是否已存在, 如果存在则直接增加记录，无需插入
-    if (left < dl->warm_size && dl->warm_list[left].address == addr) {
-        dl->warm_list[left].s_count++;
-        return;
-    }
-
-    // 检查是否需要扩展
-    if (dl->warm_size >= dl->warm_max) {
-        new_max = dl->warm_max + EXPAND_WARM_BATCH;
-        new_size = new_max * sizeof(warm_page_t);
-
-        snprintf(warm_list_filepath, sizeof(warm_list_filepath),
-             "%s/%s.%d", opts.dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
-        warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-         // 扩展文件大小以匹配新的映射范围
-        fd = open(warm_list_filepath, O_RDWR);
-        if (fd == -1) {
-            perror("[Obsidian0215]Error opening warm list file");
-            return;
-        }
-        if (ftruncate(fd, new_size) == -1) {
-            perror("[Obsidian0215]ftruncate");
-            close(fd);
-            return;
-        }
-        close(fd);
-
-        // 重新映射文件
-        new_map = mremap(dl->warm_list, dl->warm_max * sizeof(warm_page_t), new_size, MREMAP_MAYMOVE);
-        if (new_map == MAP_FAILED) {
-            perror("[Obsidian0215]mremap");
-            return;
-        }
-
-        dl->warm_list = (warm_page_t *)new_map;
-        dl->warm_max = new_max;
-    }
-
-    // 如果插入位置是末尾，直接赋值无需移动
-    if (left == dl->warm_size) {
-        dl->warm_list[left].address = addr;
-        dl->warm_list[left].s_count = 1;
-        dl->warm_size++;
+    found = g_tree_lookup(dl->warm_tree, &key);
+    if (found) {
+        found->s_count++;
     } else {
-        // 移动元素以腾出插入位置
-        memmove(&dl->warm_list[left + 1], &dl->warm_list[left],
-                (dl->warm_size - left) * sizeof(warm_page_t));
-        dl->warm_list[left].address = addr;
-        dl->warm_list[left].s_count = 1;
+        new_wp = malloc(sizeof(warm_page_t));
+        if (!new_wp) {
+            perror("[Obsidian0215] malloc failed");
+            pthread_mutex_unlock(&dl->warm_list_mutex);
+            return -1;
+        }
+        new_wp->address = addr;
+        new_wp->s_count = 1;
+
+        if (!g_tree_insert(dl->warm_tree, new_wp, new_wp)) {
+            fprintf(stderr, "[Obsidian0215] g_tree_insert failed\n");
+            free(new_wp);
+            pthread_mutex_unlock(&dl->warm_list_mutex);
+            return -1;
+        }
         dl->warm_size++;
     }
-}
 
-/**
- * @brief 将指定address从warm_list中删除，并保持warm_list升序
- *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
- * @param addr 要删除的线性地址
- * @return void
- */
-static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
-
-    if (!dl || !dl->warm_list || index >= dl->warm_size)
-        return;
-
-    // 删除的是最后一个元素，直接减少大小
-    if (index == dl->warm_size - 1) {
-        dl->warm_size--;
-    } else {
-        // 移动元素以覆盖删除的位置
-        memmove(&dl->warm_list[index], &dl->warm_list[index + 1],
-                (dl->warm_size - index - 1) * sizeof(warm_page_t));
-        dl->warm_size--;
-    }
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+    return 0;
 }
 
 /**
@@ -1279,38 +1411,219 @@ static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
  * @param addr 要操作的线性地址
  * @return void
  */
-void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
-    unsigned long mid, left = 0, right;
+int sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
+    warm_page_t key = { .address = addr, .s_count = 0 };
+    warm_page_t *found = NULL;
 
-    if (!dl || !dl->warm_list)
-        return;
+    if (!dl)
+        return -1;
 
-    right = dl->warm_size;
+    pthread_mutex_lock(&dl->warm_list_mutex);
 
-    // 二分查找目标地址
-    while (left < right) {
-        mid = left + (right - left) / 2;
-        if (dl->warm_list[mid].address < addr)
-            left = mid + 1;
-        else
-            right = mid;
+    found = g_tree_lookup(dl->warm_tree, &key);
+    if (found) {
+        if (found->s_count > 0) {
+            if (zero) {
+                found->s_count = 0;
+            } else {
+                found->s_count--;
+            }
+
+            if (found->s_count == 0) {
+                g_tree_remove(dl->warm_tree, &key);
+                dl->warm_size--;
+            }
+        }
     }
 
-    // 检查是否找到地址
-    if (left >= dl->warm_size || dl->warm_list[left].address != addr)
-        return;
-
-    if (dl->warm_list[left].s_count > 0) {
-        if (zero) {
-            dl->warm_list[left].s_count = 0;
-        } else {
-            dl->warm_list[left].s_count--;
-        }
-        if (dl->warm_list[left].s_count == 0) {
-            del_in_warm_list(dl, addr);
-        }
-    } else {
-        // s_count为0，删除该元素
-        del_in_warm_list(dl, addr);
-    }
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+    return 0;
 }
+
+// /**
+//  * @brief 查找warm_list中包含指定address
+//  *
+//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
+//  * @param addr 要查找的线性地址
+//  * @return int 找到则返回1，如果未找到则返回0
+//  */
+// int search_warm_list(struct dirty_log *dl, unsigned long addr) {
+//     unsigned long left = 0, right = 0;
+//     warm_page_t *cd_list;
+
+//     // warm_list为空，无法找到该地址
+//     if (!dl)
+//         return 0;
+//     else {
+//         cd_list = dl->warm_list;
+//         right = dl->warm_size;
+//         if (!cd_list || !right)
+//             return 0;
+//     }
+
+//     while (left < right) {
+//         unsigned long mid = left + (right - left) / 2;
+
+//         if (addr < cd_list[mid].address) {
+//             // 地址在当前范围左侧，缩小右边界
+//             right = mid;
+//         } else if (addr > cd_list[mid].address) {
+//             // 地址在当前范围右侧，缩小左边界
+//             left = mid + 1;
+//         } else {
+//             // 找到该地址
+//             return 1;
+//         }
+//     }
+//     // 未找到该地址
+//     return 0;
+// }
+
+// /**
+//  * @brief 将指定address插入warm_list中，并保持warm_list升序
+//  *
+//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
+//  * @param addr 要插入的线性地址
+//  * @return void
+//  */
+// void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
+//     char warm_list_filepath[PATH_MAX];
+//     unsigned long mid, left = 0, right, new_max, new_size;
+//     void *new_map;
+//     int fd;
+
+//     if (!dl || !dl->warm_list)
+//         return;
+
+//     right = dl->warm_size;
+//     // 二分查找插入位置
+//     while (left < right) {
+//         mid = left + (right - left) / 2;
+//         if (dl->warm_list[mid].address < addr)
+//             left = mid + 1;
+//         else
+//             right = mid;
+//     }
+
+//     // 检查地址是否已存在, 如果存在则直接增加记录，无需插入
+//     if (left < dl->warm_size && dl->warm_list[left].address == addr) {
+//         dl->warm_list[left].s_count++;
+//         return;
+//     }
+
+//     // 检查是否需要扩展
+//     if (dl->warm_size >= dl->warm_max) {
+//         pr_info("[Obsidian0215] need expand warm_list");
+//         new_max = dl->warm_max + EXPAND_WARM_BATCH;
+//         if (new_max > dl->diffmap_size) {
+//             new_max = dl->diffmap_size;
+//         }
+//         new_size = new_max * sizeof(warm_page_t);
+
+//         snprintf(warm_list_filepath, sizeof(warm_list_filepath),
+//              "%s/%s.%d", opts.dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
+//         warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
+//          // 扩展文件大小以匹配新的映射范围
+//         fd = open(warm_list_filepath, O_RDWR);
+//         if (fd == -1) {
+//             perror("[Obsidian0215]Error opening warm list file");
+//             return;
+//         }
+//         if (ftruncate(fd, new_size) == -1) {
+//             perror("[Obsidian0215]ftruncate");
+//             close(fd);
+//             return;
+//         }
+//         close(fd);
+
+//         // 重新映射文件
+//         new_map = mremap(dl->warm_list, dl->warm_max * sizeof(warm_page_t), new_size, MREMAP_MAYMOVE);
+//         if (new_map == MAP_FAILED) {
+//             perror("[Obsidian0215]mremap");
+//             return;
+//         }
+
+//         dl->warm_list = (warm_page_t *)new_map;
+//         dl->warm_max = new_max;
+//     }
+
+//     // 如果插入位置是末尾，直接赋值无需移动
+//     if (left == dl->warm_size) {
+//         dl->warm_list[left].address = addr;
+//         dl->warm_list[left].s_count = 1;
+//         dl->warm_size++;
+//     } else {
+//         // 移动元素以腾出插入位置
+//         memmove(&dl->warm_list[left + 1], &dl->warm_list[left],
+//                 (dl->warm_size - left) * sizeof(warm_page_t));
+//         dl->warm_list[left].address = addr;
+//         dl->warm_list[left].s_count = 1;
+//         dl->warm_size++;
+//     }
+// }
+
+// /**
+//  * @brief 将指定address从warm_list中删除，并保持warm_list升序
+//  *
+//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
+//  * @param addr 要删除的线性地址
+//  * @return void
+//  */
+// static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
+
+//     if (!dl || !dl->warm_list || index >= dl->warm_size)
+//         return;
+
+//     // 删除的是最后一个元素，直接减少大小
+//     if (index == dl->warm_size - 1) {
+//         dl->warm_size--;
+//     } else {
+//         // 移动元素以覆盖删除的位置
+//         memmove(&dl->warm_list[index], &dl->warm_list[index + 1],
+//                 (dl->warm_size - index - 1) * sizeof(warm_page_t));
+//         dl->warm_size--;
+//     }
+// }
+
+// /**
+//  * @brief 将warm_list中指定address的s_count减1，若为0则删除保持warm_list升序
+//  *
+//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
+//  * @param addr 要操作的线性地址
+//  * @return void
+//  */
+// void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
+//     unsigned long mid, left = 0, right;
+
+//     if (!dl || !dl->warm_list)
+//         return;
+
+//     right = dl->warm_size;
+
+//     // 二分查找目标地址
+//     while (left < right) {
+//         mid = left + (right - left) / 2;
+//         if (dl->warm_list[mid].address < addr)
+//             left = mid + 1;
+//         else
+//             right = mid;
+//     }
+
+//     // 检查是否找到地址
+//     if (left >= dl->warm_size || dl->warm_list[left].address != addr)
+//         return;
+
+//     if (dl->warm_list[left].s_count > 0) {
+//         if (zero) {
+//             dl->warm_list[left].s_count = 0;
+//         } else {
+//             dl->warm_list[left].s_count--;
+//         }
+//         if (dl->warm_list[left].s_count == 0) {
+//             del_in_warm_list(dl, addr);
+//         }
+//     } else {
+//         // s_count为0，删除该元素
+//         del_in_warm_list(dl, addr);
+//     }
+// }

@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <endian.h> // 用于字节序转换
+#include <glib.h>
+#include <pthread.h>
 #include "int.h"
 #include "pid.h"
 #include "page.h"
@@ -78,9 +80,10 @@ struct dirty_log {
     };
 
     // list for addresses of warm pages in pre-dump
-    warm_page_t *warm_list;
+    pthread_mutex_t warm_list_mutex;  // 互斥锁保护warm_list及相关字段
+    // warm_page_t *warm_list;
+    GTree *warm_list;
     unsigned long warm_size;
-    unsigned long warm_max;
 
     // thresholds for warm page selection
     float heat_threshold;
@@ -102,7 +105,6 @@ struct dirty_log {
     (log).diffmap_size = 0; \
     (log).warm_list = NULL; \
     (log).warm_size = 0; \
-    (log).warm_max = 0; \
     (log).ldm_header = NULL; \
     (log).lldm_header = NULL; \
 } while (0)
@@ -122,7 +124,6 @@ struct dirty_log {
     (log_ptr)->diffmap_size = 0; \
     (log_ptr)->warm_list = NULL; \
     (log_ptr)->warm_size = 0; \
-    (log_ptr)->warm_max = 0; \
     (log_ptr)->ldm_header = NULL; \
     (log_ptr)->lldm_header = NULL; \
 } while (0)
