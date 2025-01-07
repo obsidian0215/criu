@@ -82,9 +82,9 @@ static gboolean write_warm_page(gpointer key, gpointer value, gpointer user_data
 
     if (fwrite(wp, sizeof(warm_page_t), 1, f) != 1) {
         perror("[Obsidian0215] fwrite");
-        return FALSE;  // 停止遍历
+        return TRUE;  // 停止遍历
     }
-    return TRUE;  // 继续遍历
+    return FALSE;  // 继续遍历
 }
 
 /**
@@ -1453,6 +1453,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
     found = g_tree_lookup(dl->warm_list, &key);
     if (found) {
         found->s_count++;
+        pr_info("[Obsidian0215] Updated 0x%lx in warm_list: %d\n", addr, found->s_count);
     } else {
         new_wp = malloc(sizeof(warm_page_t));
         if (!new_wp) {
@@ -1464,6 +1465,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         new_wp->s_count = 1;
 
         g_tree_insert(dl->warm_list, new_wp, NULL);
+        pr_info("[Obsidian0215] Inserted 0x%lx to warm_list\n", addr);
         dl->warm_size++;
     }
 
