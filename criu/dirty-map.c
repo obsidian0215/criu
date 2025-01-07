@@ -710,7 +710,7 @@ static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diff
 
     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
 	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#lx, heat level: %f, heat trend: %f\n",
+		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
             diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
 	}
 }
@@ -1231,6 +1231,8 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 加载上次的阈值并更新
     load_thresholds(dl, dirty_map_dir);
     update_thresholds(dl);
+
+    pr_debug("[Obsidian] threshold: %f, %f\n", dl->heat_threshold, dl->trend_threshold);
     return 0;
 }
 
