@@ -546,6 +546,8 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
                 if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
 					if (!search_warm_list(dl, vaddr))
 						pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
+					else
+						pr_info("[Obsidian0215]update 0x%lx to warm list\n", vaddr);
 					inc_warm_list(dl, vaddr);
                     return true;
                 } else
