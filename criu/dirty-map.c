@@ -730,7 +730,7 @@ gboolean print_warm_page(gpointer key, gpointer value, gpointer user_data) {
     } else {
         printf("Invalid warm_page_t pointer.\n");
     }
-    return TRUE; // 继续遍历
+    return FALSE; // 继续遍历
 }
 
 /**
@@ -827,7 +827,7 @@ static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_dat
         data->miss_warm++;
     }
 
-    return TRUE; // 继续遍历
+    return FALSE; // 继续遍历
 }
 
 /**
