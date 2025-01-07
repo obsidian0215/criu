@@ -864,7 +864,7 @@ static void update_thresholds(struct dirty_log *dl) {
         dl->heat_threshold = fmaxf(min_heat_threshold, dl->heat_threshold * new_heat_threshold);
 
         // 更新trend_threshold
-        dl->trend_threshold = 0.55f + 0.45f * dl->trend_threshold;
+        dl->trend_threshold = 0.35f + 0.65f * dl->trend_threshold;
     }
 
     // 用更新的thresholds选择dirtymap的温页并更新new_warm
@@ -882,13 +882,13 @@ static void update_thresholds(struct dirty_log *dl) {
     // 新温页过少(<32页或5%)时，适当放宽选择阈值
     if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
         if (min_in_dirtymap > min_heat_threshold) {
-            dl->heat_threshold = min_in_dirtymap;
+            dl->heat_threshold = 1.25 * min_in_dirtymap;
         } else {
-            dl->trend_threshold = 0.9025f * dl->trend_threshold;
+            dl->trend_threshold = 0.85f * dl->trend_threshold;
         }
     } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
-        dl->trend_threshold = 1.06f * dl->trend_threshold;
-        dl->heat_threshold = fmaxf(min_in_dirtymap, 0.925f * dl->heat_threshold);
+        dl->trend_threshold = 1.15f * dl->trend_threshold;
+        dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold);
     }
 }
 
