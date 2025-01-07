@@ -88,6 +88,7 @@ struct dirty_log {
     // thresholds for warm page selection
     float heat_threshold;
     float trend_threshold;
+    float min_heat;
 };
 
 #define INIT_DIRTY_LOG(log) do { \
