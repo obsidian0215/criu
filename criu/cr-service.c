@@ -406,7 +406,15 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.use_dirty_map = true;
 		// opts.dirty_map_dir = dirty_map_dir_path;
 		// SET_CHAR_OPTS(dirty_map_dir, req->dirty_map_dir);
-		pr_info("[Obsidian0215]Use dirty_map in dir %s\n", opts.dirty_map_dir);
+		pr_info("[Obsidian0215]Use dirty_map in dir=%s\n", opts.dirty_map_dir);
+	}
+
+	/*
+	 * enable compression
+	 */
+	if (req->compress) {
+		opts.compress = true;
+		pr_info("[Obsidian0215]Enable compression for page-xfer\n");
 	}
 
 	if (req->parent_img)

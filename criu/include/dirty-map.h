@@ -11,6 +11,7 @@
 #include "pid.h"
 #include "page.h"
 #include "pagemap-cache.h"
+#include "dirty_cache.h"  // 引入脏页缓存
 
 // dirty-track LKM definitions
 #define DIRTY_TRACK_MAGIC 'd'
@@ -89,6 +90,10 @@ struct dirty_log {
     float heat_threshold;
     float trend_threshold;
     float min_heat;
+
+    // 脏页缓存 - 每个进程独享
+    dirty_cache_t *page_cache;       // 页面缓存实例
+    bool cache_enabled;              // 缓存启用状态
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -108,6 +113,8 @@ struct dirty_log {
     (log).warm_size = 0; \
     (log).ldm_header = NULL; \
     (log).lldm_header = NULL; \
+    (log).page_cache = NULL; \
+    (log).cache_enabled = false; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -127,6 +134,8 @@ struct dirty_log {
     (log_ptr)->warm_size = 0; \
     (log_ptr)->ldm_header = NULL; \
     (log_ptr)->lldm_header = NULL; \
+    (log_ptr)->page_cache = NULL; \
+    (log_ptr)->cache_enabled = false; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
@@ -139,5 +148,12 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
 int search_warm_list(struct dirty_log *dl, unsigned long addr);
 void inc_warm_list(struct dirty_log *dl, unsigned long addr);
 void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero);
+
+/* 脏页缓存集成API - 每个进程独享 */
+int init_dirty_cache(struct dirty_log *dl, const char *cache_dir);
+void fini_dirty_cache(struct dirty_log *dl);
+int dirty_cache_lookup_page(struct dirty_log *dl, unsigned long vaddr, void *page_out);
+void dirty_cache_update_page(struct dirty_log *dl, unsigned long vaddr, const void *page_data);
+bool is_dirty_cache_enabled(struct dirty_log *dl);
 
 #endif

@@ -89,6 +89,7 @@
 #include "timer.h"
 #include "sigact.h"
 #include "dirty-map.h"
+#include "dirty-cache.h"
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -1885,12 +1886,11 @@ static int cr_pre_dump_finish(int status)
 		pr_info("\tPre-dumping %d\n", vpid(item));
 		timing_start(TIME_MEMWRITE);
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
-		if (ret < 0)
-			goto err;
-
 		// [Obsidian0215] init dirty_log for pre-dump's page-xfer
 		if(opts.use_dirty_map)
 			xfer.dl = item->dl;
+		if (ret < 0)
+			goto err;
 
 		mem_pp = dmpi(item)->mem_pp;
 

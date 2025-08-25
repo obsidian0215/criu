@@ -705,6 +705,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT("use-dirty-map",&opts.use_dirty_map),
 		{ "dirty-map-dir", required_argument, 0, 1200 },
+		BOOL_OPT("compress", &opts.compress),
 		{},
 	};
 
@@ -1047,6 +1048,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1200:
 			SET_CHAR_OPTS(dirty_map_dir, optarg);
+			break;
+		case 'C':
+			opts.compress = true;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

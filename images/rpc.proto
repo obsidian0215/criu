@@ -147,7 +147,7 @@ message criu_opts {
 	optional bool			log_to_stderr		= 71;
 	optional bool           use_dirty_map       = 72;
 	optional string			dirty_map_dir		= 73;
-/* 	optional int32          dirty_map_dir_fd    = 74; 	*/
+ 	optional bool          	compress    		= 74;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

@@ -782,6 +782,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			goto out_pp;
 
 		xfer.transfer_lazy = !mdc->lazy;
+		
+		/* Store dirty_log reference for cache access */
+		if (mdc->use_dirty_map && item)
+			xfer.dl = item->dl;
 	} else {
 		ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
 		if (ret < 0)

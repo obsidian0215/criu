@@ -276,6 +276,108 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	return 0;
 }
 
+/*
+ * Enhanced write_pages_loc with compression and dirty cache support
+ * Used when both dirty_map and compress options are enabled
+ * Takes full iovec to access virtual address information
+ * Optimized to use vmsplice for zero-copy page-pipe operations
+ */
+static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struct iovec *iov)
+{
+	static __thread uint8_t *compress_buffer = NULL;
+	static __thread size_t compress_buffer_size = 0;
+
+	ssize_t ret;
+	unsigned long len = iov->iov_len;
+	unsigned long pages_count = len / PAGE_SIZE;
+	unsigned long page_idx = 0;
+	unsigned long base_vaddr = (unsigned long)iov->iov_base + xfer->offset; /* Restore original vaddr */
+	struct dirty_log *dl = xfer->dl;
+	
+	/* Page-aligned buffer for vmsplice operations */
+	void *page_buffer;
+	struct iovec pipe_iov;
+
+	/* Ensure we have adequate compression buffer */
+	if (!compress_buffer || compress_buffer_size < len * 2) {
+		if (compress_buffer)
+			free(compress_buffer);
+		
+		compress_buffer_size = len * 2; /* Conservative size for compression buffer */
+		compress_buffer = malloc(compress_buffer_size);
+		
+		if (!compress_buffer) {
+			pr_err("Failed to allocate compression buffer\n");
+			return -1;
+		}
+	}
+
+	/* Allocate page-aligned buffer for zero-copy vmsplice */
+	page_buffer = mmap(NULL, len, PROT_READ | PROT_WRITE, 
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page_buffer == MAP_FAILED) {
+		pr_perror("Unable to mmap page buffer");
+		return -1;
+	}
+
+	/* Use vmsplice to move data from pipe to user buffer with zero-copy */
+	pipe_iov.iov_base = page_buffer;
+	pipe_iov.iov_len = len;
+	
+	ret = vmsplice(pipe_fd, &pipe_iov, 1, SPLICE_F_GIFT);
+	if (ret != len) {
+		pr_perror("vmsplice failed to transfer %lu bytes, got %ld", len, ret);
+		munmap(page_buffer, len);
+		return -1;
+	}
+
+	/* Process pages: compression and cache update */
+	for (page_idx = 0; page_idx < pages_count; page_idx++) {
+		uint8_t *page_data = (uint8_t *)page_buffer + (page_idx * PAGE_SIZE);
+		unsigned long page_vaddr = base_vaddr + (page_idx * PAGE_SIZE);
+		void *final_data = page_data;
+		size_t final_size = PAGE_SIZE;
+
+		/* TODO: Add compression here - placeholder for custom compression implementation
+		 *
+		 * Compression should:
+		 * 1. Take page_data (PAGE_SIZE bytes) as input
+		 * 2. Compress into compress_buffer
+		 * 3. Set final_data and final_size if compression is beneficial
+		 *
+		 * Example structure:
+		 * size_t compressed_size = custom_compress_page(page_data, PAGE_SIZE,
+		 *                                               compress_buffer + (page_idx * MAX_COMPRESSED_SIZE), 
+		 *                                               MAX_COMPRESSED_SIZE);
+		 * if (compressed_size > 0 && compressed_size < PAGE_SIZE) {
+		 *     final_data = compress_buffer + (page_idx * MAX_COMPRESSED_SIZE);
+		 *     final_size = compressed_size;
+		 *     pr_debug("Compressed page %lx from %zu to %zu bytes\n",
+		 *              page_vaddr, PAGE_SIZE, compressed_size);
+		 * }
+		 */
+		pr_debug("[Compress_debug]Final page %lx size %zu\n", page_vaddr, final_size);
+
+		/* Write compressed/original data to image */
+		ret = write(img_raw_fd(xfer->pi), final_data, final_size);
+		if (ret != final_size) {
+			pr_perror("Unable to write page data to image");
+			munmap(page_buffer, len);
+			return -1;
+		}
+
+		/* Update dirty cache with original (uncompressed) page data */
+		if (is_dirty_cache_enabled(dl)) {
+			dirty_cache_update_page(dl, page_vaddr, page_data);
+			pr_debug("Updated cache for page %lx (pid %d)\n", page_vaddr, dl->pid);
+		}
+	}
+
+	/* Clean up the mmaped buffer */
+	munmap(page_buffer, len);
+	return 0;
+}
+
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, struct dirty_log *dl)
 {
 	int ret;
@@ -443,6 +545,7 @@ err_pmi:
 	return -1;
 }
 
+
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
@@ -453,6 +556,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	else
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }
+
 
 static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)
 {
@@ -875,8 +979,14 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				goto err;
 
-			if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				goto err;
+			/* Use cache-enabled write if dirty cache is available */
+			if (xfer->dl && is_dirty_cache_enabled(xfer->dl)) {
+				if (write_pages_loc_with_cache(xfer, ppb->p[0], &iov))
+					goto err;
+			} else {
+				if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+					goto err;
+			}
 		}
 
 		timing_stop(TIME_MEMWRITE);
@@ -922,8 +1032,16 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				return -1;
+			if (flags & PE_PRESENT) {
+				/* Use cache-enabled write if dirty cache is available */
+				if (xfer->dl && is_dirty_cache_enabled(xfer->dl)) {
+					if (write_pages_loc_with_cache(xfer, ppb->p[0], &iov))
+						return -1;
+				} else {
+					if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+						return -1;
+				}
+			}
 		}
 	}
 

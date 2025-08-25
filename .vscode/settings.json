@@ -15,7 +15,9 @@
         "page.h": "c",
         "page-pipe.h": "c",
         "bfd.h": "c",
-        "log.h": "c"
+        "log.h": "c",
+        "pagemap.h": "c",
+        "compiler.h": "c"
     },
     "makefile.configureOnOpen": false
 }

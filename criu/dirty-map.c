@@ -24,6 +24,7 @@
 #include "pstree.h"
 
 #include "dirty-map.h"
+#include "dirty_cache.h"  /* 引入脏页缓存 */
 #include "xmalloc.h"
 #include "protobuf.h"
 
@@ -1265,6 +1266,11 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     load_thresholds(dl, dirty_map_dir);
     update_thresholds(dl);
 
+    /* 初始化脏页缓存 */
+    if (init_dirty_cache(dl, dirty_map_dir) != 0) {
+        pr_warn("Failed to initialize dirty cache for pid %d, proceeding without cache\n", pid);
+    }
+
     pr_debug("[Obsidian] threshold: %f, %f\n", dl->heat_threshold, dl->trend_threshold);
     return 0;
 }
@@ -1403,6 +1409,10 @@ void fini_dirty_map(struct pstree_item *item){
         if (write_thresholds(dl, opts.dirty_map_dir)) {
             pr_perror("[Obsidian0215]Error updating thresholds to file");
         }
+
+        /* 销毁脏页缓存 */
+        fini_dirty_cache(dl);
+
         // 释放dl结构体
         free(dl);
         item->dl = NULL;
@@ -1739,3 +1749,120 @@ void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
 //         del_in_warm_list(dl, addr);
 //     }
 // }
+
+/* 脏页缓存集成函数 - 每个进程独享 */
+
+/**
+ * @brief 为特定pid初始化脏页缓存
+ *
+ * @param dl 进程的dirty_log结构体指针
+ * @param cache_dir 缓存目录路径
+ * @return int 成功返回0，失败返回-1
+ */
+int init_dirty_cache(struct dirty_log *dl, const char *cache_dir)
+{
+    char cache_path[PATH_MAX];
+    int ret;
+
+    if (!dl) {
+        pr_err("Non dirty_log, cannot initialize dirty-cache\n");
+        return -1;
+    }
+
+    /* 检查: 仅在同时开启压缩和dirty-map时启用脏页缓存 */
+    if (!DC_IS_CACHE_ENABLED()) {
+        pr_debug("Dirty cache disabled for pid %d\n", dl->pid);
+        dl->cache_enabled = false;
+        return 0;
+    }
+
+    /* 分配缓存结构体 */
+    dl->page_cache = xzalloc(sizeof(dirty_cache_t));
+    if (!dl->page_cache) {
+        pr_err("Failed to allocate dirty-cache for pid %d\n", dl->pid);
+        return -1;
+    }
+
+    /* 构建缓存文件路径 */
+    snprintf(cache_path, sizeof(cache_path), "%s/%s.%d",
+             cache_dir, DC_TMPFS_PREFIX, dl->pid);
+    cache_path[sizeof(cache_path) - 1] = '\0';
+
+    /* 初始化缓存 */
+    ret = dc_init_with_size(dl->page_cache, cache_path, DCACHE_SIZE);
+    if (ret != 0) {
+        pr_err("Failed to initialize dirty cache for pid %d\n", dl->pid);
+        xfree(dl->page_cache);
+        dl->page_cache = NULL;
+        dl->cache_enabled = false;
+        return -1;
+    }
+
+
+    dl->cache_enabled = true;
+    pr_info("Initialized dirty cache for pid %d: %s\n", dl->pid, cache_path);
+
+    return 0;
+}
+
+/**
+ * @brief 销毁特定pid的脏页缓存
+ *
+ * @param dl 进程的dirty_log结构体指针
+ */
+void fini_dirty_cache(struct dirty_log *dl)
+{
+    if (!dl || !dl->page_cache)
+        return;
+
+    dc_fini(dl->page_cache);
+    xfree(dl->page_cache);
+    dl->page_cache = NULL;
+    dl->cache_enabled = false;
+
+    pr_debug("Finalized dirty cache for pid %d\n", dl->pid);
+}
+
+/**
+ * @brief 从脏页缓存中查找页面
+ *
+ * @param dl 进程的dirty_log结构体指针
+ * @param vaddr 虚拟地址
+ * @param page_out 输出页面数据的缓冲区
+ * @return int 成功返回DC_SUCCESS，未找到返回DC_NOT_FOUND，错误返回负值
+ */
+int dirty_cache_lookup_page(struct dirty_log *dl, unsigned long vaddr, void *page_out)
+{
+    if (!dl || !dl->page_cache || !dl->cache_enabled)
+        return DC_NOT_FOUND;
+
+    return dc_lookup(dl->page_cache, vaddr, page_out);
+}
+
+/**
+ * @brief 更新脏页缓存中的页面
+ *
+ * @param dl 进程的dirty_log结构体指针
+ * @param vaddr 虚拟地址
+ * @param page_data 页面数据
+ */
+void dirty_cache_update_page(struct dirty_log *dl, unsigned long vaddr, const void *page_data)
+{
+    if (!dl || !dl->page_cache || !dl->cache_enabled || !page_data)
+        return;
+
+    dc_update(dl->page_cache, vaddr, page_data);
+
+    pr_debug("Updated dirty cache entry for pid %d, vaddr=%lx\n", dl->pid, vaddr);
+}
+
+/**
+ * @brief 检查特定进程的脏页缓存是否启用
+ *
+ * @param dl 进程的dirty_log结构体指针
+ * @return bool 启用返回true，否则返回false
+ */
+bool is_dirty_cache_enabled(struct dirty_log *dl)
+{
+    return (dl && dl->cache_enabled && dl->page_cache);
+}
