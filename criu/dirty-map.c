@@ -34,6 +34,13 @@
 #define MAX_FILES 32
 #define EXPAND_WARM_BATCH 128
 
+// 遍历统计温页预测的准确性
+typedef struct {
+    struct dirty_log *dl;
+    unsigned int hit_warm;
+    unsigned int miss_warm;
+} traversal_data_t;
+
 // 用于qsort的comparator函数
 int compare_dirty_map(const void *a, const void *b) {
     struct dirty_map *dm_a = (struct dirty_map *)a;
@@ -690,18 +697,18 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
  * @param pid dirtymap所属的进程PID
  * @return void
  */
-static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtymap_size, pid_t pid) {
-    int i;
+// static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtymap_size, pid_t pid) {
+//     int i;
 
-    if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
-		return;
+//     if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
+// 		return;
 
-    pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
-	for (i = 0; i < dirtymap_size; i++) {
-		pr_debug("\taddress: %#lx, write count: %d\n",
-            dirtymap[i].address, dirtymap[i].write_count);
-	}
-}
+//     pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
+// 	for (i = 0; i < dirtymap_size; i++) {
+// 		pr_debug("\taddress: %#lx, write count: %d\n",
+//             dirtymap[i].address, dirtymap[i].write_count);
+// 	}
+// }
 
 /**
  * @brief debug输出dirty_diffmap数组
@@ -711,18 +718,18 @@ static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtym
  * @param pid diffmap所属的进程PID
  * @return void
  */
-static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
-    int i;
+// static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
+//     int i;
 
-    if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
-		return;
+//     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
+// 		return;
 
-    pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
-	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
-            diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
-	}
-}
+//     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
+// 	for (i = 0; i < diffmap_size; i++) {
+// 		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
+//             diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
+// 	}
+// }
 
 /**
  * @brief 回调函数，用于打印每个 warm_page_t 节点
@@ -952,28 +959,6 @@ static void update_historical_stats(historical_stats_t *stats, float hit_rate,
     stats->update_count++;
 }
 
-// Phase 1优化：改进的温页选择逻辑（使用指数移动平均）
-static int enhanced_count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
-    traversal_data_t *data = (traversal_data_t *)user_data;
-    unsigned long addr = *(unsigned long *)key;
-    struct dirty_diffmap *dm = search_dirty_map(data->dl, addr);
-
-    if (!dm || dm->heat < data->dl->min_heat) {
-        data->hit_warm++;
-    } else {
-        data->miss_warm++;
-    }
-
-    return FALSE; // 继续遍历
-}
-
-// 定义遍历数据结构
-typedef struct {
-    struct dirty_log *dl;
-    unsigned int hit_warm;
-    unsigned int miss_warm;
-} traversal_data_t;
-
 // 遍历回调函数，用于统计hit_warm和miss_warm
 static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
     traversal_data_t *data = (traversal_data_t *)user_data;
@@ -990,17 +975,17 @@ static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_dat
 }
 
 /**
- * @brief Phase 1优化1：改进的温页阈值更新算法
+ * @brief 优化1：改进的温页阈值更新算法（使用指数移动平均）
  *
  * @param dl 进程的dirty-log结构体指针
  */
 static void update_thresholds(struct dirty_log *dl) {
     struct dirty_diffmap *dirtymap = dl->diffmap;
-    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
+    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0, i;
     float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
     float current_hit_rate = 0.0f, ema_hit_rate = 0.0f;
     float adjustment_factor = 1.0f, dynamic_step = 0.5f;
-    int i;
+    float current_ratio, error, p_term, i_term, d_term, pid_output;
     traversal_data_t data;
 
     // 检查warm_list和dirtymap是否存在
@@ -1023,7 +1008,7 @@ static void update_thresholds(struct dirty_log *dl) {
 
     // 加锁并遍历warm_list
     pthread_mutex_lock(&dl->warm_list_mutex);
-    g_tree_foreach(dl->warm_list, enhanced_count_warm_pages, &data);
+    g_tree_foreach(dl->warm_list, count_warm_pages, &data);
     pthread_mutex_unlock(&dl->warm_list_mutex);
 
     hit_warm = data.hit_warm;
@@ -1089,15 +1074,15 @@ static void update_thresholds(struct dirty_log *dl) {
         dl->feedback_ctrl->total_warm_count = miss_warm;
 
         // 计算误差（基于目标温页比例）
-        float current_ratio = (float)new_warm / dl->diffmap_size;
-        float error = dl->feedback_ctrl->target_warm_ratio - current_ratio;
+        current_ratio = (float)new_warm / dl->diffmap_size;
+        error = dl->feedback_ctrl->target_warm_ratio - current_ratio;
 
         // PID控制器调整
-        float p_term = dl->feedback_ctrl->kp * error;
-        float i_term = dl->feedback_ctrl->ki * dl->feedback_ctrl->integral_error;
-        float d_term = dl->feedback_ctrl->kd * (error - dl->feedback_ctrl->prev_error);
+        p_term = dl->feedback_ctrl->kp * error;
+        i_term = dl->feedback_ctrl->ki * dl->feedback_ctrl->integral_error;
+        d_term = dl->feedback_ctrl->kd * (error - dl->feedback_ctrl->prev_error);
 
-        float pid_output = p_term + i_term + d_term;
+        pid_output = p_term + i_term + d_term;
 
         // 新温页过少时，适当放宽选择阈值
         if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
@@ -1419,7 +1404,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // sort_dirty_map(less_latest_dm, slsize);
     dl->diffmap = merge_dirty_maps(dl);
 
-    debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
+    // debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
 
     // 加载上次的阈值并更新
     load_thresholds(dl, dirty_map_dir);
