@@ -11,7 +11,7 @@
 #include "pid.h"
 #include "page.h"
 #include "pagemap-cache.h"
-#include "dirty_cache.h"  // 引入脏页缓存
+#include "dirty-cache.h"  // 引入脏页缓存
 
 // dirty-track LKM definitions
 #define DIRTY_TRACK_MAGIC 'd'
