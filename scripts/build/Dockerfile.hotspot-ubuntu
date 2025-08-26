@@ -22,7 +22,8 @@ RUN apt-install protobuf-c-compiler \
 	pkg-config \
 	iptables \
 	gcc \
-	maven
+	maven	\
+	libglib2.0-dev
 
 COPY . /criu
 WORKDIR /criu

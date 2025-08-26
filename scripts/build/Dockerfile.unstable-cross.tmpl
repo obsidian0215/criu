@@ -38,7 +38,8 @@ RUN apt-install \
 	libprotobuf-c-dev:${DEBIAN_ARCH}	\
 	libcap-dev:${DEBIAN_ARCH}		\
 	libaio-dev:${DEBIAN_ARCH}		\
-	libnl-route-3-dev:${DEBIAN_ARCH}
+	libnl-route-3-dev:${DEBIAN_ARCH}	\
+	libglib2.0-dev:${DEBIAN_ARCH}
 
 ENV CROSS_COMPILE=${CROSS_TRIPLET}-				\
 	CROSS_ROOT=/usr/${CROSS_TRIPLET}			\
