@@ -31,6 +31,7 @@
 #include "gpu_compress.h"
 
 static int page_server_sk = -1;
+static bool page_compressed = false; /* Track if current page was compressed */
 
 struct page_server_iov {
 	u32 cmd;
@@ -340,8 +341,6 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 		size_t final_size = PAGE_SIZE;
 
 		/* GPU Compression implementation */
-		static bool page_compressed = false; /* Track if current page was compressed */
-
 		if (gpu_compress_available() && opts.compress) {
 			size_t compressed_size;
 			size_t max_compressed_size = PAGE_SIZE; /* LZO worst case */
@@ -460,7 +459,6 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 	pe.flags = flags;
 
 	/* Set compression flag if pages were compressed */
-	extern bool page_compressed; /* Track if current page was compressed */
 	if (page_compressed && (flags & PE_PRESENT)) {
 		pe.flags |= PE_COMPRESSED;
 		page_compressed = false; /* Reset for next page */
