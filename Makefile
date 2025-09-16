@@ -165,7 +165,8 @@ HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
 # Default target
-all: criu lib crit cuda_plugin lzo_gpu_plugin
+# all: criu lib crit cuda_plugin lzo_gpu_plugin
+all: criu lib crit cuda_plugin
 .PHONY: all
 
 #

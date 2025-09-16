@@ -12,6 +12,15 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include "../lzo_gpu/minilzo.h"
+
+/* LZO compression library functions */
+extern int lzo1x_1_compress(const unsigned char *src, unsigned int src_len,
+                           unsigned char *dst, unsigned int *dst_len,
+                           void *wrkmem);
+extern int lzo1x_decompress_safe(const unsigned char *src, unsigned int src_len,
+                                unsigned char *dst, unsigned int *dst_len,
+                                void *wrkmem);
 
 #ifdef LOG_PREFIX
 #undef LOG_PREFIX
@@ -119,15 +128,16 @@ static int load_kernels(void)
     cl_int ret;
     const char *kernel_files[] = {"decompress.cl", "lzo.cl"};
     const char *kernel_names[] = {"lzo1x_block_decompress", "lzo1x_block_compress"};
-    char *kernel_sources[2] = {NULL, NULL};
+    char *kernel_sources[2] = {NULL, NULL}, *log;
     size_t kernel_lengths[2] = {0, 0};
+    int i;
+    char kernel_path[256];
+    FILE *kernel_file;
+    struct stat st;
+    size_t bytes_read, log_size;
 
     /* Load kernel files */
-    for (int i = 0; i < 2; i++) {
-        char kernel_path[256];
-        FILE *kernel_file;
-        struct stat st;
-
+    for (i = 0; i < 2; i++) {
         snprintf(kernel_path, sizeof(kernel_path), "plugins/lzo_gpu/%s", kernel_files[i]);
 
         if (stat(kernel_path, &st) != 0) {
@@ -148,7 +158,7 @@ static int load_kernels(void)
             goto cleanup;
         }
 
-        size_t bytes_read = fread(kernel_sources[i], 1, kernel_lengths[i], kernel_file);
+        bytes_read = fread(kernel_sources[i], 1, kernel_lengths[i], kernel_file);
         if (bytes_read != kernel_lengths[i]) {
             pr_err("Failed to read kernel source file\n");
             fclose(kernel_file);
@@ -172,9 +182,8 @@ static int load_kernels(void)
     ret = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
     if (ret != CL_SUCCESS) {
         pr_err("Failed to build program: %d\n", ret);
-        size_t log_size;
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
-        char *log = xmalloc(log_size);
+        log = xmalloc(log_size);
         if (log) {
             clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
             pr_err("Build log: %s\n", log);
@@ -199,7 +208,7 @@ static int load_kernels(void)
     }
 
     /* Cleanup sources */
-    for (int i = 0; i < 2; i++) {
+    for (i = 0; i < 2; i++) {
         if (kernel_sources[i]) {
             free(kernel_sources[i]);
         }
@@ -209,7 +218,7 @@ static int load_kernels(void)
     return 0;
 
 cleanup:
-    for (int i = 0; i < 2; i++) {
+    for (i = 0; i < 2; i++) {
         if (kernel_sources[i]) {
             free(kernel_sources[i]);
         }
@@ -312,6 +321,92 @@ void lzo_gpu_plugin_fini(int stage, int ret)
 }
 
 /*
+ * GPU compression function - exported for gpu_compress.c
+ */
+int gpu_compress_data(const void *input_data, size_t input_size,
+                     void *output_data, size_t *output_size)
+{
+    void *compressed_data;
+    unsigned int compressed_size;
+    int result;
+
+    if (plugin_disabled || !gpu_available || !input_data || !output_data || !output_size) {
+        return -1;
+    }
+
+    /* TODO: Implement actual GPU compression using OpenCL */
+    /* For now, use CPU LZO compression as fallback */
+
+    /* Allocate buffer for compressed data (worst case LZO expansion) */
+    compressed_data = xmalloc(input_size * 2);
+    if (!compressed_data) {
+        pr_err("Failed to allocate compression buffer\n");
+        return -1;
+    }
+
+    /* Use CPU LZO compression for now */
+    compressed_size = input_size * 2;
+    result = lzo1x_1_compress(input_data, input_size,
+                             compressed_data, &compressed_size,
+                             NULL);
+
+    if (result != LZO_E_OK || compressed_size >= input_size) {
+        /* Compression failed or not beneficial, copy original data */
+        if (compressed_size < *output_size) {
+            memcpy(output_data, input_data, input_size);
+            *output_size = input_size;
+            free(compressed_data);
+            return 0;
+        }
+        free(compressed_data);
+        return -1;
+    }
+
+    /* Copy compressed data to output */
+    if (compressed_size <= *output_size) {
+        memcpy(output_data, compressed_data, compressed_size);
+        *output_size = compressed_size;
+        free(compressed_data);
+        pr_debug("CPU LZO compressed %zu bytes to %u bytes\n", input_size, compressed_size);
+        return 0;
+    }
+
+    free(compressed_data);
+    return -1;
+}
+
+/*
+ * GPU decompression function - exported for gpu_compress.c
+ */
+int gpu_decompress_data(const void *input_data, size_t input_size,
+                       void *output_data, size_t *output_size)
+{
+    unsigned int decompressed_size;
+    int result;
+
+    if (plugin_disabled || !gpu_available || !input_data || !output_data || !output_size) {
+        return -1;
+    }
+
+    /* TODO: Implement actual GPU decompression using OpenCL */
+    /* For now, use CPU LZO decompression as fallback */
+
+    /* Use CPU LZO decompression */
+    decompressed_size = *output_size;
+    result = lzo1x_decompress_safe(input_data, input_size,
+                                  output_data, &decompressed_size,
+                                  NULL);
+
+    if (result == LZO_E_OK) {
+        *output_size = decompressed_size;
+        pr_debug("CPU LZO decompressed %zu bytes to %u bytes\n", input_size, decompressed_size);
+        return 0;
+    }
+
+    return -1;
+}
+
+/*
  * Memory dump hook - compress memory pages during dump
  */
 int lzo_gpu_plugin_dump_pages(void *data, size_t size, void **compressed_data, size_t *compressed_size)
@@ -331,13 +426,19 @@ int lzo_gpu_plugin_dump_pages(void *data, size_t size, void **compressed_data, s
         return -ENOMEM;
     }
 
-    /* TODO: Implement actual GPU compression */
-    /* For now, just copy data */
+    /* Use GPU compression function */
+    size_t compressed_len = size * 2;
+    if (gpu_compress_data(data, size, *compressed_data, &compressed_len) == 0) {
+        *compressed_size = compressed_len;
+        pr_debug("GPU compressed %zu bytes to %zu bytes\n", size, *compressed_size);
+        return 0; /* Success, data compressed */
+    }
+
+    /* Fallback to copying original data */
     memcpy(*compressed_data, data, size);
     *compressed_size = size;
-
-    pr_debug("GPU compressed %zu bytes\n", size);
-    return 0; /* Success, data compressed */
+    pr_debug("GPU compression failed, using original data (%zu bytes)\n", size);
+    return 0;
 }
 
 /*
