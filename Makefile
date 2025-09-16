@@ -165,7 +165,7 @@ HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
 # Default target
-all: criu lib crit cuda_plugin
+all: criu lib crit cuda_plugin lzo_gpu_plugin
 .PHONY: all
 
 #
@@ -302,6 +302,10 @@ clean-cuda_plugin:
 	$(Q) $(MAKE) -C plugins/cuda clean
 .PHONY: clean-cuda_plugin
 
+clean-lzo_gpu_plugin:
+	$(Q) $(MAKE) -C plugins/lzo_gpu clean
+.PHONY: clean-lzo_gpu_plugin
+
 clean-top:
 	$(Q) $(MAKE) -C Documentation clean
 	$(Q) $(MAKE) $(build)=test/compel clean
@@ -310,7 +314,7 @@ clean-top:
 
 clean: clean-top clean-amdgpu_plugin clean-cuda_plugin
 
-mrproper-top: clean-top clean-amdgpu_plugin clean-cuda_plugin
+mrproper-top: clean-top clean-amdgpu_plugin clean-cuda_plugin clean-lzo_gpu_plugin
 	$(Q) $(RM) $(CONFIG_HEADER)
 	$(Q) $(RM) $(VERSION_HEADER)
 	$(Q) $(RM) $(COMPEL_VERSION_HEADER)
@@ -345,6 +349,10 @@ amdgpu_plugin: criu
 cuda_plugin: criu
 	$(Q) $(MAKE) -C plugins/cuda all
 .PHONY: cuda_plugin
+
+lzo_gpu_plugin: criu
+	$(Q) $(MAKE) -C plugins/lzo_gpu all
+.PHONY: lzo_gpu_plugin
 
 crit: lib
 	$(Q) $(MAKE) -C crit

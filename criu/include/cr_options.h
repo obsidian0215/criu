@@ -241,7 +241,7 @@ struct cr_options {
 	/* [Obsidian0215]use for adaptive live migration */
 	int use_dirty_map;
 	char* dirty_map_dir;
-	int compress;
+	int compress;	/* Enable compression for memory pages */
 };
 
 extern struct cr_options opts;

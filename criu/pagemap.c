@@ -18,6 +18,7 @@
 #include "xmalloc.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "gpu_compress.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -236,6 +237,7 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+	size_t original_len = len;
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -250,15 +252,66 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 		return -1;
 
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
-	while (1) {
-		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
-		if (ret < 1) {
-			pr_perror("Can't read mapping page %zd", ret);
+
+	/* Check if the page is compressed */
+	if (pagemap_compressed(pr->pe)) {
+		/* Read compressed data first */
+		void *compressed_buf = xmalloc(len);
+		if (!compressed_buf) {
+			pr_err("Failed to allocate buffer for compressed data\n");
 			return -1;
 		}
-		curr += ret;
-		if (curr == len)
-			break;
+
+		while (1) {
+			ret = pread(fd, compressed_buf + curr, len - curr, pr->pi_off + curr);
+			if (ret < 1) {
+				pr_perror("Can't read compressed mapping page %zd", ret);
+				xfree(compressed_buf);
+				return -1;
+			}
+			curr += ret;
+			if (curr == len)
+				break;
+		}
+
+		/* Decompress the data */
+		if (gpu_compress_available()) {
+			size_t decompressed_size = original_len;
+			int decompress_result = gpu_decompress_data(compressed_buf, len, buf, &decompressed_size);
+
+			if (decompress_result == 0 && decompressed_size == original_len) {
+				pr_debug("GPU decompressed page %lx from %zu to %zu bytes\n",
+				         vaddr, len, decompressed_size);
+			} else {
+				pr_err("GPU decompression failed for page %lx\n", vaddr);
+				xfree(compressed_buf);
+				return -1;
+			}
+		} else {
+			/* GPU not available, copy uncompressed data (fallback) */
+			if (len <= original_len) {
+				memcpy(buf, compressed_buf, len);
+				pr_debug("GPU not available, copying uncompressed data for page %lx\n", vaddr);
+			} else {
+				pr_err("Compressed data larger than expected for page %lx\n", vaddr);
+				xfree(compressed_buf);
+				return -1;
+			}
+		}
+
+		xfree(compressed_buf);
+	} else {
+		/* Read uncompressed data directly */
+		while (1) {
+			ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
+			if (ret < 1) {
+				pr_perror("Can't read mapping page %zd", ret);
+				return -1;
+			}
+			curr += ret;
+			if (curr == len)
+				break;
+		}
 	}
 
 	if (opts.auto_dedup) {

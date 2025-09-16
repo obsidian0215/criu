@@ -43,6 +43,7 @@
 #include "fault-injection.h"
 #include "proc_parse.h"
 #include "kerndat.h"
+#include "gpu_compress.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
@@ -52,6 +53,14 @@ void flush_early_log_to_stderr(void) __attribute__((destructor));
 void flush_early_log_to_stderr(void)
 {
 	flush_early_log_buffer(STDERR_FILENO);
+}
+
+/* GPU cleanup on program exit */
+void cleanup_gpu_resources(void) __attribute__((destructor));
+
+void cleanup_gpu_resources(void)
+{
+	gpu_compress_cleanup();
 }
 
 static int image_dir_mode(char *argv[], int optind)
@@ -123,6 +132,7 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (fault_injection_init()) {
 		pr_err("Failed to initialize fault injection when initializing crtools.\n");
+		gpu_compress_cleanup();
 		return 1;
 	}
 
@@ -265,6 +275,11 @@ int main(int argc, char *argv[], char *envp[])
 	if (kerndat_init()) {
 		pr_err("Could not initialize kernel features detection.\n");
 		return 1;
+	}
+
+	/* Initialize GPU compression module */
+	if (gpu_compress_init() < 0) {
+		pr_warn("GPU compression not available, falling back to CPU compression\n");
 	}
 
 	if (check_options())

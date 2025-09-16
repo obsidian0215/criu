@@ -3,6 +3,7 @@
 #include "xmalloc.h"
 #include "log.h"
 #include "util.h"
+#include "page.h"
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -100,12 +101,13 @@ err_close:
 
 void dc_fini(dirty_cache_t *c)
 {
+    size_t file_size;
     if (!c || !c->initialized)
         return;
 
     /* Sync and cleanup */
     if (c->base && c->base != MAP_FAILED) {
-        size_t file_size = dc_file_size(c->total_size, c->num_sets);
+        file_size = dc_file_size(c->total_size, c->num_sets);
         msync(c->base, file_size, MS_SYNC);
         munmap(c->base, file_size);
     }
@@ -143,6 +145,7 @@ int dc_lookup(dirty_cache_t *c, uint64_t vaddr, void *page_out)
 {
     size_t set_idx, way;
     dc_entry_t *set, *entry;
+    uint8_t *page_data;
 
     if (!c || !c->initialized || !page_out)
         return DC_INVALID_PARAM;
@@ -153,7 +156,7 @@ int dc_lookup(dirty_cache_t *c, uint64_t vaddr, void *page_out)
     if (dc_find_way(set, vaddr, &way)) {
         entry = &set[way];
 
-        uint8_t *page_data = dc_get_page_data(c, set_idx, way);
+        page_data = dc_get_page_data(c, set_idx, way);
 
         /* Copy data and update LRU */
         memcpy(page_out, page_data, PAGE_SIZE);
@@ -200,6 +203,7 @@ void dc_update(dirty_cache_t *c, uint64_t vaddr, const void *page)
 int dc_expand(dirty_cache_t *c, size_t additional_size)
 {
     size_t new_size;
+    int ret;
 
     if (!c || !c->initialized)
         return DC_INVALID_PARAM;
@@ -218,7 +222,8 @@ int dc_expand(dirty_cache_t *c, size_t additional_size)
         return DC_ERROR;
     }
 
-    int ret = dc_expand_internal(c, new_size);
+    /* Expand the cache */
+    ret = dc_expand_internal(c, new_size);
 
     if (ret == 0) {
         pr_info("Expanded cache from %zu to %zu bytes\n",
@@ -230,7 +235,7 @@ int dc_expand(dirty_cache_t *c, size_t additional_size)
 
 static int dc_expand_internal(dirty_cache_t *c, size_t new_size)
 {
-    size_t old_file_size, new_file_size;
+    size_t old_file_size, new_file_size, old_meta_size, new_meta_size;
     size_t new_num_pages, new_num_sets;
     void *new_base;
 
@@ -264,8 +269,8 @@ static int dc_expand_internal(dirty_cache_t *c, size_t new_size)
 
     /* Initialize new metadata space */
     if (new_num_sets > c->num_sets) {
-        size_t old_meta_size = dc_meta_size(c->num_sets);
-        size_t new_meta_size = dc_meta_size(new_num_sets);
+        old_meta_size = dc_meta_size(c->num_sets);
+        new_meta_size = dc_meta_size(new_num_sets);
         memset((uint8_t *)c->meta + old_meta_size, 0, new_meta_size - old_meta_size);
     }
 
@@ -274,10 +279,11 @@ static int dc_expand_internal(dirty_cache_t *c, size_t new_size)
 
 int dc_sync(dirty_cache_t *c)
 {
+    size_t file_size;
     if (!c || !c->initialized)
         return DC_INVALID_PARAM;
 
-    size_t file_size = dc_file_size(c->total_size, c->num_sets);
+    file_size = dc_file_size(c->total_size, c->num_sets);
 
     if (msync(c->base, file_size, MS_SYNC) != 0) {
         pr_perror("Failed to sync cache to disk");

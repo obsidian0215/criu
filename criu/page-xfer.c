@@ -28,6 +28,7 @@
 #include "stats.h"
 #include "tls.h"
 #include "dirty-map.h"
+#include "gpu_compress.h"
 
 static int page_server_sk = -1;
 
@@ -293,7 +294,7 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 	unsigned long page_idx = 0;
 	unsigned long base_vaddr = (unsigned long)iov->iov_base + xfer->offset; /* Restore original vaddr */
 	struct dirty_log *dl = xfer->dl;
-	
+
 	/* Page-aligned buffer for vmsplice operations */
 	void *page_buffer;
 	struct iovec pipe_iov;
@@ -302,10 +303,10 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 	if (!compress_buffer || compress_buffer_size < len * 2) {
 		if (compress_buffer)
 			free(compress_buffer);
-		
+
 		compress_buffer_size = len * 2; /* Conservative size for compression buffer */
 		compress_buffer = malloc(compress_buffer_size);
-		
+
 		if (!compress_buffer) {
 			pr_err("Failed to allocate compression buffer\n");
 			return -1;
@@ -313,7 +314,7 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 	}
 
 	/* Allocate page-aligned buffer for zero-copy vmsplice */
-	page_buffer = mmap(NULL, len, PROT_READ | PROT_WRITE, 
+	page_buffer = mmap(NULL, len, PROT_READ | PROT_WRITE,
 			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (page_buffer == MAP_FAILED) {
 		pr_perror("Unable to mmap page buffer");
@@ -323,7 +324,7 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 	/* Use vmsplice to move data from pipe to user buffer with zero-copy */
 	pipe_iov.iov_base = page_buffer;
 	pipe_iov.iov_len = len;
-	
+
 	ret = vmsplice(pipe_fd, &pipe_iov, 1, SPLICE_F_GIFT);
 	if (ret != len) {
 		pr_perror("vmsplice failed to transfer %lu bytes, got %ld", len, ret);
@@ -338,25 +339,39 @@ static int write_pages_loc_with_cache(struct page_xfer *xfer, int pipe_fd, struc
 		void *final_data = page_data;
 		size_t final_size = PAGE_SIZE;
 
-		/* TODO: Add compression here - placeholder for custom compression implementation
-		 *
-		 * Compression should:
-		 * 1. Take page_data (PAGE_SIZE bytes) as input
-		 * 2. Compress into compress_buffer
-		 * 3. Set final_data and final_size if compression is beneficial
-		 *
-		 * Example structure:
-		 * size_t compressed_size = custom_compress_page(page_data, PAGE_SIZE,
-		 *                                               compress_buffer + (page_idx * MAX_COMPRESSED_SIZE), 
-		 *                                               MAX_COMPRESSED_SIZE);
-		 * if (compressed_size > 0 && compressed_size < PAGE_SIZE) {
-		 *     final_data = compress_buffer + (page_idx * MAX_COMPRESSED_SIZE);
-		 *     final_size = compressed_size;
-		 *     pr_debug("Compressed page %lx from %zu to %zu bytes\n",
-		 *              page_vaddr, PAGE_SIZE, compressed_size);
-		 * }
-		 */
-		pr_debug("[Compress_debug]Final page %lx size %zu\n", page_vaddr, final_size);
+		/* GPU Compression implementation */
+		static bool page_compressed = false; /* Track if current page was compressed */
+
+		if (gpu_compress_available() && opts.compress) {
+			size_t compressed_size;
+			size_t max_compressed_size = PAGE_SIZE; /* LZO worst case */
+
+			/* Use GPU compression */
+			int compress_result = gpu_compress_data(page_data, PAGE_SIZE,
+				compress_buffer + (page_idx * max_compressed_size),
+				&compressed_size);
+
+			if (compress_result == 0 && compressed_size > 0 && compressed_size < PAGE_SIZE) {
+				/* Compression successful and beneficial */
+				final_data = compress_buffer + (page_idx * max_compressed_size);
+				final_size = compressed_size;
+				page_compressed = true;
+				pr_debug("GPU compressed page %lx from %zu to %zu bytes\n",
+				         page_vaddr, PAGE_SIZE, compressed_size);
+			} else {
+				/* Compression failed or not beneficial, use original data */
+				final_data = page_data;
+				final_size = PAGE_SIZE;
+				page_compressed = false;
+				pr_debug("GPU compression failed for page %lx, using original data\n", page_vaddr);
+			}
+		} else {
+			/* GPU not available, use original data */
+			final_data = page_data;
+			final_size = PAGE_SIZE;
+			page_compressed = false;
+			pr_debug("GPU not available, using original data for page %lx\n", page_vaddr);
+		}
 
 		/* Write compressed/original data to image */
 		ret = write(img_raw_fd(xfer->pi), final_data, final_size);
@@ -443,6 +458,13 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 	pe.nr_pages = iov->iov_len / PAGE_SIZE;
 	pe.has_flags = true;
 	pe.flags = flags;
+
+	/* Set compression flag if pages were compressed */
+	extern bool page_compressed; /* Track if current page was compressed */
+	if (page_compressed && (flags & PE_PRESENT)) {
+		pe.flags |= PE_COMPRESSED;
+		page_compressed = false; /* Reset for next page */
+	}
 
 	if (flags & PE_PRESENT) {
 		if (opts.auto_dedup && xfer->parent != NULL) {
