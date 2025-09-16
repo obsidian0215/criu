@@ -35,6 +35,13 @@
 #define MAX_FILES 32
 #define EXPAND_WARM_BATCH 128
 
+// 遍历统计温页预测的准确性
+typedef struct {
+    struct dirty_log *dl;
+    unsigned int hit_warm;
+    unsigned int miss_warm;
+} traversal_data_t;
+
 // 用于qsort的comparator函数
 int compare_dirty_map(const void *a, const void *b) {
     struct dirty_map *dm_a = (struct dirty_map *)a;
@@ -712,18 +719,18 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
  * @param pid diffmap所属的进程PID
  * @return void
  */
-static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
-    int i;
+// static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
+//     int i;
 
-    if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
-		return;
+//     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
+// 		return;
 
-    pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
-	for (i = 0; i < diffmap_size; i++) {
-		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
-            diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
-	}
-}
+//     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
+// 	for (i = 0; i < diffmap_size; i++) {
+// 		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
+//             diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
+// 	}
+// }
 
 /**
  * @brief 回调函数，用于打印每个 warm_page_t 节点
@@ -817,16 +824,141 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
         close(fd);
         return;
     }
-
     close(fd);
 }
 
-// 定义遍历数据结构
-typedef struct {
-    struct dirty_log *dl;
-    unsigned int hit_warm;
-    unsigned int miss_warm;
-} traversal_data_t;
+// 优化1：初始化历史统计信息
+static int init_historical_stats(struct dirty_log *dl) {
+    if (!dl)
+        return -1;
+
+    if (!dl->historical_stats) {
+        dl->historical_stats = (historical_stats_t *)xzalloc(sizeof(historical_stats_t));
+        if (!dl->historical_stats) {
+            pr_perror("[Phase1] Failed to allocate historical_stats");
+            return -1;
+        }
+    }
+
+    // 初始化历史统计信息
+    memset(dl->historical_stats->hit_rates, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
+    memset(dl->historical_stats->threshold_history, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
+    memset(dl->historical_stats->adjustment_factors, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
+
+    dl->historical_stats->history_idx = 0;
+    dl->historical_stats->ema_hit_rate = 0.0f;
+    dl->historical_stats->learning_rate = 0.1f;
+    dl->historical_stats->momentum_factor = 0.8f;
+    dl->historical_stats->update_count = 0;
+
+    return 0;
+}
+
+// 优化1：初始化反馈控制器
+static int init_feedback_controller(struct dirty_log *dl) {
+    if (!dl)
+        return -1;
+
+    if (!dl->feedback_ctrl) {
+        dl->feedback_ctrl = (feedback_controller_t *)xzalloc(sizeof(feedback_controller_t));
+        if (!dl->feedback_ctrl) {
+            pr_perror("[Phase1] Failed to allocate feedback_ctrl");
+            return -1;
+        }
+    }
+
+    // 初始化反馈控制器参数
+    dl->feedback_ctrl->target_warm_ratio = TARGET_WARM_RATIO;
+    dl->feedback_ctrl->adjustment_step = 0.5f; // 初始调整步长
+    dl->feedback_ctrl->integral_error = 0.0f;
+    dl->feedback_ctrl->prev_error = 0.0f;
+    dl->feedback_ctrl->kp = KP_DEFAULT;
+    dl->feedback_ctrl->ki = KI_DEFAULT;
+    dl->feedback_ctrl->kd = KD_DEFAULT;
+    dl->feedback_ctrl->new_warm_count = 0;
+    dl->feedback_ctrl->total_warm_count = 0;
+
+    return 0;
+}
+
+// 优化1：计算指数移动平均命中率
+static float calculate_ema_hit_rate(historical_stats_t *stats, float current_hit_rate) {
+    if (!stats)
+        return current_hit_rate;
+
+    // 指数移动平均计算
+    stats->ema_hit_rate = EMA_ALPHA * current_hit_rate + (1.0f - EMA_ALPHA) * stats->ema_hit_rate;
+    return stats->ema_hit_rate;
+}
+
+// 优化1：计算波动性（用于动态调整步长）
+static float calculate_volatility(historical_stats_t *stats) {
+    float sum = 0.0f, mean = 0.0f, variance = 0.0f;
+    int count = 0, i;
+
+    if (!stats || stats->update_count < 2)
+        return 0.0f;
+
+    // 计算最近10次调整因子的平均值和方差
+    for (i = 0; i < HISTORY_BUFFER_SIZE; i++) {
+        if (stats->adjustment_factors[i] != 0.0f) {
+            sum += stats->adjustment_factors[i];
+            count++;
+        }
+    }
+
+    if (count < 2)
+        return 0.0f;
+    mean = sum / count;
+
+    // 计算方差
+    for (i = 0; i < HISTORY_BUFFER_SIZE; i++) {
+        if (stats->adjustment_factors[i] != 0.0f) {
+            float diff = stats->adjustment_factors[i] - mean;
+            variance += diff * diff;
+        }
+    }
+
+    variance /= count;
+    return sqrtf(variance); // 返回标准差作为波动性度量
+}
+
+// 优化1：计算动态调整步长
+static float calculate_dynamic_step(historical_stats_t *stats, feedback_controller_t *fb) {
+    float volatility, adaptive_step;
+
+    if (!stats || !fb)
+        return 0.0f;
+
+    volatility = calculate_volatility(stats);
+    adaptive_step = fb->adjustment_step * (1.0f + volatility);
+
+    // 限制调整步长在合理范围内
+    if (adaptive_step > MAX_ADJUSTMENT_STEP)
+        adaptive_step = MAX_ADJUSTMENT_STEP;
+    else if (adaptive_step < MIN_ADJUSTMENT_STEP)
+        adaptive_step = MIN_ADJUSTMENT_STEP;
+
+    return adaptive_step;
+}
+
+// 优化1：更新历史统计信息
+static void update_historical_stats(historical_stats_t *stats, float hit_rate,
+                                   float threshold, float adjustment_factor) {
+    int idx;
+    if (!stats)
+        return;
+
+    // 更新历史数据（循环缓冲区）
+    idx = stats->history_idx;
+
+    stats->hit_rates[idx] = hit_rate;
+    stats->threshold_history[idx] = threshold;
+    stats->adjustment_factors[idx] = adjustment_factor;
+
+    stats->history_idx = (idx + 1) % HISTORY_BUFFER_SIZE;
+    stats->update_count++;
+}
 
 // 遍历回调函数，用于统计hit_warm和miss_warm
 static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
@@ -844,20 +976,22 @@ static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_dat
 }
 
 /**
- * @brief 更新dirty_log中判断温页的阈值
+ * @brief 优化1：改进的温页阈值更新算法（使用指数移动平均）
  *
  * @param dl 进程的dirty-log结构体指针
  */
 static void update_thresholds(struct dirty_log *dl) {
     struct dirty_diffmap *dirtymap = dl->diffmap;
-    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
-    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0, new_heat_threshold = 0.0;
-    int i;
+    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0, i;
+    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
+    float current_hit_rate = 0.0f, ema_hit_rate = 0.0f;
+    float adjustment_factor = 1.0f, dynamic_step = 0.5f;
+    float current_ratio, error, p_term, i_term, d_term, pid_output;
     traversal_data_t data;
 
     // 检查warm_list和dirtymap是否存在
     if (!dl->warm_list || !dirtymap) {
-        pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
+        pr_info("[Phase1] warm threshold for %d won't update\n", dl->pid);
         return;
     }
 
@@ -866,7 +1000,7 @@ static void update_thresholds(struct dirty_log *dl) {
         min_in_dirtymap = dirtymap[0].heat;
     } else {
         // 如果dirtymap为空，无法更新阈值
-        pr_info("[Obsidian0215] dirtymap is empty for %d, thresholds not updated\n", dl->pid);
+        pr_info("[Phase1] dirtymap is empty for %d, thresholds not updated\n", dl->pid);
         return;
     }
 
@@ -881,25 +1015,50 @@ static void update_thresholds(struct dirty_log *dl) {
     hit_warm = data.hit_warm;
     miss_warm = data.miss_warm;
 
-    // 当命中率不高于50%时(不包括空warm_list)，更新thresholds
-    if (hit_warm <= miss_warm && miss_warm > 0) {
+    // 计算当前命中率
+    if (hit_warm + miss_warm > 0) {
+        current_hit_rate = (float)hit_warm / (hit_warm + miss_warm);
+    }
+
+    // Phase 1优化：使用指数移动平均计算平滑命中率
+    if (dl->historical_stats) {
+        ema_hit_rate = calculate_ema_hit_rate(dl->historical_stats, current_hit_rate);
+    } else {
+        // 初始化历史统计信息
+        if (init_historical_stats(dl) == 0) {
+            ema_hit_rate = calculate_ema_hit_rate(dl->historical_stats, current_hit_rate);
+        } else {
+            ema_hit_rate = current_hit_rate; // 降级到当前命中率
+        }
+    }
+
+    // Phase 1优化：当EMA命中率不高于50%时更新阈值
+    if (ema_hit_rate <= 0.5f && miss_warm > 0) {
         // 计算min_heat_threshold
         if (dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
             min_heat_threshold = 1.0f / ((float)dl->ldm_header->track_duration_ns / 1e9f);
         } else {
-            min_heat_threshold = 0.0f; // 默认值或其他处理
+            min_heat_threshold = 0.0f;
         }
 
-        // 更新heat_threshold
-        new_heat_threshold = (float)hit_warm / (hit_warm + miss_warm);
-        dl->heat_threshold = fmaxf(min_heat_threshold, dl->heat_threshold * new_heat_threshold);
+        // Phase 1优化：计算动态调整步长
+        if (dl->feedback_ctrl) {
+            dynamic_step = calculate_dynamic_step(dl->historical_stats, dl->feedback_ctrl);
+        }
 
-        // 更新trend_threshold
-        dl->trend_threshold = 0.35f + 0.65f * dl->trend_threshold;
+        // Phase 1优化：使用EMA命中率进行调整
+        adjustment_factor = ema_hit_rate * 2.0f; // 放大调整因子以提高响应性
+        dl->heat_threshold = fmaxf(min_heat_threshold, dl->heat_threshold * adjustment_factor);
+
+        // Phase 1优化：使用动态步长调整trend_threshold
+        dl->trend_threshold = dl->trend_threshold + dynamic_step * (0.35f - dl->trend_threshold * 0.65f);
+
+        pr_debug("[Phase1] PID %d: ema_hit_rate=%.3f, dynamic_step=%.3f, new_heat=%.3f, new_trend=%.3f\n",
+                dl->pid, ema_hit_rate, dynamic_step, dl->heat_threshold, dl->trend_threshold);
     }
 
     // 用更新的thresholds选择dirtymap的温页并更新new_warm
-    for (i = 0 ; i < dl->diffmap_size; i++) {
+    for (i = 0; i < dl->diffmap_size; i++) {
         if (dirtymap[i].heat <= dl->heat_threshold
          && -dirtymap[i].heat_trend > dl->trend_threshold * dirtymap[i].heat
          && !search_warm_list(dl, dirtymap[i].address)) {
@@ -910,77 +1069,64 @@ static void update_thresholds(struct dirty_log *dl) {
         }
     }
 
-    // 新温页过少(<32页或5%)时，适当放宽选择阈值
-    if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
-        if (min_in_dirtymap > min_heat_threshold) {
-            dl->heat_threshold = 1.25 * min_in_dirtymap;
-        } else {
-            dl->trend_threshold = 0.85f * dl->trend_threshold;
+    // Phase 1优化：改进的反馈控制逻辑
+    if (dl->feedback_ctrl) {
+        dl->feedback_ctrl->new_warm_count = new_warm;
+        dl->feedback_ctrl->total_warm_count = miss_warm;
+
+        // 计算误差（基于目标温页比例）
+        current_ratio = (float)new_warm / dl->diffmap_size;
+        error = dl->feedback_ctrl->target_warm_ratio - current_ratio;
+
+        // PID控制器调整
+        p_term = dl->feedback_ctrl->kp * error;
+        i_term = dl->feedback_ctrl->ki * dl->feedback_ctrl->integral_error;
+        d_term = dl->feedback_ctrl->kd * (error - dl->feedback_ctrl->prev_error);
+
+        pid_output = p_term + i_term + d_term;
+
+        // 新温页过少时，适当放宽选择阈值
+        if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
+            if (min_in_dirtymap > min_heat_threshold) {
+                dl->heat_threshold = fmaxf(dl->heat_threshold, min_in_dirtymap * (1.0f + pid_output));
+            } else {
+                dl->trend_threshold = fmaxf(0.1f, dl->trend_threshold * (0.85f - pid_output));
+            }
+        } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
+            // 新温页过多时，收紧阈值
+            dl->trend_threshold = fminf(2.0f, dl->trend_threshold * (1.15f + pid_output));
+            dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold * (1.0f - fabsf(pid_output)));
         }
-    } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
-        dl->trend_threshold = 1.15f * dl->trend_threshold;
-        dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold);
+
+        // 更新积分误差和上一轮误差
+        dl->feedback_ctrl->integral_error += error;
+        dl->feedback_ctrl->prev_error = error;
+
+        // 限制积分误差范围
+        if (dl->feedback_ctrl->integral_error > 1.0f)
+            dl->feedback_ctrl->integral_error = 1.0f;
+        else if (dl->feedback_ctrl->integral_error < -1.0f)
+            dl->feedback_ctrl->integral_error = -1.0f;
+    } else {
+        // 降级到原有逻辑（如果反馈控制器未初始化）
+        if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
+            if (min_in_dirtymap > min_heat_threshold) {
+                dl->heat_threshold = 1.25 * min_in_dirtymap;
+            } else {
+                dl->trend_threshold = 0.85f * dl->trend_threshold;
+            }
+        } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
+            dl->trend_threshold = 1.15f * dl->trend_threshold;
+            dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold);
+        }
+    }
+
+    // Phase 1优化：更新历史统计信息
+    if (dl->historical_stats) {
+        update_historical_stats(dl->historical_stats, ema_hit_rate,
+                               dl->heat_threshold, adjustment_factor);
     }
 }
-
-// /**
-//  * @brief 更新dirty_log中判断温页的阈值
-//  *
-//  * @param dl 进程的dirty-log结构体指针
-//  */
-// static void update_thresholds(struct dirty_log *dl) {
-//     struct dirty_diffmap *dirtymap = dl->diffmap;
-//     warm_page_t *wl = dl->warm_list;
-//     unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0;
-//     float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
-//     int i;
-
-//     if (!wl || !dirtymap) {
-//         pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
-//         return;
-//     }
-//     min_in_dirtymap = dirtymap[0].heat;
-
-//     // 遍历warm_list，更新hit_warm和miss_warm
-//     for (i = 0 ; i < dl->warm_size; i++) {
-//         if (!search_dirty_map(dl, wl[i].address)) {
-//             hit_warm++;
-//         } else {
-//             miss_warm++;
-//         }
-//     }
-
-//     // 当命中率不高于50%时(不包括空warm_list)，更新thresholds
-//     if (hit_warm <= miss_warm && miss_warm > 0) {
-//         min_heat_threshold = 1.0 / (float)(dl->ldm_header->track_duration_ns / 1e9);
-//         dl->heat_threshold = max(min_heat_threshold, dl->heat_threshold * (float)hit_warm / (float)(hit_warm + miss_warm));
-//         dl->trend_threshold = 0.55 + 0.45 * dl->trend_threshold;
-//     }
-
-//     // 用更新的thresholds选择dirtymap的温页并更新new_warm
-//     for (i = 0 ; i < dl->diffmap_size; i++) {
-//         if (dirtymap[i].heat <= dl->heat_threshold
-//          && -dirtymap[i].heat_trend > dl->trend_threshold * dirtymap[i].heat
-//          && !search_warm_list(dl, dirtymap[i].address)) {
-//             new_warm++;
-//         }
-//         if (dirtymap[i].heat < min_in_dirtymap) {
-//             min_in_dirtymap = dirtymap[i].heat;
-//         }
-//     }
-
-//     // 新温页过少(<32页或5%)时，适当放宽选择阈值
-//     if (new_warm < 32 || new_warm < 0.054 * miss_warm) {
-//         if (min_in_dirtymap > min_heat_threshold) {
-//             dl->heat_threshold = min_in_dirtymap;
-//         } else {
-//             dl->trend_threshold = 0.9025 * dl->trend_threshold;
-//         }
-//     } else if (new_warm >= 32 && new_warm > 0.25 * miss_warm) {
-//         dl->trend_threshold = 1.06 * dl->trend_threshold;
-//         dl->heat_threshold = max(min_in_dirtymap, (float)0.925 * dl->heat_threshold);
-//     }
-// }
 
 /**
  * @brief 将dirty_log的温页判断阈值写入thresholds.pid
@@ -1224,7 +1370,7 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // if (dl->latest_dm && dl->ldm_size) {
-    //     // pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
+    //     pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
     //     debug_show_dirtymap(dl->latest_dm, dl->ldm_size, pid);
     // } else if (!dl->latest_dm || !dl->ldm_size)
     //     pr_info("[Obsidian0215]No latest dirtymap for pid %d\n", pid);
@@ -1249,29 +1395,32 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     }
 
     // if (dl->less_latest_dm && dl->lldm_size) {
-    //     // pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
+    //     pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
     //     debug_show_dirtymap(dl->less_latest_dm, dl->lldm_size, pid);
     // } else if (!dl->less_latest_dm || !dl->lldm_size)
     //     pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
 
-    // 生成dirty_diffmap先保证两个dirtymap都按升序排列
-    // 使用升序的less_latest_dm和latest_dm生成dirty_diffmap
+    // 确保less_latest_dm和latest_dm为升序再生成dirty_diffmap
     // sort_dirty_map(latest_dm, lsize);
     // sort_dirty_map(less_latest_dm, slsize);
     dl->diffmap = merge_dirty_maps(dl);
 
-    debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
+    // debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
 
     // 加载上次的阈值并更新
     load_thresholds(dl, dirty_map_dir);
-    update_thresholds(dl);
 
-    /* 初始化脏页缓存 */
-    if (init_dirty_cache(dl, dirty_map_dir) != 0) {
-        pr_warn("Failed to initialize dirty cache for pid %d, proceeding without cache\n", pid);
+    // 优化1：初始化历史统计和反馈控制
+    if (init_historical_stats(dl) != 0) {
+        pr_warn("[Obsidian0215] Failed to initialize historical stats for pid %d\n", pid);
+    }
+    if (init_feedback_controller(dl) != 0) {
+        pr_warn("[Obsidian0215] Failed to initialize feedback controller for pid %d\n", pid);
     }
 
-    pr_debug("[Obsidian] threshold: %f, %f\n", dl->heat_threshold, dl->trend_threshold);
+    update_thresholds(dl);
+
+    pr_debug("[Obsidian0215] threshold: %f, %f\n", dl->heat_threshold, dl->trend_threshold);
     return 0;
 }
 
@@ -1407,9 +1556,17 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 处理thresholds
         if (write_thresholds(dl, opts.dirty_map_dir)) {
-            pr_perror("[Obsidian0215]Error updating thresholds to file");
+            pr_perror("[Obsidian0215] Error updating thresholds to file");
         }
-
+        // 优化1：清理历史统计和反馈控制
+        if (dl->historical_stats) {
+            free(dl->historical_stats);
+            dl->historical_stats = NULL;
+        }
+        if (dl->feedback_ctrl) {
+            free(dl->feedback_ctrl);
+            dl->feedback_ctrl = NULL;
+        }
         /* 销毁脏页缓存 */
         fini_dirty_cache(dl);
 
@@ -1561,194 +1718,6 @@ void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
 }
-
-// /**
-//  * @brief 查找warm_list中包含指定address
-//  *
-//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
-//  * @param addr 要查找的线性地址
-//  * @return int 找到则返回1，如果未找到则返回0
-//  */
-// int search_warm_list(struct dirty_log *dl, unsigned long addr) {
-//     unsigned long left = 0, right = 0;
-//     warm_page_t *cd_list;
-
-//     // warm_list为空，无法找到该地址
-//     if (!dl)
-//         return 0;
-//     else {
-//         cd_list = dl->warm_list;
-//         right = dl->warm_size;
-//         if (!cd_list || !right)
-//             return 0;
-//     }
-
-//     while (left < right) {
-//         unsigned long mid = left + (right - left) / 2;
-
-//         if (addr < cd_list[mid].address) {
-//             // 地址在当前范围左侧，缩小右边界
-//             right = mid;
-//         } else if (addr > cd_list[mid].address) {
-//             // 地址在当前范围右侧，缩小左边界
-//             left = mid + 1;
-//         } else {
-//             // 找到该地址
-//             return 1;
-//         }
-//     }
-//     // 未找到该地址
-//     return 0;
-// }
-
-// /**
-//  * @brief 将指定address插入warm_list中，并保持warm_list升序
-//  *
-//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
-//  * @param addr 要插入的线性地址
-//  * @return void
-//  */
-// void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
-//     char warm_list_filepath[PATH_MAX];
-//     unsigned long mid, left = 0, right, new_max, new_size;
-//     void *new_map;
-//     int fd;
-
-//     if (!dl || !dl->warm_list)
-//         return;
-
-//     right = dl->warm_size;
-//     // 二分查找插入位置
-//     while (left < right) {
-//         mid = left + (right - left) / 2;
-//         if (dl->warm_list[mid].address < addr)
-//             left = mid + 1;
-//         else
-//             right = mid;
-//     }
-
-//     // 检查地址是否已存在, 如果存在则直接增加记录，无需插入
-//     if (left < dl->warm_size && dl->warm_list[left].address == addr) {
-//         dl->warm_list[left].s_count++;
-//         return;
-//     }
-
-//     // 检查是否需要扩展
-//     if (dl->warm_size >= dl->warm_max) {
-//         pr_info("[Obsidian0215] need expand warm_list");
-//         new_max = dl->warm_max + EXPAND_WARM_BATCH;
-//         if (new_max > dl->diffmap_size) {
-//             new_max = dl->diffmap_size;
-//         }
-//         new_size = new_max * sizeof(warm_page_t);
-
-//         snprintf(warm_list_filepath, sizeof(warm_list_filepath),
-//              "%s/%s.%d", opts.dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
-//         warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-//          // 扩展文件大小以匹配新的映射范围
-//         fd = open(warm_list_filepath, O_RDWR);
-//         if (fd == -1) {
-//             perror("[Obsidian0215]Error opening warm list file");
-//             return;
-//         }
-//         if (ftruncate(fd, new_size) == -1) {
-//             perror("[Obsidian0215]ftruncate");
-//             close(fd);
-//             return;
-//         }
-//         close(fd);
-
-//         // 重新映射文件
-//         new_map = mremap(dl->warm_list, dl->warm_max * sizeof(warm_page_t), new_size, MREMAP_MAYMOVE);
-//         if (new_map == MAP_FAILED) {
-//             perror("[Obsidian0215]mremap");
-//             return;
-//         }
-
-//         dl->warm_list = (warm_page_t *)new_map;
-//         dl->warm_max = new_max;
-//     }
-
-//     // 如果插入位置是末尾，直接赋值无需移动
-//     if (left == dl->warm_size) {
-//         dl->warm_list[left].address = addr;
-//         dl->warm_list[left].s_count = 1;
-//         dl->warm_size++;
-//     } else {
-//         // 移动元素以腾出插入位置
-//         memmove(&dl->warm_list[left + 1], &dl->warm_list[left],
-//                 (dl->warm_size - left) * sizeof(warm_page_t));
-//         dl->warm_list[left].address = addr;
-//         dl->warm_list[left].s_count = 1;
-//         dl->warm_size++;
-//     }
-// }
-
-// /**
-//  * @brief 将指定address从warm_list中删除，并保持warm_list升序
-//  *
-//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
-//  * @param addr 要删除的线性地址
-//  * @return void
-//  */
-// static void del_in_warm_list(struct dirty_log *dl, unsigned long index) {
-
-//     if (!dl || !dl->warm_list || index >= dl->warm_size)
-//         return;
-
-//     // 删除的是最后一个元素，直接减少大小
-//     if (index == dl->warm_size - 1) {
-//         dl->warm_size--;
-//     } else {
-//         // 移动元素以覆盖删除的位置
-//         memmove(&dl->warm_list[index], &dl->warm_list[index + 1],
-//                 (dl->warm_size - index - 1) * sizeof(warm_page_t));
-//         dl->warm_size--;
-//     }
-// }
-
-// /**
-//  * @brief 将warm_list中指定address的s_count减1，若为0则删除保持warm_list升序
-//  *
-//  * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
-//  * @param addr 要操作的线性地址
-//  * @return void
-//  */
-// void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
-//     unsigned long mid, left = 0, right;
-
-//     if (!dl || !dl->warm_list)
-//         return;
-
-//     right = dl->warm_size;
-
-//     // 二分查找目标地址
-//     while (left < right) {
-//         mid = left + (right - left) / 2;
-//         if (dl->warm_list[mid].address < addr)
-//             left = mid + 1;
-//         else
-//             right = mid;
-//     }
-
-//     // 检查是否找到地址
-//     if (left >= dl->warm_size || dl->warm_list[left].address != addr)
-//         return;
-
-//     if (dl->warm_list[left].s_count > 0) {
-//         if (zero) {
-//             dl->warm_list[left].s_count = 0;
-//         } else {
-//             dl->warm_list[left].s_count--;
-//         }
-//         if (dl->warm_list[left].s_count == 0) {
-//             del_in_warm_list(dl, addr);
-//         }
-//     } else {
-//         // s_count为0，删除该元素
-//         del_in_warm_list(dl, addr);
-//     }
-// }
 
 /* 脏页缓存集成函数 - 每个进程独享 */
 

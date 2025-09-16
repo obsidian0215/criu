@@ -21,7 +21,8 @@ RUN apt-install \
 	pkg-config \
 	protobuf-c-compiler \
 	protobuf-compiler \
-	python3-minimal
+	python3-minimal	\
+	libglib2.0-dev
 
 COPY . /criu
 WORKDIR /criu

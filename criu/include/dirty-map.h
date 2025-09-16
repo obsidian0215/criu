@@ -26,6 +26,18 @@
 #define INITIAL_HEAT_THRESHOLD 5.0
 #define INITIAL_TREND_THRESHOLD 0.0
 
+// 优化1：指数移动平均和平滑参数
+#define EMA_ALPHA 0.3f                    // 指数移动平均平滑因子
+#define MAX_ADJUSTMENT_STEP 2.0f         // 最大调整步长
+#define MIN_ADJUSTMENT_STEP 0.1f         // 最小调整步长
+#define HISTORY_BUFFER_SIZE 10            // 历史数据缓冲区大小
+
+// 优化1：反馈控制参数
+#define TARGET_WARM_RATIO 0.05f          // 目标温页比例 (5%)
+#define KP_DEFAULT 0.1f                  // PID控制器比例系数
+#define KI_DEFAULT 0.01f                 // PID控制器积分系数
+#define KD_DEFAULT 0.05f                 // PID控制器微分系数
+
 // 检查pid是否被dirty-track中
 struct pid_check {
     pid_t pid;
@@ -57,6 +69,29 @@ typedef struct __attribute__((__packed__)) dirty_map
 typedef struct {
     u64 track_duration_ns;
 } dirtymap_header_t;
+
+// Phase 1优化：历史统计信息结构
+typedef struct {
+    float hit_rates[HISTORY_BUFFER_SIZE];           // 历史命中率
+    float threshold_history[HISTORY_BUFFER_SIZE];   // 历史阈值
+    float adjustment_factors[HISTORY_BUFFER_SIZE];  // 历史调整因子
+    int history_idx;                                 // 历史数据索引
+    float ema_hit_rate;                             // 指数移动平均命中率
+    float learning_rate;                            // 学习率
+    float momentum_factor;                          // 动量因子
+    int update_count;                               // 更新次数
+} historical_stats_t;
+
+// Phase 1优化：反馈控制结构
+typedef struct {
+    float target_warm_ratio;                        // 目标温页比例
+    float adjustment_step;                          // 当前调整步长
+    float integral_error;                           // 积分误差
+    float prev_error;                               // 上一轮误差
+    float kp, ki, kd;                               // PID控制器参数
+    unsigned int new_warm_count;                    // 新温页数量
+    unsigned int total_warm_count;                  // 总温页数量
+} feedback_controller_t;
 
 struct dirty_log {
     pid_t pid;
@@ -94,6 +129,10 @@ struct dirty_log {
     // 脏页缓存 - 每个进程独享
     dirty_cache_t *page_cache;       // 页面缓存实例
     bool cache_enabled;              // 缓存启用状态
+
+    // 优化1：历史统计和学习
+    historical_stats_t *historical_stats;           // 历史统计信息
+    feedback_controller_t *feedback_ctrl;           // 反馈控制
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -115,6 +154,8 @@ struct dirty_log {
     (log).lldm_header = NULL; \
     (log).page_cache = NULL; \
     (log).cache_enabled = false; \
+    (log).historical_stats = NULL; \
+    (log).feedback_ctrl = NULL; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -136,6 +177,8 @@ struct dirty_log {
     (log_ptr)->lldm_header = NULL; \
     (log_ptr)->page_cache = NULL; \
     (log_ptr)->cache_enabled = false; \
+    (log_ptr)->historical_stats = NULL; \
+    (log_ptr)->feedback_ctrl = NULL; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);

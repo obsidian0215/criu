@@ -17,3 +17,6 @@ libcap-dev
 libaio-dev
 python3-yaml
 libnl-route-3-dev
+
+# Obsidian0215 added
+libglib2.0-dev
