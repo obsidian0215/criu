@@ -422,6 +422,11 @@ void init_opts(void)
 	opts.cpu_cap = CPU_CAP_DEFAULT;
 	opts.manage_cgroups = CG_MODE_DEFAULT;
 	opts.ps_socket = -1;
+	/* restore/memory tuning defaults */
+	opts.restore_bulk_pages = 64; /* pages */
+	opts.pagemap_max_bunch_size = 256; /* pages */
+	opts.batch_madvise = 1; /* enabled */
+	opts.madvise_batch_min_pages = 1; /* pages */
 	opts.ghost_limit = DEFAULT_GHOST_LIMIT;
 	opts.timeout = DEFAULT_TIMEOUT;
 	opts.empty_ns = 0;
@@ -682,6 +687,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("display-stats", &opts.display_stats),
 		BOOL_OPT("weak-sysctls", &opts.weak_sysctls),
 		{ "status-fd", required_argument, 0, 1088 },
+		{ "restore-bulk-pages", required_argument, 0, 1300 },
+		{ "pagemap-max-bunch-size", required_argument, 0, 1301 },
+		BOOL_OPT("batch-madvise", &opts.batch_madvise),
+		{ "madvise-batch-min-pages", required_argument, 0, 1303 },
 		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
 		{ "verbosity", optional_argument, 0, 'v' },
 		{ "ps-socket", required_argument, 0, 1091 },
@@ -1047,6 +1056,21 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1200:
 			SET_CHAR_OPTS(dirty_map_dir, optarg);
+			break;
+		case 1300:
+			opts.restore_bulk_pages = atoi(optarg);
+			if ((int)opts.restore_bulk_pages < 0)
+				goto bad_arg;
+			break;
+		case 1301:
+			opts.pagemap_max_bunch_size = atoi(optarg);
+			if ((int)opts.pagemap_max_bunch_size <= 0)
+				goto bad_arg;
+			break;
+		case 1303:
+			opts.madvise_batch_min_pages = atoi(optarg);
+			if ((int)opts.madvise_batch_min_pages <= 0)
+				goto bad_arg;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

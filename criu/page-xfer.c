@@ -178,17 +178,25 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 {
 	ssize_t ret, left = len;
 
+	if (opts.mode == CR_RESTORE)
+		timing_start(TIME_PAGE_XFER);
+
 	if (opts.tls) {
 		pr_debug("Sending %lu bytes / %lu pages\n", len, len / PAGE_SIZE);
 
-		if (tls_send_data_from_fd(p, len))
+		if (tls_send_data_from_fd(p, len)) {
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_PAGE_XFER);
 			return -1;
+		}
 	} else {
 		pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
 
 		while (left > 0) {
 			ret = splice(p, NULL, xfer->sk, NULL, left, SPLICE_F_MOVE);
 			if (ret < 0) {
+				if (opts.mode == CR_RESTORE)
+					timing_stop(TIME_PAGE_XFER);
 				pr_perror("Can't write pages to socket");
 				return -1;
 			}
@@ -197,6 +205,9 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 			left -= ret;
 		}
 	}
+
+	if (opts.mode == CR_RESTORE)
+		timing_stop(TIME_PAGE_XFER);
 
 	return 0;
 }
@@ -257,14 +268,20 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
+	if (opts.mode == CR_RESTORE)
+		timing_start(TIME_PAGE_XFER);
 
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_PAGE_XFER);
 			pr_perror("Unable to spice data");
 			return -1;
 		}
 		if (ret == 0) {
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_PAGE_XFER);
 			pr_err("A pipe was closed unexpectedly\n");
 			return -1;
 		}
@@ -272,6 +289,9 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 		if (curr == len)
 			break;
 	}
+
+	if (opts.mode == CR_RESTORE)
+		timing_stop(TIME_PAGE_XFER);
 
 	return 0;
 }

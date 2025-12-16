@@ -13,6 +13,7 @@
 #include "restorer.h"
 #include "rst-malloc.h"
 #include "page-xfer.h"
+#include "stats.h"
 
 #include "fault-injection.h"
 #include "xmalloc.h"
@@ -40,10 +41,11 @@ struct page_read_iov {
 
 static inline bool can_extend_bunch(struct iovec *bunch, unsigned long off, unsigned long len)
 {
+	unsigned long max_bunch_pages = opts.pagemap_max_bunch_size ? opts.pagemap_max_bunch_size : MAX_BUNCH_SIZE;
 	return /* The next region is the continuation of the existing */
 		((unsigned long)bunch->iov_base + bunch->iov_len == off) &&
 		/* The resulting region is non empty and is small enough */
-		(bunch->iov_len == 0 || bunch->iov_len + len < MAX_BUNCH_SIZE * PAGE_SIZE);
+		(bunch->iov_len == 0 || bunch->iov_len + len < max_bunch_pages * PAGE_SIZE);
 }
 
 static int punch_hole(struct page_read *pr, unsigned long off, unsigned long len, bool cleanup)
@@ -250,16 +252,22 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 		return -1;
 
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
+	if (opts.mode == CR_RESTORE)
+		timing_start(TIME_READ_PAGES);
 	while (1) {
 		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_READ_PAGES);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
 	}
+	if (opts.mode == CR_RESTORE)
+		timing_stop(TIME_READ_PAGES);
 
 	if (opts.auto_dedup) {
 		ret = punch_hole(pr, pr->pi_off, len, false);
@@ -420,19 +428,29 @@ static int maybe_read_page_img_streamer(struct page_read *pr, unsigned long vadd
 	/* We can't seek. The requested address better match */
 	BUG_ON(pr->cvaddr != vaddr);
 
+	if (opts.mode == CR_RESTORE)
+		timing_start(TIME_READ_PAGES);
+
 	while (1) {
 		ret = read(fd, buf + curr, len - curr);
 		if (ret == 0) {
 			pr_err("Reached EOF unexpectedly while reading page from image\n");
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_READ_PAGES);
 			return -1;
 		} else if (ret < 0) {
 			pr_perror("Can't read mapping page %d", ret);
+			if (opts.mode == CR_RESTORE)
+				timing_stop(TIME_READ_PAGES);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
 	}
+
+	if (opts.mode == CR_RESTORE)
+		timing_stop(TIME_READ_PAGES);
 
 	if (opts.auto_dedup)
 		pr_warn_once("Can't dedup when streaming images\n");
@@ -540,7 +558,11 @@ static int process_async_reads(struct page_read *pr)
 		pr_debug("Read piov iovs %d, from %ju, len %ju, first %p:%zu\n", piov->nr, piov->from,
 			 piov->end - piov->from, piov->to->iov_base, piov->to->iov_len);
 	more:
+		if (opts.mode == CR_RESTORE)
+			timing_start(TIME_READ_PAGES);
 		ret = preadv(fd, piov->to, piov->nr, piov->from);
+		if (opts.mode == CR_RESTORE)
+			timing_stop(TIME_READ_PAGES);
 		if (fault_injected(FI_PARTIAL_PAGES)) {
 			/*
 			 * We might have read everything, but for debug
@@ -555,7 +577,7 @@ static int process_async_reads(struct page_read *pr)
 
 		if (ret < 0) {
 			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-			       piov->end - piov->from, piov->from, piov->nr);
+				   piov->end - piov->from, piov->from, piov->nr);
 			return -1;
 		}
 

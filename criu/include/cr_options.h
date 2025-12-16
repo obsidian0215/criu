@@ -241,6 +241,12 @@ struct cr_options {
 	/* [Obsidian0215]use for adaptive live migration */
 	int use_dirty_map;
 	char* dirty_map_dir;
+
+	/* Fine-grained restore tuning options */
+	unsigned int restore_bulk_pages;
+	unsigned int pagemap_max_bunch_size;
+	int batch_madvise;
+	unsigned int madvise_batch_min_pages;
 };
 
 extern struct cr_options opts;

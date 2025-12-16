@@ -147,6 +147,15 @@ static void display_stats(int what, StatsEntry *stats)
 			       stats->restore->pages_restored);
 		pr_msg("Restore time: %d us\n", stats->restore->restore_time);
 		pr_msg("Forking time: %d us\n", stats->restore->forking_time);
+
+		if (stats->restore->has_read_pages_time)
+			pr_msg("Pages read time: %d us\n", stats->restore->read_pages_time);
+		if (stats->restore->has_compare_pages_time)
+			pr_msg("Pages compare time: %d us\n", stats->restore->compare_pages_time);
+		if (stats->restore->has_copy_pages_time)
+			pr_msg("Pages copy time: %d us\n", stats->restore->copy_pages_time);
+		if (stats->restore->has_page_xfer_time)
+			pr_msg("Page transfer time: %d us\n", stats->restore->page_xfer_time);
 	} else
 		return;
 }
@@ -197,6 +206,11 @@ void write_stats(int what)
 
 		encode_time(TIME_FORK, &rs_entry.forking_time);
 		encode_time(TIME_RESTORE, &rs_entry.restore_time);
+		/* fine-grained restore timings */
+		encode_time(TIME_READ_PAGES, &rs_entry.read_pages_time);
+		encode_time(TIME_COMPARE_PAGES, &rs_entry.compare_pages_time);
+		encode_time(TIME_COPY_PAGES, &rs_entry.copy_pages_time);
+		encode_time(TIME_PAGE_XFER, &rs_entry.page_xfer_time);
 
 		name = "restore";
 	} else

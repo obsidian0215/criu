@@ -1441,6 +1441,64 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			if (vma_inherited(vma)) {
 				clear_bit(off, vma->pvma->page_bitmap);
 
+				/* Bulk read + compare/copy when configured */
+				if (opts.restore_bulk_pages > 0) {
+					unsigned int max_nr = min_t(unsigned int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
+					unsigned int chunk = min_t(unsigned int, opts.restore_bulk_pages, max_nr);
+					int k;
+
+					/* allocate temp buffer for bulk read */
+					{
+						void *tmp = xmalloc(chunk * PAGE_SIZE);
+						if (!tmp)
+							goto err_read;
+
+						ret = pr->read_pages(pr, va, chunk, tmp, 0);
+						if (ret < 0) {
+							xfree(tmp);
+							goto err_read;
+						}
+
+						va += chunk * PAGE_SIZE;
+						nr_compared += chunk;
+
+						/* mark the bitmap for all pages read */
+						for (k = 0; k < (int)chunk; k++)
+							set_bit(off + k, vma->page_bitmap);
+
+						/* if all pages equal, count as shared */
+						timing_start(TIME_COMPARE_PAGES);
+						if (memcmp(p, tmp, chunk * PAGE_SIZE) == 0) {
+							timing_stop(TIME_COMPARE_PAGES);
+							nr_shared += chunk;
+						} else {
+							timing_stop(TIME_COMPARE_PAGES);
+							/* Otherwise compare page-by-page and copy differing pages */
+							for (k = 0; k < (int)chunk; k++) {
+								timing_start(TIME_COMPARE_PAGES);
+								if (memcmp((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE) != 0) {
+									timing_stop(TIME_COMPARE_PAGES);
+									timing_start(TIME_COPY_PAGES);
+									memcpy((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE);
+									timing_stop(TIME_COPY_PAGES);
+									nr_restored++;
+								} else {
+									timing_stop(TIME_COMPARE_PAGES);
+									nr_shared++;
+								}
+							}
+						}
+
+						xfree(tmp);
+
+						/* advance indices */
+						i += chunk - 1;
+						off += chunk;
+						continue;
+					}
+				}
+
+				/* Fall back to single-page path */
 				ret = pr->read_pages(pr, va, 1, buf, 0);
 				if (ret < 0)
 					goto err_read;
@@ -1506,6 +1564,25 @@ err_read:
 			if (i >= size)
 				break;
 
+			if (opts.batch_madvise && opts.madvise_batch_min_pages > 1) {
+				unsigned long j = i + 1;
+				/* extend j while next bits are also set (pages to drop) */
+				while (j < size && test_bit(j, vma->pvma->page_bitmap))
+					j++;
+				if (j - i >= opts.madvise_batch_min_pages) {
+					unsigned long len = j - i;
+					ret = madvise(addr + PAGE_SIZE * i, len * PAGE_SIZE, MADV_DONTNEED);
+					if (ret < 0) {
+						pr_perror("madvise failed");
+						return -1;
+					}
+					nr_dropped += len;
+					i = j;
+					continue;
+				}
+			}
+
+			/* fallback to single page madvise */
 			ret = madvise(addr + PAGE_SIZE * i, PAGE_SIZE, MADV_DONTNEED);
 			if (ret < 0) {
 				pr_perror("madvise failed");
