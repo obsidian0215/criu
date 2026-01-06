@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdlib.h>
 #include "int.h"
 #include "atomic.h"
 #include "cr_options.h"
@@ -100,6 +101,7 @@ void timing_stop(int t)
 {
 	struct timing *tm;
 	struct timeval now;
+	long delta_us;
 
 	/* stats haven't been initialized. */
 	if (!dstats && !rstats)
@@ -107,7 +109,71 @@ void timing_stop(int t)
 
 	tm = get_timing(t);
 	gettimeofday(&now, NULL);
+
+	/* compute delta in microseconds (now - start) */
+	delta_us = (now.tv_sec - tm->start.tv_sec) * USEC_PER_SEC + (now.tv_usec - tm->start.tv_usec);
+	if (delta_us < 0)
+		delta_us = 0;
+
+	/* accumulate into total timing */
 	timeval_accumulate(&tm->start, &now, &tm->total);
+
+	/* For restore, account microsecond deltas in atomic counters so it works across tasks */
+	if (rstats) {
+		switch (t) {
+		case TIME_READ_PAGES:
+			cnt_add(CNT_READ_PAGES_USEC, delta_us);
+			break;
+		case TIME_COMPARE_PAGES:
+			cnt_add(CNT_COMPARE_PAGES_USEC, delta_us);
+			break;
+		case TIME_COPY_PAGES:
+			cnt_add(CNT_COPY_PAGES_USEC, delta_us);
+			break;
+		case TIME_PAGE_XFER:
+			cnt_add(CNT_PAGE_XFER_USEC, delta_us);
+			break;
+		/* Fine-grained phase timings - only account when STATS_EXPORT is enabled */
+		case TIME_PREPARE_NS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_PREPARE_NS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_NS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_NS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_CGROUP:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_CGROUP_USEC, delta_us);
+			break;
+		case TIME_RESTORE_FILES:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_FILES_USEC, delta_us);
+			break;
+		case TIME_RESTORE_PIDS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_PIDS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_SOCKETS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_SOCKETS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_CREDS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_CREDS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_MNTNS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_MNTNS_USEC, delta_us);
+			break;
+		case TIME_RESTORE_VMAS:
+			if (getenv("STATS_EXPORT"))
+				cnt_add(CNT_RESTORE_VMAS_USEC, delta_us);
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 static void encode_time(int t, u_int32_t *to)
@@ -206,11 +272,15 @@ void write_stats(int what)
 
 		encode_time(TIME_FORK, &rs_entry.forking_time);
 		encode_time(TIME_RESTORE, &rs_entry.restore_time);
-		/* fine-grained restore timings */
-		encode_time(TIME_READ_PAGES, &rs_entry.read_pages_time);
-		encode_time(TIME_COMPARE_PAGES, &rs_entry.compare_pages_time);
-		encode_time(TIME_COPY_PAGES, &rs_entry.copy_pages_time);
-		encode_time(TIME_PAGE_XFER, &rs_entry.page_xfer_time);
+		/* fine-grained restore timings: use accumulated atomic microsecond counters */
+		rs_entry.read_pages_time = atomic_read(&rstats->counts[CNT_READ_PAGES_USEC]);
+		rs_entry.has_read_pages_time = !!rs_entry.read_pages_time;
+		rs_entry.compare_pages_time = atomic_read(&rstats->counts[CNT_COMPARE_PAGES_USEC]);
+		rs_entry.has_compare_pages_time = !!rs_entry.compare_pages_time;
+		rs_entry.copy_pages_time = atomic_read(&rstats->counts[CNT_COPY_PAGES_USEC]);
+		rs_entry.has_copy_pages_time = !!rs_entry.copy_pages_time;
+		rs_entry.page_xfer_time = atomic_read(&rstats->counts[CNT_PAGE_XFER_USEC]);
+		rs_entry.has_page_xfer_time = !!rs_entry.page_xfer_time;
 
 		name = "restore";
 	} else
@@ -224,7 +294,58 @@ void write_stats(int what)
 
 	if (opts.display_stats)
 		display_stats(what, &stats);
+
+	/* Export a concise STATS_EXPORT line for external parsers when requested */
+	if (what == RESTORE_STATS && getenv("STATS_EXPORT")) {
+		unsigned long read_us = (unsigned long) rs_entry.read_pages_time;
+		unsigned long cmp_us = (unsigned long) rs_entry.compare_pages_time;
+		unsigned long copy_us = (unsigned long) rs_entry.copy_pages_time;
+		unsigned long xfer_us = (unsigned long) rs_entry.page_xfer_time;
+		unsigned long pages_work_us = read_us + cmp_us + copy_us + xfer_us;
+
+		/* Collect new phase timings */
+		unsigned long prep_ns_us = atomic_read(&rstats->counts[CNT_PREPARE_NS_USEC]);
+		unsigned long restore_ns_us = atomic_read(&rstats->counts[CNT_RESTORE_NS_USEC]);
+		unsigned long cgroup_us = atomic_read(&rstats->counts[CNT_RESTORE_CGROUP_USEC]);
+		unsigned long files_us = atomic_read(&rstats->counts[CNT_RESTORE_FILES_USEC]);
+		unsigned long pids_us = atomic_read(&rstats->counts[CNT_RESTORE_PIDS_USEC]);
+		unsigned long sockets_us = atomic_read(&rstats->counts[CNT_RESTORE_SOCKETS_USEC]);
+		unsigned long creds_us = atomic_read(&rstats->counts[CNT_RESTORE_CREDS_USEC]);
+		unsigned long mntns_us = atomic_read(&rstats->counts[CNT_RESTORE_MNTNS_USEC]);
+		unsigned long vmas_us = atomic_read(&rstats->counts[CNT_RESTORE_VMAS_USEC]);
+
+		/* Total forking and restore times */
+		unsigned long fork_us = (unsigned long) rs_entry.forking_time;
+		unsigned long restore_total_us = (unsigned long) rs_entry.restore_time;
+
+		/* Export comprehensive timing breakdown */
+		pr_info("STATS_EXPORT: "
+			"fork_time_us=%lu "
+			"restore_total_us=%lu "
+			"prepare_ns_us=%lu "
+			"restore_ns_us=%lu "
+			"cgroup_us=%lu "
+			"mntns_us=%lu "
+			"files_us=%lu "
+			"pids_us=%lu "
+			"sockets_us=%lu "
+			"creds_us=%lu "
+			"vmas_us=%lu "
+			"read_pages_us=%lu "
+			"compare_pages_us=%lu "
+			"copy_pages_us=%lu "
+			"page_xfer_us=%lu "
+			"pages_work_us=%lu "
+			"pages_restored=%lu"
+			"\n",
+			fork_us, restore_total_us,
+			prep_ns_us, restore_ns_us, cgroup_us, mntns_us,
+			files_us, pids_us, sockets_us, creds_us, vmas_us,
+			read_us, cmp_us, copy_us, xfer_us, pages_work_us,
+			rs_entry.pages_restored);
+	}
 }
+
 
 int init_stats(int what)
 {

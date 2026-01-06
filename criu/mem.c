@@ -507,72 +507,279 @@ again:
 	return ret;
 }
 
+static enum page_access_pattern classify_page_pattern(struct dirty_diffmap *dhm, struct dirty_log *dl, vma_stats_t *vs)
+{
+	float abs_trend;
+	float min_heat = dl->min_heat;
+	float heat_threshold = dl->heat_threshold;
+	float trend_base = 0.2f;
+	float cooling_base = -1.2f;
+	float vol_limit = 0.15f;
+	float effective_ema;
+
+	if (!dhm)
+		return PATTERN_UNKNOWN;
+
+	effective_ema = dl->current_ema_hit_rate;
+	if (vs && vs->historical_stats && vs->historical_stats->ema_hit_rate > 0.0f) {
+		effective_ema = vs->current_ema_hit_rate;
+	}
+
+	// [Obsidian0215] 优化3：动态趋势阈值
+	// 根据当前平滑命中率调整分类门槛
+	if (effective_ema > 0.0f) {
+		if (effective_ema < 0.85f) {
+			// 准确率较低，变得更保守
+			float penalty = (0.85f - effective_ema);
+			trend_base += penalty * 0.8f;      // 提高稳定判定门槛
+			cooling_base -= penalty * 3.0f;    // 提高变冷判定门槛（要求更明显的下降）
+
+			// [Obsidian0215] 额外惩罚：降低冷页判定上限且收紧波动性限制
+			min_heat *= (1.0f - penalty);
+			vol_limit *= (effective_ema / 0.85f);
+		} else if (effective_ema > 0.95f) {
+			// 准确率很高，可以稍微激进一点
+			trend_base = 0.15f;
+			cooling_base = -0.8f;
+		}
+	}
+
+	if (dhm->consecutive_appear == 0)
+		return PATTERN_COLD;
+
+	// [Obsidian0215] 持久性过滤器：如果页面在所有轮次中均出现，判定为持续热页
+	// 针对 InfluxDB 等低准确率负载，避免传输这种“伪冷却”页
+	if (dl->current_predump_iter >= 2 && dhm->consecutive_appear >= (unsigned int)dl->current_predump_iter) {
+		if (effective_ema > 0.1f && effective_ema < 0.70f) {
+			return PATTERN_HOT_STABLE;
+		}
+	}
+
+	// 第一次出现：根据热度分类，作为 warm_list 基线
+	if (dhm->consecutive_appear == 1) {
+		if (dhm->heat < min_heat)
+			return PATTERN_COLD;
+		else if (dhm->heat >= min_heat && dhm->heat <= heat_threshold)
+			return PATTERN_WARMING;  // 温页，应加入 warm_list
+		else
+			return PATTERN_HOT_STABLE;  // 热页，跳过传输
+	}
+
+	// 第二次及以后：根据趋势分类
+	abs_trend = fabsf(dhm->heat_trend);
+
+	// 更严格的分类逻辑以提升准确率
+	if (dhm->consecutive_appear >= 2 && abs_trend < trend_base) {
+		if (dhm->heat < min_heat)
+			return PATTERN_COLD_STABLE;
+		else if (dhm->heat > heat_threshold)
+			return PATTERN_HOT_STABLE;
+		else
+			return PATTERN_OSCILLATING;
+	}
+
+	if (dhm->heat_trend > trend_base)
+		return PATTERN_WARMING;
+
+	// [Obsidian0215] 波动性检查：防止将不稳定的页面误判为变冷
+	if (dhm->volatility > vol_limit * dhm->heat)
+		return PATTERN_OSCILLATING;
+
+	// 变冷页面：要求下降趋势非常明显且热度已经降到一定程度
+	if (dhm->heat_trend < cooling_base || (dhm->heat_trend < (cooling_base/2.0f) && dhm->heat < heat_threshold))
+		return PATTERN_COOLING;
+
+	if (dhm->heat < min_heat)
+		return PATTERN_COLD_STABLE;
+
+	return PATTERN_UNKNOWN;
+}
+
+static bool is_neighborhood_hot(struct dirty_log *dl, unsigned long vaddr) {
+	unsigned long radial_pages = 4; // 16KB radius (adaptive for LSM-tree like InfluxDB)
+	unsigned long i;
+	struct dirty_diffmap *dhm;
+
+	for (i = 1; i <= radial_pages; i++) {
+		// Check forward
+		dhm = search_dirty_map(dl, vaddr + i * PAGE_SIZE);
+		if (dhm && dhm->heat > dl->heat_threshold) return true;
+
+		// Check backward
+		if (vaddr >= i * PAGE_SIZE) {
+			dhm = search_dirty_map(dl, vaddr - i * PAGE_SIZE);
+			if (dhm && dhm->heat > dl->heat_threshold) return true;
+		}
+	}
+	return false;
+}
+
+static bool decide_by_pattern(enum page_access_pattern pattern, struct dirty_log *dl, unsigned long vaddr, struct dirty_diffmap *dhm, vma_stats_t *vs)
+{
+	warm_page_t *wp = search_warm_list_entry(dl, vaddr);
+	int cooling_threshold = 2;
+	float relative_cooling_rate;
+	float effective_ema;
+
+	effective_ema = dl->current_ema_hit_rate;
+	if (vs && vs->historical_stats && vs->historical_stats->ema_hit_rate > 0.0f) {
+		effective_ema = vs->current_ema_hit_rate;
+	}
+
+	// [Obsidian0215] 优化：根据准确率动态调整冷却窗口
+	// 如果准确率极低（如 InfluxDB 场景），要求更长的观察期
+	if (effective_ema > 0.0f) {
+		if (effective_ema < 0.30f) {
+			cooling_threshold = 4;
+		} else if (effective_ema < 0.60f) {
+			cooling_threshold = 3;
+		}
+	}
+
+	// Phase 1 核心策略：只传输稳定冷页和正在变冷的页面
+	// 跳过所有可能继续变脏的页面（warming/hot/oscillating）
+	switch (pattern) {
+	case PATTERN_COLD:
+	case PATTERN_COLD_STABLE:
+		if (wp) wp->consecutive_cooling = 0;
+
+		// [Obsidian0215] 自适应空间局部性检查
+		// 如果命中率较低（< 0.7，如 InfluxDB），开启空间检查以防范连带变脏
+		// 如果命中率很高（> 0.9，如 Redis），禁用检查以支持稀疏访问
+		if (effective_ema > 0.1f && effective_ema < 0.70f) {
+			if (is_neighborhood_hot(dl, vaddr))
+				return false;
+		}
+
+		return true;  // 冷页传输（稳定，不会再变脏）
+
+	case PATTERN_COOLING:
+		// [Obsidian0215] 相对热度策略：针对 InfluxDB/ES 的高热页面优化
+		if (dhm) {
+			// 如果绝对热度依然很高 (高于4.0)，即使有下降趋势，也说明刚从高热状态脱离
+			// 这种页面极易反弹，需要更长的观察窗口
+			if (dhm->heat > 4.0f) {
+				if (cooling_threshold < 3) cooling_threshold = 3;
+			}
+
+			// 相对冷却率 = |trend| / heat，用来判定冷却的"可信度"
+			relative_cooling_rate = fabsf(dhm->heat_trend) / (dhm->heat + 0.01f);
+			if (relative_cooling_rate < 0.05f && dhm->heat_trend < -0.2f) {
+				// 极慢冷却（小于5%且有明确趋势），可能是大内存应用的稳态调整
+				// 这种页面其实非常安全，不需要太长观察期
+				cooling_threshold = 2;
+			} else if (relative_cooling_rate < 0.15f && dhm->heat_trend < -0.5f) {
+				// 中等缓慢下降，维持现有观察期
+				if (cooling_threshold < 3) cooling_threshold = 3;
+			}
+		}
+
+		if (wp) {
+			wp->consecutive_cooling++;
+			if (wp->consecutive_cooling >= cooling_threshold) {
+				return true; // 连续多次变冷，才传输
+			}
+			return false; // 观察期内，不传输
+		}
+		return true;  // 变冷页面传输（正在降温，可能不再变脏）
+
+	case PATTERN_WARMING:
+	case PATTERN_HOT_STABLE:
+	case PATTERN_OSCILLATING:
+	case PATTERN_UNKNOWN:
+	default:
+		if (wp) wp->consecutive_cooling = 0;
+		return false;  // 跳过所有可能继续变脏的页面
+	}
+}
+
 // [Obsidian0215]make the decision whether to dump the pages
-static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty) {
-    struct dirty_diffmap *dhm = search_dirty_map(dl, vaddr);
+static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty, vma_stats_t *vs) {
+	struct dirty_diffmap *dhm = search_dirty_map(dl, vaddr);
 
 	if (pre_dump) {
-        if (!dhm) {
-            // 未在dirty_map中找到，根据是否有父镜像决定
-            if (!has_parent) {
+		// [Obsidian0215] 修正：如果已经在父镜像中且未变脏，则跳过，避免重复传输
+		if (has_parent && page_in_parent(softdirty))
+			return false;
+
+		if (!dhm) {
+			// 未在dirty_map中找到，根据是否有父镜像决定
+			if (!has_parent) {
 				// 没有父镜像，选择没有变脏的冷页
 				if (!page_in_parent(softdirty))
-                	return true;
+					return true;
 				else	// 若之前没有被track，可以跳过
-                	return false;
-            } else {
+					return false;
+			} else {
 				// (现在脏页追踪到进程冻结才结束，一般dirtymap不会遗漏脏页)
 				// 有父镜像且无dirty-map记录的一定是冷页且被传输过，跳过
-                return false;
-            }
-        } else {
-            // 被dirty_map记录则基于热度和热度变化确定
-            if (dhm->heat < dl->min_heat) {
+				return false;
+			}
+		} else {
+			enum page_access_pattern pattern;
+			bool should_transfer;
+
+			pattern = classify_page_pattern(dhm, dl, vs);
+			dhm->pattern = pattern;
+
+			should_transfer = decide_by_pattern(pattern, dl, vaddr, dhm, vs);
+
+			// Log pattern classification for statistics
+			pr_debug("vaddr=0x%lx pattern=%d heat=%.2f trend=%.2f appear=%d\n",
+				vaddr, pattern, dhm->heat, dhm->heat_trend, dhm->consecutive_appear);
+
+			if (pattern != PATTERN_UNKNOWN) {
+				// [Obsidian0215] 恢复：将所有非冷页加入 warm_list 进行追踪
+				// 这样 selection accuracy 才能反映“预测覆盖率”
+				if (pattern != PATTERN_COLD_STABLE && pattern != PATTERN_COLD) {
+					inc_warm_list(dl, vaddr);
+				}
+				return should_transfer;
+			}
+			// 模式无法确定时，回退到热度和趋势的决策
+			if (dhm->heat < dl->min_heat) {
 				// 冷页（一般只会从第二次predump出现）, 选择变冷的
 				if (dhm->heat_trend < 0) {
 					// 判断是否在温页列表中，若在则删除该地址
 					if (search_warm_list(dl, vaddr)) {
-						pr_info("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
+						pr_debug("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
 						// sub_warm_list(dl, vaddr, true);
 						return false;
 					}
-                	return true;
+					return true;
 				} else {	// 一般不会走该分支
 					return false;
 				}
-            } else if (dhm->heat <= dl->heat_threshold && dhm->heat >= dl->min_heat) {
+			} else if (dhm->heat <= dl->heat_threshold && dhm->heat >= dl->min_heat) {
 				// 温页，选择热度下降较快的（超过trend_threshold）
 				// 并加入温页列表
-                if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
-					// if (!search_warm_list(dl, vaddr))
-					// 	pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
-					// else
-					// 	pr_info("[Obsidian0215]update 0x%lx to warm list\n", vaddr);
+				if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
 					inc_warm_list(dl, vaddr);
-                    return true;
-                } else
-                	return false;
-            } else {
+					return true;
+				} else
+					return false;
+			} else {
 				 // 热页被跳过
 				// 判断是否在温页列表中，若在则删除该地址
 				if (search_warm_list(dl, vaddr)) {
-					pr_info("[Obsidian0215]0x%lx in warm list get hot\n", vaddr);
-					// inc_warm_list(dl, vaddr);
-					// sub_warm_list(dl, vaddr, false);
+					pr_debug("[Obsidian0215]0x%lx in warm list get hot\n", vaddr);
 				}
-                return false;
-            }
-        }
-    } else { // dump模式下
-        if (dhm) {
+				return false;
+			}
+		}
+	} else { // dump模式下
+		if (dhm) {
+			// [Obsidian0215] 修正：即使在dirty-map中，如果页面在父镜像中且未变脏，也应跳过
+			if (has_parent && page_in_parent(softdirty))
+				return false;
 			// 被dirty-map记录的页——最后一次需要传输
-            return true;
-        } else if (!dhm && has_parent && !page_in_parent(softdirty)) {
+			return true;
+		} else if (!dhm && has_parent && !page_in_parent(softdirty)) {
 			// 未被dirty-map记录但soft-dirty置位(发生过修改)——最后一次需要传输
 			// (目前这种情况应该不太可能触发，dirty-map能覆盖进程运行的所有脏页)
-            return true;
-        } else if (!dhm && !has_parent) {
-			// 未被dirty-map记录, 且无父镜像——需要传输
+			return true;
+		} else if (!dhm && !has_parent) {
+			// 未被dirty-map记录, 且无父镜像——冷页需要传输
 			// 进程在dump前创建且未被track会产生这种情况
 			return true;
 		} else {
@@ -580,7 +787,7 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
 			// 能找到父镜像则可以跳过
 			return false;
 		}
-    }
+	}
 }
 
 //[Obsidian0215]put pages into page-pipe with dirty-map
@@ -592,6 +799,10 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
+	unsigned long total_written;
+	unsigned long total_transferred;
+	float skip_rate;
+	vma_stats_t *vs = search_vma_stats(item->dl, vma->e->start);
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
@@ -621,7 +832,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 		 */
 		// [Obsidian0215] for pages in writable vma, check dirty-map to decide whether to dump
 		if ((vma->e->prot & PROT_WRITE) || !(vma->e->status & VMA_NO_PROT_WRITE)) {
-			if (!choose_page_by_dirtymap(item->dl, vaddr, pre_dump, has_parent, softdirty)) {
+			if (!choose_page_by_dirtymap(item->dl, vaddr, pre_dump, has_parent, softdirty, vs)) {
 				// ret = page_pipe_add_hole(pp, vaddr, pre_dump? PP_HOLE_SKIP: PP_HOLE_PARENT);
 				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 				st = 0;
@@ -661,11 +872,15 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
 
+	total_written = pages[2] + pages[1];
+	total_transferred = total_written;
+	skip_rate = (nr_scanned > 0) ? (100.0 * pages[0] / nr_scanned) : 0;
+
+	pr_info("[Obsidian0215]Pagemap stats: scanned=%lu transferred=%lu holes=%lu skip_rate=%.1f%%\n",
+		nr_scanned, total_transferred, pages[0], skip_rate);
 	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
 	return ret;
 }
-
-// [Obsidian0215] 使用dirty_map的generate_vma_iovs
 static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
@@ -1441,62 +1656,61 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			if (vma_inherited(vma)) {
 				clear_bit(off, vma->pvma->page_bitmap);
 
-				/* Bulk read + compare/copy when configured */
-				if (opts.restore_bulk_pages > 0) {
-					unsigned int max_nr = min_t(unsigned int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
-					unsigned int chunk = min_t(unsigned int, opts.restore_bulk_pages, max_nr);
-					int k;
+/* Bulk read + compare/copy (enabled only when opts.restore_bulk_pages > 1) */
+			if (opts.restore_bulk_pages > 1) {
+				unsigned int max_nr = min_t(unsigned int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
+				unsigned int chunk = min_t(unsigned int, opts.restore_bulk_pages, max_nr);
+				int k;
 
-					/* allocate temp buffer for bulk read */
-					{
-						void *tmp = xmalloc(chunk * PAGE_SIZE);
-						if (!tmp)
-							goto err_read;
+				if (chunk > 1) {
+					void *tmp = xmalloc(chunk * PAGE_SIZE);
+					if (!tmp)
+						goto err_read;
 
-						ret = pr->read_pages(pr, va, chunk, tmp, 0);
-						if (ret < 0) {
-							xfree(tmp);
-							goto err_read;
-						}
+					ret = pr->read_pages(pr, va, chunk, tmp, 0);
+					if (ret < 0) {
+						xfree(tmp);
+						goto err_read;
+					}
 
-						va += chunk * PAGE_SIZE;
-						nr_compared += chunk;
+					va += chunk * PAGE_SIZE;
+					nr_compared += chunk;
 
-						/* mark the bitmap for all pages read */
-						for (k = 0; k < (int)chunk; k++)
-							set_bit(off + k, vma->page_bitmap);
+					/* mark the bitmap for all pages read */
+					for (k = 0; k < (int)chunk; k++)
+						set_bit(off + k, vma->page_bitmap);
 
-						/* if all pages equal, count as shared */
-						timing_start(TIME_COMPARE_PAGES);
-						if (memcmp(p, tmp, chunk * PAGE_SIZE) == 0) {
-							timing_stop(TIME_COMPARE_PAGES);
-							nr_shared += chunk;
-						} else {
-							timing_stop(TIME_COMPARE_PAGES);
-							/* Otherwise compare page-by-page and copy differing pages */
-							for (k = 0; k < (int)chunk; k++) {
-								timing_start(TIME_COMPARE_PAGES);
-								if (memcmp((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE) != 0) {
-									timing_stop(TIME_COMPARE_PAGES);
-									timing_start(TIME_COPY_PAGES);
-									memcpy((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE);
-									timing_stop(TIME_COPY_PAGES);
-									nr_restored++;
-								} else {
-									timing_stop(TIME_COMPARE_PAGES);
-									nr_shared++;
-								}
+					/* if all pages equal, count as shared */
+					timing_start(TIME_COMPARE_PAGES);
+					if (memcmp(p, tmp, chunk * PAGE_SIZE) == 0) {
+						timing_stop(TIME_COMPARE_PAGES);
+						nr_shared += chunk;
+					} else {
+						timing_stop(TIME_COMPARE_PAGES);
+						/* Otherwise compare page-by-page and copy differing pages */
+						for (k = 0; k < (int)chunk; k++) {
+							timing_start(TIME_COMPARE_PAGES);
+							if (memcmp((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE) != 0) {
+								timing_stop(TIME_COMPARE_PAGES);
+								timing_start(TIME_COPY_PAGES);
+								memcpy((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE);
+								timing_stop(TIME_COPY_PAGES);
+								nr_restored++;
+							} else {
+								timing_stop(TIME_COMPARE_PAGES);
+								nr_shared++;
 							}
 						}
-
-						xfree(tmp);
-
-						/* advance indices */
-						i += chunk - 1;
-						off += chunk;
-						continue;
 					}
+
+					xfree(tmp);
+
+					/* advance indices */
+					i += chunk - 1;
+					off += chunk;
+					continue;
 				}
+			}
 
 				/* Fall back to single-page path */
 				ret = pr->read_pages(pr, va, 1, buf, 0);
@@ -1564,23 +1778,6 @@ err_read:
 			if (i >= size)
 				break;
 
-			if (opts.batch_madvise && opts.madvise_batch_min_pages > 1) {
-				unsigned long j = i + 1;
-				/* extend j while next bits are also set (pages to drop) */
-				while (j < size && test_bit(j, vma->pvma->page_bitmap))
-					j++;
-				if (j - i >= opts.madvise_batch_min_pages) {
-					unsigned long len = j - i;
-					ret = madvise(addr + PAGE_SIZE * i, len * PAGE_SIZE, MADV_DONTNEED);
-					if (ret < 0) {
-						pr_perror("madvise failed");
-						return -1;
-					}
-					nr_dropped += len;
-					i = j;
-					continue;
-				}
-			}
 
 			/* fallback to single page madvise */
 			ret = madvise(addr + PAGE_SIZE * i, PAGE_SIZE, MADV_DONTNEED);

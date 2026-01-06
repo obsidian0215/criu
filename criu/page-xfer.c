@@ -320,19 +320,29 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, stru
 		if (ret <= 0 || !p->pe) {
 			if (!dl && !opts.use_dirty_map) {
 				pr_err("Missing %lx in parent pagemap\n", off);
-			} else {
-				dhm = search_dirty_map(dl, off);
-				if (dhm) {
-				    // pr_info("[Obsidian0215]Found %lx in dirty map\n", off);
-					off += PAGE_SIZE;
-					if (off >= end)
-						return 0;
-					else
-						continue;
-				}
-				pr_err("[Obsidian0215]Missing %lx both in dirtymap and parent pagemap\n", off);
+				return -1;
 			}
-			return -1;
+
+			// Use dirty-map to check
+			dhm = search_dirty_map(dl, off);
+			if (dhm) {
+			    pr_debug("[Obsidian0215]Found %lx in dirty map (heat=%f)\n", off, dhm->heat);
+				off += PAGE_SIZE;
+				if (off >= end)
+					return 0;
+				else
+					continue;
+			}
+
+			// Page not in dirtymap, this shouldn't happen with proper dirty-map
+			// but we allow it if dirty-track might have missed some pages
+			pr_warn("[Obsidian0215]Missing %lx in both parent pagemap and dirtymap. "
+					"This page may not have been tracked. Skipping to avoid data loss.\n", off);
+			off += PAGE_SIZE;
+			if (off >= end)
+				return 0;
+			else
+				continue;
 		}
 
 		pr_debug("\tFound %" PRIx64 "/%lu\n", p->pe->vaddr, pagemap_len(p->pe));

@@ -30,6 +30,7 @@
 #define TIMESTAMP_LIST_PREFIX "timestamp_list"
 #define WARM_LIST_PREFIX "warm_list"
 #define THRESHOLD_PREFIX "threshold"
+#define VMA_STATS_PREFIX "vma_stats"
 
 #define MAX_FILES 32
 #define EXPAND_WARM_BATCH 128
@@ -72,15 +73,90 @@ gint compare_warm_page(gconstpointer a, gconstpointer b, gpointer user_data) {
         return 0;
 }
 
+// [Obsidian0215] VMA 级统计信息比较与释放
+gint compare_vma_stats(gconstpointer a, gconstpointer b, gpointer user_data) {
+    vma_stats_t *vma_a = (vma_stats_t *)a;
+    vma_stats_t *vma_b = (vma_stats_t *)b;
+    if (vma_a->start < vma_b->start) return -1;
+    if (vma_a->start > vma_b->start) return 1;
+    return 0;
+}
+
+static void free_vma_stats(gpointer data) {
+    vma_stats_t *vs = (vma_stats_t *)data;
+    if (vs) {
+        if (vs->historical_stats) xfree(vs->historical_stats);
+        xfree(vs);
+    }
+}
+
+// [Obsidian0215] 更新 VMA 级命中率
+static gboolean update_vma_ema(gpointer key, gpointer value, gpointer user_data) {
+    vma_stats_t *vs = (vma_stats_t *)value;
+    unsigned int total = vs->tmp_hit + vs->tmp_miss;
+
+    if (total > 0) {
+        float current_hit_rate = (float)vs->tmp_hit / (float)total;
+        if (vs->historical_stats) {
+            vs->historical_stats->ema_hit_rate = EMA_ALPHA * current_hit_rate +
+                                               (1.0f - EMA_ALPHA) * vs->historical_stats->ema_hit_rate;
+            vs->current_ema_hit_rate = vs->historical_stats->ema_hit_rate;
+        }
+    }
+    return FALSE;
+}
+
+// [Obsidian0215] 查找地址所属的 VMA 统计信息
+static gint vma_contains_addr(gconstpointer a, gconstpointer b) {
+    vma_stats_t *vs = (vma_stats_t *)a;
+    unsigned long addr = (unsigned long)(unsigned long *)b;
+    if (addr < vs->start) return 1;
+    if (addr >= vs->end) return -1;
+    return 0;
+}
+
+vma_stats_t *search_vma_stats(struct dirty_log *dl, unsigned long vaddr) {
+    if (!dl || !dl->vma_stats_tree) return NULL;
+    return g_tree_search(dl->vma_stats_tree, vma_contains_addr, (gpointer)&vaddr);
+}
+
+// [Obsidian0215] 从 vma 列表初始化 vma_stats_tree
+static int init_vma_stats_tree(struct vm_area_list *vma_list, struct dirty_log *dl) {
+    struct vma_area *vma;
+
+    if (!vma_list || !dl) return -1;
+
+    dl->vma_stats_tree = g_tree_new_full((GCompareDataFunc)compare_vma_stats, NULL, NULL, free_vma_stats);
+
+    list_for_each_entry(vma, &vma_list->h, list) {
+        vma_stats_t *vs = xzalloc(sizeof(vma_stats_t));
+        if (!vs) return -1;
+
+        vs->start = vma->e->start;
+        vs->end = vma->e->end;
+        vs->current_ema_hit_rate = 0.85f; // Baseline
+        vs->historical_stats = xzalloc(sizeof(historical_stats_t));
+        if (vs->historical_stats) {
+            vs->historical_stats->ema_hit_rate = 0.85f;
+            vs->historical_stats->learning_rate = 0.1f;
+        }
+
+        g_tree_insert(dl->vma_stats_tree, vs, vs);
+    }
+    return 0;
+}
+
 // 回调函数，用于遍历 GTree 并写入文件
 static gboolean write_warm_page(gpointer key, gpointer value, gpointer user_data) {
     FILE *f = (FILE *)user_data;
     unsigned long *addr = (unsigned long *)key;
-    char *s_count = (char *)value;
+    warm_page_t *wp_value = (warm_page_t *)value;
     warm_page_t wp;
 
     wp.address = *addr;
-    wp.s_count = *s_count;
+    wp.s_count = wp_value->s_count;
+    wp.consecutive_count = wp_value->consecutive_count;
+    wp.last_seen_iter = wp_value->last_seen_iter;
 
     if (fwrite(&wp, sizeof(warm_page_t), 1, f) != 1) {
         perror("[Obsidian0215] fwrite");
@@ -102,7 +178,7 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
     FILE *file = NULL;
     warm_page_t wp;
     unsigned long addr, *new_key;
-    char *existing_scount, *new_scount;
+    warm_page_t *existing_wp, *new_wp;
     int ret;
 
     if (!dl) {
@@ -137,9 +213,17 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
     // 读取文件中的warm_page_t记录并插入到GTree
     while (fread(&wp, sizeof(warm_page_t), 1, file) == 1) {
         addr = wp.address;
-        existing_scount = g_tree_lookup(dl->warm_list, &addr);
-        if (existing_scount) {
-            *existing_scount += wp.s_count;
+        existing_wp = g_tree_lookup(dl->warm_list, &addr);
+        if (existing_wp) {
+            // 累加 s_count，更新 consecutive_count（如果是连续的迭代）
+            existing_wp->s_count += wp.s_count;
+            // 如果是连续迭代，累加 consecutive_count；否则重置为1
+            if (wp.last_seen_iter == dl->current_predump_iter - 1) {
+                existing_wp->consecutive_count += wp.consecutive_count;
+            } else {
+                existing_wp->consecutive_count = wp.consecutive_count;
+            }
+            existing_wp->last_seen_iter = dl->current_predump_iter;
         } else {
             new_key = malloc(sizeof(unsigned long));
             if (!new_key) {
@@ -148,19 +232,22 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
                 pthread_mutex_unlock(&dl->warm_list_mutex);
                 return -1;
             }
-
             *new_key = addr;
-            new_scount = malloc(sizeof(char));
-            if (!new_scount) {
+
+            new_wp = malloc(sizeof(warm_page_t));
+            if (!new_wp) {
                 perror("[Obsidian0215] malloc failed");
                 free(new_key);
                 fclose(file);
                 pthread_mutex_unlock(&dl->warm_list_mutex);
                 return -1;
             }
-            *new_scount = wp.s_count;
+            new_wp->address = addr;
+            new_wp->s_count = wp.s_count;
+            new_wp->consecutive_count = wp.consecutive_count;
+            new_wp->last_seen_iter = dl->current_predump_iter;
 
-            g_tree_insert(dl->warm_list, new_key, new_scount);
+            g_tree_insert(dl->warm_list, new_key, new_wp);
             dl->warm_size++;
         }
     }
@@ -174,6 +261,9 @@ static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log
 
     fclose(file);
     pthread_mutex_unlock(&dl->warm_list_mutex);
+
+    // [Obsidian0215] 记录初始大小，用于计算重叠率（收敛指标）
+    dl->prev_warm_size = dl->warm_size;
 
     return 0;
 }
@@ -569,6 +659,22 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
     struct dirty_diffmap *diffmap, *resized_diffmap;
     float pre_heat = 0.0, cur_heat = 0.0;
 
+    // 初始化单个diffmap条目的辅助宏
+#define INIT_DIFF_ENTRY(entry)                 \
+    do {                                      \
+        (entry).volatility = 0.0f;            \
+        (entry).consecutive_appear = 1;       \
+        (entry).total_appear = 1;             \
+        (entry).pattern = PATTERN_UNKNOWN;    \
+    } while (0)
+
+#define CALC_VOL(cur, pre) ({                           \
+        float _c = (cur);                               \
+        float _p = (pre);                               \
+        float _avg = (_c + _p) / 2.0f;                  \
+        (_avg > 0.0f) ? fabsf(_c - _p) / (_avg + 0.001f) : 0.0f; \
+    })
+
     // 两个dirty_map都为空，直接返回空diffmap
     if ((!latest_dm || !lsize)
      && (!less_latest_dm || !slsize)) {
@@ -608,6 +714,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
                 cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
                 diffmap[k].heat = cur_heat;
                 diffmap[k].heat_trend = cur_heat;
+                INIT_DIFF_ENTRY(diffmap[k]);
+                diffmap[k].volatility = 0.0f;
                 i++;
             }
             else if (latest_dm[i].address > less_latest_dm[j].address) {
@@ -616,6 +724,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
                 pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
                 diffmap[k].heat = 0.0;
                 diffmap[k].heat_trend = -pre_heat;
+                INIT_DIFF_ENTRY(diffmap[k]);
+                diffmap[k].volatility = CALC_VOL(0.0f, pre_heat);
                 j++;
             }
             else {
@@ -625,6 +735,10 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
                 pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
                 diffmap[k].heat = cur_heat;
                 diffmap[k].heat_trend = cur_heat - pre_heat;
+                INIT_DIFF_ENTRY(diffmap[k]);
+                diffmap[k].volatility = CALC_VOL(cur_heat, pre_heat);
+                diffmap[k].consecutive_appear = 2;
+                diffmap[k].total_appear = 2;
                 i++;
                 j++;
             }
@@ -637,6 +751,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
             cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
             diffmap[k].heat = cur_heat;
             diffmap[k].heat_trend = cur_heat;
+            INIT_DIFF_ENTRY(diffmap[k]);
+            diffmap[k].volatility = 0.0f;
             i++;
             k++;
         }
@@ -647,6 +763,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
             diffmap[k].heat = 0.0;
             pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
             diffmap[k].heat_trend = -pre_heat;
+            INIT_DIFF_ENTRY(diffmap[k]);
+            diffmap[k].volatility = CALC_VOL(0.0f, pre_heat);
             j++;
             k++;
         }
@@ -657,6 +775,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
             cur_heat = (float)(latest_dm[i].write_count) / (float)(ltd_ns / 1e9);
             diffmap[k].heat = cur_heat;
             diffmap[k].heat_trend = cur_heat;
+            INIT_DIFF_ENTRY(diffmap[k]);
+            diffmap[k].volatility = 0.0f;
         }
     } else if (less_latest_dm && slsize > 0) {
         // 仅less_latest_dm存在，latest_dm为空
@@ -665,6 +785,8 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
             diffmap[k].heat = 0.0;
             pre_heat = (float)(less_latest_dm[j].write_count) / (float)(lltd_ns / 1e9);
             diffmap[k].heat_trend = -pre_heat;
+            INIT_DIFF_ENTRY(diffmap[k]);
+            diffmap[k].volatility = CALC_VOL(0.0f, pre_heat);
         }
     }
 
@@ -689,6 +811,7 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
     return resized_diffmap;
 }
 
+#if 0
 /**
  * @brief debug输出dirty_map数组
  *
@@ -697,18 +820,18 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
  * @param pid dirtymap所属的进程PID
  * @return void
  */
-// static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtymap_size, pid_t pid) {
-//     int i;
+static void debug_show_dirtymap(struct dirty_map *dirtymap, unsigned long dirtymap_size, pid_t pid) {
+    int i;
 
-//     if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
-// 		return;
+    if (pr_quelled(LOG_DEBUG) || !dirtymap || !dirtymap_size)
+		return;
 
-//     pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
-// 	for (i = 0; i < dirtymap_size; i++) {
-// 		pr_debug("\taddress: %#lx, write count: %d\n",
-//             dirtymap[i].address, dirtymap[i].write_count);
-// 	}
-// }
+    pr_debug("Dirtymap for pid %d:(size: %ld)\n", pid, dirtymap_size);
+	for (i = 0; i < dirtymap_size; i++) {
+		pr_debug("\taddress: %#lx, write count: %d\n",
+            dirtymap[i].address, dirtymap[i].write_count);
+	}
+}
 
 /**
  * @brief debug输出dirty_diffmap数组
@@ -718,18 +841,19 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
  * @param pid diffmap所属的进程PID
  * @return void
  */
-// static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
-//     int i;
+static void debug_show_diffmap(struct dirty_diffmap *diffmap, unsigned long diffmap_size, pid_t pid) {
+    int i;
 
-//     if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
-// 		return;
+    if (pr_quelled(LOG_DEBUG) || !diffmap || !diffmap_size)
+		return;
 
-//     pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
-// 	for (i = 0; i < diffmap_size; i++) {
-// 		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
-//             diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
-// 	}
-// }
+    pr_debug("Diffmap for pid %d:(size: %lu)\n", pid, diffmap_size);
+	for (i = 0; i < diffmap_size; i++) {
+		pr_debug("\taddress: %#lx, heat: %f, heat trend: %f\n",
+            diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
+	}
+}
+#endif
 
 /**
  * @brief 回调函数，用于打印每个 warm_page_t 节点
@@ -845,7 +969,7 @@ static int init_historical_stats(struct dirty_log *dl) {
     memset(dl->historical_stats->adjustment_factors, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
 
     dl->historical_stats->history_idx = 0;
-    dl->historical_stats->ema_hit_rate = 0.0f;
+    dl->historical_stats->ema_hit_rate = 0.85f; // [Obsidian0215] Initialize with a healthy baseline to avoid extreme cold-start penalties
     dl->historical_stats->learning_rate = 0.1f;
     dl->historical_stats->momentum_factor = 0.8f;
     dl->historical_stats->update_count = 0;
@@ -964,14 +1088,121 @@ static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_dat
     traversal_data_t *data = (traversal_data_t *)user_data;
     unsigned long addr = *(unsigned long *)key;
     struct dirty_diffmap *dm = search_dirty_map(data->dl, addr);
+    vma_stats_t *vs = search_vma_stats(data->dl, addr);
 
     if (!dm || dm->heat < data->dl->min_heat) {
         data->hit_warm++;
+        if (vs) vs->tmp_hit++;
     } else {
         data->miss_warm++;
+        if (vs) vs->tmp_miss++;
     }
 
     return FALSE; // 继续遍历
+}
+
+static gboolean reset_vma_stats(gpointer key, gpointer value, gpointer user_data) {
+    vma_stats_t *vs = (vma_stats_t *)value;
+    vs->tmp_hit = 0;
+    vs->tmp_miss = 0;
+    return FALSE;
+}
+
+// 基于warm_list与当前diffmap计算温页预测准确率
+static float compute_selection_accuracy(struct dirty_log *dl,
+                                        unsigned int *hit_warm_out,
+                                        unsigned int *miss_warm_out) {
+    traversal_data_t data;
+    unsigned int hit_warm = 0, miss_warm = 0;
+    unsigned int total = 0;
+
+    if (!dl || !dl->warm_list || !dl->diffmap) {
+        if (hit_warm_out)
+            *hit_warm_out = 0;
+        if (miss_warm_out)
+            *miss_warm_out = 0;
+        return -1.0f; // 无法计算
+    }
+
+    data = (traversal_data_t){ .dl = dl, .hit_warm = 0, .miss_warm = 0 };
+
+    pthread_mutex_lock(&dl->warm_list_mutex);
+    if (dl->vma_stats_tree)
+        g_tree_foreach(dl->vma_stats_tree, reset_vma_stats, NULL);
+    g_tree_foreach(dl->warm_list, count_warm_pages, &data);
+    if (dl->vma_stats_tree)
+        g_tree_foreach(dl->vma_stats_tree, update_vma_ema, NULL);
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+
+    hit_warm = data.hit_warm;
+    miss_warm = data.miss_warm;
+    total = hit_warm + miss_warm;
+
+    if (hit_warm_out)
+        *hit_warm_out = hit_warm;
+    if (miss_warm_out)
+        *miss_warm_out = miss_warm;
+
+    if (!total)
+        return -1.0f;
+
+    return (float)hit_warm / (float)total;
+}
+
+// [Obsidian0215] 持久化 VMA 统计信息
+static gboolean write_vma_stats(gpointer key, gpointer value, gpointer user_data) {
+    FILE *f = (FILE *)user_data;
+    vma_stats_t *vs = (vma_stats_t *)value;
+    if (fwrite(vs, sizeof(vma_stats_t) - sizeof(historical_stats_t *), 1, f) != 1) return TRUE;
+    if (fwrite(vs->historical_stats, sizeof(historical_stats_t), 1, f) != 1) return TRUE;
+    return FALSE;
+}
+
+int store_vma_stats(char *dirty_map_dir, struct dirty_log *dl) {
+    char path[PATH_MAX];
+    FILE *f;
+
+    if (!dl || !dl->vma_stats_tree) return 0;
+
+    snprintf(path, sizeof(path), "%s/%s.%d", dirty_map_dir, VMA_STATS_PREFIX, dl->pid);
+    f = fopen(path, "wb");
+    if (!f) return -1;
+
+    g_tree_foreach(dl->vma_stats_tree, write_vma_stats, f);
+    fclose(f);
+    return 0;
+}
+
+int load_vma_stats(char *dirty_map_dir, struct dirty_log *dl) {
+    char path[PATH_MAX];
+    FILE *f;
+    vma_stats_t vs_header;
+    historical_stats_t hs;
+
+    if (!dl) return -1;
+
+    snprintf(path, sizeof(path), "%s/%s.%d", dirty_map_dir, VMA_STATS_PREFIX, dl->pid);
+    f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (!dl->vma_stats_tree) {
+        dl->vma_stats_tree = g_tree_new_full((GCompareDataFunc)compare_vma_stats, NULL, NULL, free_vma_stats);
+    }
+
+    while (fread(&vs_header, sizeof(vma_stats_t) - sizeof(historical_stats_t *), 1, f) == 1) {
+        vma_stats_t *vs;
+        if (fread(&hs, sizeof(historical_stats_t), 1, f) != 1) break;
+
+        vs = xzalloc(sizeof(vma_stats_t));
+        memcpy(vs, &vs_header, sizeof(vma_stats_t) - sizeof(historical_stats_t *));
+        vs->historical_stats = xzalloc(sizeof(historical_stats_t));
+        memcpy(vs->historical_stats, &hs, sizeof(historical_stats_t));
+
+        g_tree_insert(dl->vma_stats_tree, vs, vs);
+    }
+
+    fclose(f);
+    return 0;
 }
 
 /**
@@ -986,7 +1217,7 @@ static void update_thresholds(struct dirty_log *dl) {
     float current_hit_rate = 0.0f, ema_hit_rate = 0.0f;
     float adjustment_factor = 1.0f, dynamic_step = 0.5f;
     float current_ratio, error, p_term, i_term, d_term, pid_output;
-    traversal_data_t data;
+    float selection_accuracy = -1.0f;
 
     // 检查warm_list和dirtymap是否存在
     if (!dl->warm_list || !dirtymap) {
@@ -1003,20 +1234,16 @@ static void update_thresholds(struct dirty_log *dl) {
         return;
     }
 
-    // 初始化遍历数据
-    data = (traversal_data_t){ .dl = dl, .hit_warm = 0, .miss_warm = 0 };
+    // 计算当前命中率/准确率
+    selection_accuracy = compute_selection_accuracy(dl, &hit_warm, &miss_warm);
+    if (selection_accuracy >= 0.0f)
+        current_hit_rate = selection_accuracy;
 
-    // 加锁并遍历warm_list
-    pthread_mutex_lock(&dl->warm_list_mutex);
-    g_tree_foreach(dl->warm_list, count_warm_pages, &data);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    hit_warm = data.hit_warm;
-    miss_warm = data.miss_warm;
-
-    // 计算当前命中率
-    if (hit_warm + miss_warm > 0) {
-        current_hit_rate = (float)hit_warm / (hit_warm + miss_warm);
+    if (selection_accuracy >= 0.0f) {
+        pr_info("[Phase1] selection accuracy for %d: %.2f%% (hit %u, miss %u)\n",
+                dl->pid, selection_accuracy * 100.0f, hit_warm, miss_warm);
+    } else {
+        pr_info("[Phase1] selection accuracy for %d unavailable (no samples)\n", dl->pid);
     }
 
     // Phase 1优化：使用指数移动平均计算平滑命中率
@@ -1030,6 +1257,7 @@ static void update_thresholds(struct dirty_log *dl) {
             ema_hit_rate = current_hit_rate; // 降级到当前命中率
         }
     }
+    dl->current_ema_hit_rate = ema_hit_rate;
 
     // Phase 1优化：当EMA命中率不高于50%时更新阈值
     if (ema_hit_rate <= 0.5f && miss_warm > 0) {
@@ -1200,18 +1428,31 @@ static int write_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
  * @param dirty_map_dir dirty_map 目录的字符串。
  * @return int 成功返回 0，失败返回 -1。
  */
-int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
+#include <sys/time.h>
+
+#define PROFILE_START(name) gettimeofday(&start_##name, NULL);
+#define PROFILE_END(name, msg) gettimeofday(&end_##name, NULL); \
+    pr_info("[Obsidian0215] PROFILE %s: %ld us\n", msg, \
+    (end_##name.tv_sec - start_##name.tv_sec) * 1000000 + (end_##name.tv_usec - start_##name.tv_usec));
+
+int init_dirty_map(struct pstree_item *item, struct vm_area_list *vmas, const char *dirty_map_dir){
     struct dirty_log *dl;
     pid_t pid = item->pid->real;
-    char pattern[256], timestamp_str[64], *endptr;
-    // char current_dirty_map_path[PATH_MAX];
-    int ret, len, in_list;
-    unsigned long timestamp;
+    int ret, in_list;
     DIR *dir;
-    regex_t regex;
     struct dirent *entry;
-    regmatch_t matches[2];
     struct pid_check pc = {.pid = pid, .is_tracked = 0};
+    struct timeval start_init_total, end_init_total;
+    struct timeval start_load_warm, end_load_warm;
+    struct timeval start_load_ts, end_load_ts;
+    struct timeval start_stop_dt, end_stop_dt;
+    struct timeval start_scan_dir, end_scan_dir;
+    struct timeval start_load_latest, end_load_latest;
+    struct timeval start_load_less, end_load_less;
+    struct timeval start_merge, end_merge;
+    struct timeval start_update_th, end_update_th;
+
+    PROFILE_START(init_total);
 
     // [Obsidian0215] init dirty-log for pid
     dl = (struct dirty_log *)xzalloc(sizeof(struct dirty_log));
@@ -1223,6 +1464,11 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     dl->pid = pid;
     item->dl = dl;
 
+    // [Obsidian0215] 加载或初始化 VMA 统计信息
+    if (load_vma_stats((char *)dirty_map_dir, dl) != 0) {
+        init_vma_stats_tree(vmas, dl);
+    }
+
     // 打开 DT_DEV_PATH 并验证 dirty_map_dir
     ret = init_dirty_track(dl);
     if (ret) {
@@ -1233,17 +1479,22 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     pthread_mutex_init(&dl->warm_list_mutex, NULL);
     dl->warm_list = g_tree_new_full(compare_warm_page, NULL, free, free);
     // 读取warm_list.<pid>文件，初始化warm_list
+    PROFILE_START(load_warm);
     ret = load_warm_list(dirty_map_dir, pid, dl);
+    PROFILE_END(load_warm, "load_warm_list");
     if (ret < 0) {
         pr_perror("[Obsidian0215]Failed to load warm_list for pid %d", pid);
         return -1;
     }
-    pr_info("[Obsidian0215]Traversing warm_list:\n");
-    g_tree_foreach(dl->warm_list, print_warm_page, NULL);
-    pr_info("End of warm_list traversal.\n");
+
+    // 增加 predump 迭代计数（每次 pre-dump 开始时）
+    dl->current_predump_iter++;
+    pr_info("[Obsidian0215] Current predump iteration: %d\n", dl->current_predump_iter);
 
     // 读取timestamp_list.<pid>文件，初始化timestamp_list
+    PROFILE_START(load_ts);
     ret = load_timestamp_list(dirty_map_dir, pid, &dl->timestamp_list, &dl->ts_list_size);
+    PROFILE_END(load_ts, "load_timestamp_list");
     if (ret < 0) {
         pr_perror("[Obsidian0215]Failed to load timestamp_list for pid %d", pid);
         return -1;
@@ -1252,12 +1503,10 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     // 若timestamp_list不为空则将记录的最后一个timestamp作为less_latest_timestamp
     if (dl->ts_list_size) {
         dl->less_latest_timestamp = dl->timestamp_list[dl->ts_list_size-1];
-    } else {
-        // 什么都不干，已初始化为0
-        // dl->less_latest_timestamp = 0;
     }
 
     // 停止pid的dirty track以生成dirty-map文件
+    PROFILE_START(stop_dt);
     ret = ioctl(dl->dirty_track_fd, IOCTL_CHECK_PID, &pc);
     if (!ret && pc.is_tracked) {
         ret = ioctl(dl->dirty_track_fd, IOCTL_STOP_PID, &pid);
@@ -1273,70 +1522,49 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         close(dl->dirty_track_fd);
         return -1;
     }
-    // close(dl->dirty_track_fd);
+    PROFILE_END(stop_dt, "ioctl_STOP_PID");
 
     // 扫描dirty_map_dir，查找新的dirtymap文件
+    PROFILE_START(scan_dir);
     dir = opendir(dirty_map_dir);
     if (!dir) {
         pr_perror("[Obsidian0215]%s opendir failed", dirty_map_dir);
         return -1;
     }
 
-    // 编译正则表达式以匹配<pid>-<timestamp>.dirtymap
-    snprintf(pattern, sizeof(pattern), "^%d-([0-9]+)\\.dirtymap$", pid);
-    if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
-        pr_perror("[Obsidian0215]Failed to compile regex: %s", pattern);
-        closedir(dir);
-        return -1;
-    }
-
     while ((entry = readdir(dir)) != NULL) {
+        unsigned long ts_val;
+        int found_pid;
+
         if (entry->d_type != DT_REG)
             continue;
 
-        ret = regexec(&regex, entry->d_name, 2, matches, 0);
-        if (ret == 0) {
-            // 提取 timestamp
-            len = matches[1].rm_eo - matches[1].rm_so;
-            if (len <= 0 || len >= 64) {
-                pr_perror("[Obsidian0215]Invalid timestamp in file name: %s", entry->d_name);
+        // 使用 sscanf 替代正则表达式优化性能
+        if (sscanf(entry->d_name, "%d-%lu.dirtymap", &found_pid, &ts_val) == 2) {
+            if (found_pid != pid)
                 continue;
-            }
-            strncpy(timestamp_str, entry->d_name + matches[1].rm_so, len);
-            timestamp_str[len] = '\0';
-
-            timestamp = strtoul(timestamp_str, &endptr, 10);
-            if (*endptr != '\0') { // 确保整个字符串都被转换
-                pr_perror("[Obsidian0215]Non-numeric characters in timestamp: %s", timestamp_str);
-                continue;
-            }
-            if (timestamp <= 0 || (timestamp == ULONG_MAX && errno == ERANGE)) {
-                pr_perror("[Obsidian0215]Invalid timestamp value: %s", timestamp_str);
-                continue;
-            }
 
             // 检查 timestamp 是否已在 timestamp_list 中
-            in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, timestamp);
+            in_list = is_timestamp_in_list(dl->timestamp_list, dl->ts_list_size, ts_val);
             if (in_list == 1) {
                 continue; // 已存在
             }
 
             // 找到一个新的timestamp，更新latest_timestamp退出循环
-            if (timestamp) {
-                dl->latest_timestamp = timestamp;
+            if (ts_val) {
+                dl->latest_timestamp = ts_val;
                 break;
             }
         }
     }
-    regfree(&regex);
     closedir(dir);
+    PROFILE_END(scan_dir, "scan_dir_sscanf");
 
     // 将更新的latest_timestamp追加到timestamp_list
     ret = append_timestamp_to_list(dl->timestamp_list, &dl->ts_list_size, dl->latest_timestamp);
     if (ret < 0) {
         pr_perror("[Obsidian0215]Failed to append latest timestamp %lu to timestamp_list.%d",
                 dl->latest_timestamp, pid);
-        // 追加失败也继续执行
     } else {
         pr_info("[Obsidian0215]PID %d: latest timestamp = %lu, less-latest timestamp = %lu\n",
                 pid, dl->latest_timestamp, dl->less_latest_timestamp);
@@ -1351,8 +1579,10 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
 
     // 映射latest_dm
     if (dl->latest_timestamp) {
+        PROFILE_START(load_latest);
         ret = load_dirtymap(pid, dl->latest_timestamp, dirty_map_dir,
                           &dl->latest_dm, &dl->ldm_size, &dl->ldm_header);
+        PROFILE_END(load_latest, "load_latest_dirtymap");
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map latest dirtymap for pid %d", pid);
             dl->latest_dm = NULL;
@@ -1363,21 +1593,14 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             pr_info("\ttrack_duration: %lu ns, size: %lu bytes\n",
                     dl->ldm_header->track_duration_ns, dl->ldm_size * sizeof(struct dirty_map));
         }
-    } else {
-        dl->latest_dm = NULL;
-        dl->ldm_size = 0;
     }
-
-    // if (dl->latest_dm && dl->ldm_size) {
-    //     pr_info("[Obsidian0215]latest dirtymap for pid %d:\n", pid);
-    //     debug_show_dirtymap(dl->latest_dm, dl->ldm_size, pid);
-    // } else if (!dl->latest_dm || !dl->ldm_size)
-    //     pr_info("[Obsidian0215]No latest dirtymap for pid %d\n", pid);
 
     // 映射less_latest_dm
     if (dl->less_latest_timestamp) {
+        PROFILE_START(load_less);
         ret = load_dirtymap(pid, dl->less_latest_timestamp, dirty_map_dir,
                           &dl->less_latest_dm, &dl->lldm_size, &dl->lldm_header);
+        PROFILE_END(load_less, "load_less_latest_dirtymap");
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to map previous dirtymap for pid %d", pid);
             dl->less_latest_dm = NULL;
@@ -1388,23 +1611,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
             pr_info("\ttrack_duration: %lu ns, size: %lu bytes\n",
                     dl->lldm_header->track_duration_ns, dl->lldm_size * sizeof(struct dirty_map));
         }
-    } else {
-        dl->less_latest_dm = NULL;
-        dl->lldm_size = 0;
     }
 
-    // if (dl->less_latest_dm && dl->lldm_size) {
-    //     pr_info("[Obsidian0215]less-latest dirtymap for pid %d:\n", pid);
-    //     debug_show_dirtymap(dl->less_latest_dm, dl->lldm_size, pid);
-    // } else if (!dl->less_latest_dm || !dl->lldm_size)
-    //     pr_info("[Obsidian0215]No less-latest dirtymap for pid %d\n", pid);
-
     // 确保less_latest_dm和latest_dm为升序再生成dirty_diffmap
-    // sort_dirty_map(latest_dm, lsize);
-    // sort_dirty_map(less_latest_dm, slsize);
+    PROFILE_START(merge);
     dl->diffmap = merge_dirty_maps(dl);
-
-    // debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
+    dl->search_cursor = 0; // [Obsidian0215] 重置查找游标
+    PROFILE_END(merge, "merge_dirty_maps");
 
     // 加载上次的阈值并更新
     load_thresholds(dl, dirty_map_dir);
@@ -1417,9 +1630,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         pr_warn("[Obsidian0215] Failed to initialize feedback controller for pid %d\n", pid);
     }
 
+    PROFILE_START(update_th);
     update_thresholds(dl);
+    PROFILE_END(update_th, "update_thresholds");
 
     pr_debug("[Obsidian0215] threshold: %f, %f\n", dl->heat_threshold, dl->trend_threshold);
+
+    PROFILE_END(init_total, "init_dirty_map_total");
     return 0;
 }
 
@@ -1544,13 +1761,47 @@ void fini_dirty_map(struct pstree_item *item){
 
         // 处理warm_list
         if (dl->warm_list) {
+            int max_consecutive;
+            struct timeval s_write, e_write;
+
+            // 更新收敛指标（在写入文件之前）
+            update_warm_set_overlap(dl);
+            max_consecutive = get_max_consecutive_scount(dl);
+            pr_info("[Obsidian0215] Convergence metrics: overlap_ratio=%.2f%%, max_consecutive=%d\n",
+                    dl->warm_set_overlap_ratio * 100.0, max_consecutive);
+
+            gettimeofday(&s_write, NULL);
             if (write_warm_list(dl, opts.dirty_map_dir)) {
                 pr_perror("[Obsidian0215]Error updating warm_list to file");
             }
+            gettimeofday(&e_write, NULL);
+            pr_info("[Obsidian0215] PROFILE write_warm_list: %ld us\n",
+                    (e_write.tv_sec - s_write.tv_sec) * 1000000 + (e_write.tv_usec - s_write.tv_usec));
+
+            // 导出收敛指标供迁移脚本使用
+            if (export_convergence_metrics(dl, opts.dirty_map_dir)) {
+                pr_perror("[Obsidian0215]Error exporting convergence metrics");
+            }
+
             g_tree_destroy(dl->warm_list);
             pthread_mutex_destroy(&dl->warm_list_mutex);
             dl->warm_list = NULL;
             dl->warm_size = 0;
+        }
+
+        // [Obsidian0215] 处理 VMA 统计信息
+        if (dl->vma_stats_tree) {
+            struct timeval s_vma, e_vma;
+            gettimeofday(&s_vma, NULL);
+            if (store_vma_stats((char *)opts.dirty_map_dir, dl)) {
+                pr_perror("[Obsidian0215]Error updating vma_stats to file");
+            }
+            gettimeofday(&e_vma, NULL);
+            pr_info("[Obsidian0215] PROFILE store_vma_stats: %ld us\n",
+                    (e_vma.tv_sec - s_vma.tv_sec) * 1000000 + (e_vma.tv_usec - s_vma.tv_usec));
+
+            g_tree_destroy(dl->vma_stats_tree);
+            dl->vma_stats_tree = NULL;
         }
 
         // 处理thresholds
@@ -1594,6 +1845,13 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
             return NULL;
     }
 
+    // [Obsidian0215] 顺序扫描优化：利用游标加速。addr 通常是顺序递增的。
+    if (dl->search_cursor < right && addr >= map[dl->search_cursor].address) {
+        left = dl->search_cursor;
+    } else {
+        left = 0;
+    }
+
     while (left < right) {
         unsigned long mid = left + (right - left) / 2;
 
@@ -1604,10 +1862,17 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
             // 地址在当前范围右侧，缩小左边界
             left = mid + 1;
         } else {
+            // 找到匹配项，更新游标以便下个顺序地址快速查找
+            dl->search_cursor = mid;
             // 地址在当前范围内，返回该结构体指针
             return &map[mid];
         }
     }
+
+    // 未找到，但在顺序扫描中，游标应停留在最接近 addr 的位置之后
+    if (left < dl->diffmap_size)
+        dl->search_cursor = left;
+
     // 如果未找到包含地址的范围，返回NULL
     return NULL;
 }
@@ -1620,17 +1885,21 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
  * @return int 找到则返回1，如果未找到则返回0
  */
 int search_warm_list(struct dirty_log *dl, unsigned long addr) {
-    char *found_s_count = NULL;
+    return search_warm_list_entry(dl, addr) != NULL;
+}
+
+warm_page_t *search_warm_list_entry(struct dirty_log *dl, unsigned long addr) {
+    warm_page_t *found_wp = NULL;
     unsigned long key_addr = addr;
 
-    if (!dl)
-        return 0;
+    if (!dl || !dl->warm_list)
+        return NULL;
 
     pthread_mutex_lock(&dl->warm_list_mutex);
-    found_s_count = g_tree_lookup(dl->warm_list, &key_addr);
+    found_wp = g_tree_lookup(dl->warm_list, &key_addr);
     pthread_mutex_unlock(&dl->warm_list_mutex);
 
-    return (found_s_count != NULL) ? 1 : 0;
+    return found_wp;
 }
 
 /**
@@ -1641,21 +1910,35 @@ int search_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @return void
  */
 void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
-    char *found_s_count = NULL;
     unsigned long key_addr = addr;
-    char *new_s_count = NULL;
+    warm_page_t *found_wp = NULL;
     unsigned long *new_key = NULL;
+    warm_page_t *new_wp = NULL;
 
     if (!dl)
         return;
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    found_s_count = g_tree_lookup(dl->warm_list, &key_addr);
-    if (found_s_count) {
-        (*found_s_count)++;
-        pr_info("[Obsidian0215] Updated 0x%lx in warm_list: %d\n", addr, *found_s_count);
+    found_wp = g_tree_lookup(dl->warm_list, &key_addr);
+    if (found_wp) {
+        // 已存在：增加累计计数
+        found_wp->s_count++;
+
+        // 关键：更新连续出现次数
+        if (found_wp->last_seen_iter == dl->current_predump_iter - 1) {
+            // 连续出现：增加连续计数
+            found_wp->consecutive_count++;
+        } else {
+            // 间隔出现：重置为 1
+            found_wp->consecutive_count = 1;
+        }
+        found_wp->last_seen_iter = dl->current_predump_iter;
+
+        pr_debug("[Obsidian0215] Updated 0x%lx: s_count=%d, consecutive=%d\n",
+                addr, found_wp->s_count, found_wp->consecutive_count);
     } else {
+        // 新增页面
         new_key = malloc(sizeof(unsigned long));
         if (!new_key) {
             perror("[Obsidian0215] malloc failed");
@@ -1664,21 +1947,152 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
         }
         *new_key = addr;
 
-        new_s_count = malloc(sizeof(char));
-        if (!new_s_count) {
+        new_wp = malloc(sizeof(warm_page_t));
+        if (!new_wp) {
             perror("[Obsidian0215] malloc failed");
             free(new_key);
             pthread_mutex_unlock(&dl->warm_list_mutex);
             return;
         }
-        *new_s_count = 1;
+        new_wp->address = addr;
+        new_wp->s_count = 1;
+        new_wp->consecutive_count = 1;
+        new_wp->last_seen_iter = dl->current_predump_iter;
+        new_wp->consecutive_cooling = 0;
 
-        g_tree_insert(dl->warm_list, new_key, new_s_count);
-        pr_info("[Obsidian0215] Inserted 0x%lx to warm_list\n", addr);
+        g_tree_insert(dl->warm_list, new_key, new_wp);
+        pr_debug("[Obsidian0215] Inserted 0x%lx to warm_list\n", addr);
         dl->warm_size++;
     }
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
+}
+
+/**
+ * @brief 更新 working set overlap ratio（与上一轮 warm_list 的重叠率）
+ *
+ * @param dl dirty_log 指针
+ */
+void update_warm_set_overlap(struct dirty_log *dl) {
+    unsigned long current_size;
+    unsigned long max_size;
+
+    if (!dl) {
+        return;
+    }
+
+    pthread_mutex_lock(&dl->warm_list_mutex);
+
+    current_size = dl->warm_size;
+
+    // [Obsidian0215] 简化：由于 warm_list 是累加的，重叠数量即为初始加载的大小
+    // 计算重叠率：prev_size / current_size
+    max_size = current_size > dl->prev_warm_size ? current_size : dl->prev_warm_size;
+    if (max_size > 0) {
+        dl->warm_set_overlap_ratio = (float)dl->prev_warm_size / (float)max_size;
+    } else {
+        dl->warm_set_overlap_ratio = 1.0; // 都为空也视为收敛
+    }
+
+    pr_info("[Obsidian0215] Working set overlap: %lu/%lu = %.2f%%\n",
+            dl->prev_warm_size, max_size, dl->warm_set_overlap_ratio * 100.0);
+
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+}
+
+/**
+ * @brief 获取最大连续出现次数（核心收敛指标）
+ *
+ * @param dl dirty_log 指针
+ * @return int 最大连续出现次数
+ */
+int get_max_consecutive_scount(struct dirty_log *dl) {
+    int max_consecutive;
+    int high_consecutive_count;
+    GTreeNode *node;
+
+    if (!dl || !dl->warm_list) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&dl->warm_list_mutex);
+
+    max_consecutive = 0;
+    high_consecutive_count = 0;  // consecutive >= 3 的页面数量
+
+    node = g_tree_node_first(dl->warm_list);
+    while (node) {
+        warm_page_t *wp = g_tree_node_value(node);
+        if (wp->consecutive_count > max_consecutive) {
+            max_consecutive = wp->consecutive_count;
+        }
+        if (wp->consecutive_count >= 3) {
+            high_consecutive_count++;
+        }
+        node = g_tree_node_next(node);
+    }
+
+    dl->max_consecutive_scount = max_consecutive;
+
+    pr_info("[Obsidian0215] Max consecutive scount: %d, high_count: %d/%lu\n",
+            max_consecutive, high_consecutive_count, dl->warm_size);
+
+    pthread_mutex_unlock(&dl->warm_list_mutex);
+    return max_consecutive;
+}
+
+/**
+ * @brief 获取 working set overlap ratio
+ *
+ * @param dl dirty_log 指针
+ * @return float overlap ratio (0.0 - 1.0)
+ */
+float get_warm_set_overlap_ratio(struct dirty_log *dl) {
+    if (!dl) {
+        return 0.0;
+    }
+    return dl->warm_set_overlap_ratio;
+}
+
+/**
+ * @brief 导出收敛指标到文件供迁移脚本使用
+ *
+ * @param dl dirty_log 指针
+ * @param dirty_map_dir dirty_map 目录路径
+ * @return int 成功返回0，失败返回-1
+ */
+int export_convergence_metrics(struct dirty_log *dl, const char *dirty_map_dir) {
+    char metrics_filepath[PATH_MAX];
+    FILE *file = NULL;
+    int ret;
+
+    if (!dl || !dirty_map_dir) {
+        return -1;
+    }
+
+    // 构造文件路径: convergence_metrics.<pid>
+    ret = snprintf(metrics_filepath, sizeof(metrics_filepath),
+                   "%s/convergence_metrics.%d", dirty_map_dir, dl->pid);
+    if (ret < 0 || ret >= sizeof(metrics_filepath)) {
+        fprintf(stderr, "[Obsidian0215] Error constructing convergence metrics file path\n");
+        return -1;
+    }
+
+    file = fopen(metrics_filepath, "w");
+    if (!file) {
+        perror("[Obsidian0215] fopen convergence_metrics");
+        return -1;
+    }
+
+    // 写入指标（格式：key=value，便于脚本解析）
+    fprintf(file, "max_consecutive_scount=%d\n", dl->max_consecutive_scount);
+    fprintf(file, "warm_set_overlap_ratio=%.4f\n", dl->warm_set_overlap_ratio);
+    fprintf(file, "warm_list_size=%lu\n", dl->warm_size);
+    fprintf(file, "predump_iteration=%d\n", dl->current_predump_iter);
+
+    fclose(file);
+    pr_info("[Obsidian0215] Exported convergence metrics to %s\n", metrics_filepath);
+    return 0;
 }
 
 /**
@@ -1689,7 +2103,7 @@ void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
  * @return void
  */
 void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
-    char *found_s_count = NULL;
+    warm_page_t *found_wp = NULL;
     unsigned long key_addr = addr;
 
     if (!dl)
@@ -1697,16 +2111,16 @@ void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
 
     pthread_mutex_lock(&dl->warm_list_mutex);
 
-    found_s_count = g_tree_lookup(dl->warm_list, &key_addr);
-    if (found_s_count) {
-        if (*found_s_count > 0) {
+    found_wp = g_tree_lookup(dl->warm_list, &key_addr);
+    if (found_wp) {
+        if (found_wp->s_count > 0) {
             if (zero) {
-                *found_s_count = 0;
+                found_wp->s_count = 0;
             } else {
-                (*found_s_count)--;
+                found_wp->s_count--;
             }
 
-            if (*found_s_count == 0) {
+            if (found_wp->s_count == 0) {
                 g_tree_remove(dl->warm_list, &key_addr);
                 dl->warm_size--;
             }
@@ -1714,4 +2128,27 @@ void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
     }
 
     pthread_mutex_unlock(&dl->warm_list_mutex);
+}
+// Phase 1优化：判断当前predump所处阶段
+enum predump_phase get_predump_phase(struct dirty_log *dl, int max_predumps) {
+    int current_iter;
+
+    if (!dl || max_predumps <= 0) {
+        return PHASE_INITIAL;
+    }
+
+    current_iter = dl->current_predump_iter;
+
+    // 前两次迭代：初始阶段（建立基线）
+    if (current_iter <= 2) {
+        return PHASE_INITIAL;
+    }
+
+    // 最后1-2次迭代：收敛阶段（为final dump减负）
+    if (current_iter >= max_predumps - 1) {
+        return PHASE_CONVERGENCE;
+    }
+
+    // 中间迭代：优化阶段（利用预测优化）
+    return PHASE_OPTIMIZATION;
 }

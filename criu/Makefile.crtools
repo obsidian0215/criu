@@ -2,6 +2,10 @@ CFLAGS_REMOVE_clone-noasan.o += $(CFLAGS-ASAN)
 CFLAGS_kerndat.o	+= -DKDAT_MAGIC_2=${shell echo $${SOURCE_DATE_EPOCH:-$$(date +%s)}} -DKDAT_RUNDIR=\"$(RUNDIR)\"
 ldflags-y		+= -r
 
+CFLAGS_mem.o += -O3
+CFLAGS_dirty-map.o += -O3
+CFLAGS_pagemap.o += -O3
+
 obj-y			+= action-scripts.o
 obj-y			+= external.o
 obj-y			+= aio.o

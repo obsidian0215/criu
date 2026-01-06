@@ -187,6 +187,7 @@ struct cr_options {
 	char *work_dir;
 	int network_lock_method;
 	int skip_file_rwx_check;
+	int skip_post_restore_scripts;
 
 	/*
 	 * When we scheduler for removal some functionality we first
@@ -244,9 +245,6 @@ struct cr_options {
 
 	/* Fine-grained restore tuning options */
 	unsigned int restore_bulk_pages;
-	unsigned int pagemap_max_bunch_size;
-	int batch_madvise;
-	unsigned int madvise_batch_min_pages;
 };
 
 extern struct cr_options opts;

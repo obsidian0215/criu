@@ -597,7 +597,8 @@ static int __pty_open_ptmx_index(int index, int flags, int (*cb)(void *arg, int 
 	for (i = 0; i < ARRAY_SIZE(fds); i++) {
 		fds[i] = cb(arg, flags);
 		if (fds[i] < 0) {
-			pr_err("Can't open %s\n", path);
+			pr_perror("Can't open %s", path);
+			pr_err("Opening %s returned fd=%d (attempt %d)\n", path, fds[i], i);
 			break;
 		}
 
@@ -606,7 +607,7 @@ static int __pty_open_ptmx_index(int index, int flags, int (*cb)(void *arg, int 
 			break;
 		}
 
-		pr_debug("\t\tptmx opened with index %d\n", cur_idx);
+		pr_debug("\t\tptmx opened with index %d (fd=%d)\n", cur_idx, fds[i]);
 
 		if (cur_idx == index) {
 			pr_info("ptmx opened with index %d\n", cur_idx);

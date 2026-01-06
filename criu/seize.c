@@ -535,24 +535,10 @@ static int freeze_processes(void)
 	int fd, exit_code = -1;
 	enum freezer_state state = THAWED;
 
-	static const unsigned long step_ms = 100;
-	unsigned long nr_attempts = (opts.timeout * 1000000) / step_ms;
+	unsigned long step_ms = 1;
+	unsigned long nr_attempts = opts.timeout ? (opts.timeout * 1000) : 10000;
 	unsigned long i = 0;
-
-	const struct timespec req = {
-		.tv_nsec = step_ms * 1000000,
-		.tv_sec = 0,
-	};
-
-	if (unlikely(!nr_attempts)) {
-		/*
-		 * If timeout is turned off, lets
-		 * wait for at least 10 seconds.
-		 */
-		nr_attempts = (10 * 1000000) / step_ms;
-	}
-
-	pr_debug("freezing processes: %lu attempts with %lu ms steps\n", nr_attempts, step_ms);
+	struct timespec req;
 
 	fd = freezer_open();
 	if (fd < 0)
@@ -578,6 +564,9 @@ static int freeze_processes(void)
 		 * before freezing complete so we should
 		 * not read @tasks pids while freezer in
 		 * transition stage.
+		 *
+		 * Use adaptive polling to reduce downtime:
+		 * 1ms steps for the first 20 attempts to catch fast freezes.
 		 */
 		for (; i <= nr_attempts; i++) {
 			state = get_freezer_state(fd);
@@ -590,6 +579,16 @@ static int freeze_processes(void)
 				break;
 			if (alarm_timeouted())
 				goto err;
+
+			if (i < 20)
+				step_ms = 1;
+			else if (i < 40)
+				step_ms = 10;
+			else
+				step_ms = 100;
+
+			req.tv_sec = 0;
+			req.tv_nsec = step_ms * 1000000;
 			nanosleep(&req, NULL);
 		}
 

@@ -41,11 +41,10 @@ struct page_read_iov {
 
 static inline bool can_extend_bunch(struct iovec *bunch, unsigned long off, unsigned long len)
 {
-	unsigned long max_bunch_pages = opts.pagemap_max_bunch_size ? opts.pagemap_max_bunch_size : MAX_BUNCH_SIZE;
 	return /* The next region is the continuation of the existing */
 		((unsigned long)bunch->iov_base + bunch->iov_len == off) &&
 		/* The resulting region is non empty and is small enough */
-		(bunch->iov_len == 0 || bunch->iov_len + len < max_bunch_pages * PAGE_SIZE);
+		(bunch->iov_len == 0 || bunch->iov_len + len < MAX_BUNCH_SIZE * PAGE_SIZE);
 }
 
 static int punch_hole(struct page_read *pr, unsigned long off, unsigned long len, bool cleanup)
@@ -593,7 +592,6 @@ static int process_async_reads(struct page_read *pr)
 			 * Modify the piov in-place, we're going to drop this one
 			 * anyway.
 			 */
-
 			advance_piov(piov, ret);
 			goto more;
 		}

@@ -28,6 +28,7 @@
 #include "fdstore.h"
 #include "kerndat.h"
 #include "util-caps.h"
+#include "stats.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -1800,8 +1801,10 @@ int prepare_namespace(struct pstree_item *item, unsigned long clone_flags)
 	 * This one is special -- there can be several mount
 	 * namespaces and prepare_mnt_ns handles them itself.
 	 */
+	timing_start_if_enabled(TIME_RESTORE_MNTNS);
 	if (prepare_mnt_ns())
 		goto out;
+	timing_stop_if_enabled(TIME_RESTORE_MNTNS);
 
 	ret = 0;
 out:
