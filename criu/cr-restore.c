@@ -638,18 +638,14 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	memzero(ta, args_len);
 
-	timing_start_if_enabled(TIME_RESTORE_FILES);
 	if (prepare_fds(current))
 		return -1;
-	timing_stop_if_enabled(TIME_RESTORE_FILES);
 
 	if (prepare_file_locks(pid))
 		return -1;
 
-	timing_start_if_enabled(TIME_RESTORE_VMAS);
 	if (open_vmas(current))
 		return -1;
-	timing_stop_if_enabled(TIME_RESTORE_VMAS);
 
 	if (prepare_aios(current, ta))
 		return -1;
@@ -1621,10 +1617,8 @@ static int __restore_task_with_children(void *_arg)
 		if (collect_images(before_ns_cinfos, ARRAY_SIZE(before_ns_cinfos)))
 			goto err;
 
-		timing_start_if_enabled(TIME_RESTORE_NS);
 		if (prepare_namespace(current, ca->clone_flags))
 			goto err;
-		timing_stop_if_enabled(TIME_RESTORE_NS);
 
 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
 			goto err;
@@ -2025,10 +2019,8 @@ static int restore_root_task(struct pstree_item *init)
 	if (prepare_userns_hook())
 		return -1;
 
-	timing_start_if_enabled(TIME_PREPARE_NS);
 	if (prepare_namespace_before_tasks())
 		return -1;
-	timing_stop_if_enabled(TIME_PREPARE_NS);
 
 	if (vpid(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
@@ -2174,17 +2166,12 @@ skip_ns_bouncing:
 	if (fault_injected(FI_POST_RESTORE))
 		goto out_kill;
 
-	pr_info("CONFIG: skip_post_restore_scripts=%d\n", opts.skip_post_restore_scripts);
-	if (opts.skip_post_restore_scripts) {
-		pr_info("Skipping post-restore scripts due to configuration\n");
-	} else {
-		ret = run_scripts(ACT_POST_RESTORE);
-		if (ret != 0) {
-			pr_err("Aborting restore due to post-restore script ret code %d\n", ret);
-			timing_stop(TIME_RESTORE);
-			write_stats(RESTORE_STATS);
-			goto out_kill;
-		}
+	ret = run_scripts(ACT_POST_RESTORE);
+	if (ret != 0) {
+		pr_err("Aborting restore due to post-restore script ret code %d\n", ret);
+		timing_stop(TIME_RESTORE);
+		write_stats(RESTORE_STATS);
+		goto out_kill;
 	}
 
 	/*
@@ -2215,10 +2202,8 @@ skip_ns_bouncing:
 	 */
 	attach_to_tasks(root_seized);
 
-	timing_start_if_enabled(TIME_RESTORE_CREDS);
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
 		goto out_kill_network_unlocked;
-	timing_stop_if_enabled(TIME_RESTORE_CREDS);
 
 	timing_stop(TIME_RESTORE);
 
@@ -2399,10 +2384,8 @@ int cr_restore_tasks(void)
 	if (prepare_task_entries() < 0)
 		goto err;
 
-	timing_start_if_enabled(TIME_RESTORE_PIDS);
 	if (prepare_pstree() < 0)
 		goto err;
-	timing_stop_if_enabled(TIME_RESTORE_PIDS);
 
 	if (fdstore_init())
 		goto err;
@@ -2413,10 +2396,8 @@ int cr_restore_tasks(void)
 	if (crtools_prepare_shared() < 0)
 		goto err;
 
-	timing_start_if_enabled(TIME_RESTORE_CGROUP);
 	if (prepare_cgroup())
 		goto clean_cgroup;
-	timing_stop_if_enabled(TIME_RESTORE_CGROUP);
 
 	if (criu_signals_setup() < 0)
 		goto clean_cgroup;

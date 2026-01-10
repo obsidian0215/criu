@@ -145,4 +145,9 @@ static inline bool pagemap_present(PagemapEntry *pe)
 	return !!(pe->flags & PE_PRESENT);
 }
 
+static inline bool pagemap_skip(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_SKIP);
+}
+
 #endif /* __CR_PAGE_READ_H__ */

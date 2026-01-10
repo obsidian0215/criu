@@ -141,6 +141,13 @@ static void skip_pagemap_pages(struct page_read *pr, unsigned long len)
 
 	if (pagemap_present(pr->pe))
 		pr->pi_off += len;
+	else if (pagemap_skip(pr->pe)) {
+		/*
+		 * If PE_SKIP page is being skipped, we don't have pi_off
+		 * to advance, but we might eventually need to read it
+		 * from parent if this is not the head page_read.
+		 */
+	}
 	pr->cvaddr += len;
 }
 
@@ -496,6 +503,13 @@ static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, int nr, 
 	pr_info("pr%lu-%u Read %lx %u pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
 
+	if (pagemap_skip(pr->pe)) {
+		if (pr->parent)
+			return read_parent_page(pr, vaddr, nr, buf, flags);
+		pr->cvaddr += nr * PAGE_SIZE;
+		return 1;
+	}
+
 	if (pagemap_in_parent(pr->pe)) {
 		if (read_parent_page(pr, vaddr, nr, buf, flags) < 0)
 			return -1;
@@ -574,9 +588,13 @@ static int process_async_reads(struct page_read *pr)
 			}
 		}
 
-		if (ret < 0) {
-			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-				   piov->end - piov->from, piov->from, piov->nr);
+		if (ret <= 0) {
+			if (ret == 0)
+				pr_err("Unexpected EOF on async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
+					   piov->end - piov->from, piov->from, piov->nr);
+			else
+				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
+					   piov->end - piov->from, piov->from, piov->nr);
 			return -1;
 		}
 
@@ -592,6 +610,7 @@ static int process_async_reads(struct page_read *pr)
 			 * Modify the piov in-place, we're going to drop this one
 			 * anyway.
 			 */
+
 			advance_piov(piov, ret);
 			goto more;
 		}

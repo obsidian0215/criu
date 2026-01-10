@@ -18,33 +18,12 @@ enum {
 	TIME_COMPARE_PAGES,
 	TIME_COPY_PAGES,
 	TIME_PAGE_XFER,
-	TIME_PREPARE_NS,
-	TIME_RESTORE_NS,
-	TIME_RESTORE_CGROUP,
-	TIME_RESTORE_FILES,
-	TIME_RESTORE_PIDS,
-	TIME_RESTORE_SOCKETS,
-	TIME_RESTORE_CREDS,
-	TIME_RESTORE_MNTNS,
-	TIME_RESTORE_VMAS,
 
 	RESTORE_TIME_NS_STATS,
 };
 
 extern void timing_start(int t);
 extern void timing_stop(int t);
-
-/*
- * Conditional timing macros for fine-grained phase timing.
- * Only performs timing when STATS_EXPORT env var is set to avoid overhead.
- */
-#define timing_start_if_enabled(t) do { \
-	if (getenv("STATS_EXPORT")) timing_start(t); \
-} while (0)
-
-#define timing_stop_if_enabled(t) do { \
-	if (getenv("STATS_EXPORT")) timing_stop(t); \
-} while (0)
 
 enum {
 	CNT_PAGES_SCANNED,
@@ -65,20 +44,6 @@ enum {
 	CNT_PAGES_COMPARED,
 	CNT_PAGES_SKIPPED_COW,
 	CNT_PAGES_RESTORED,
-
-	CNT_READ_PAGES_USEC,
-	CNT_COMPARE_PAGES_USEC,
-	CNT_COPY_PAGES_USEC,
-	CNT_PAGE_XFER_USEC,
-	CNT_PREPARE_NS_USEC,
-	CNT_RESTORE_NS_USEC,
-	CNT_RESTORE_CGROUP_USEC,
-	CNT_RESTORE_FILES_USEC,
-	CNT_RESTORE_PIDS_USEC,
-	CNT_RESTORE_SOCKETS_USEC,
-	CNT_RESTORE_CREDS_USEC,
-	CNT_RESTORE_MNTNS_USEC,
-	CNT_RESTORE_VMAS_USEC,
 
 	RESTORE_CNT_NR_STATS,
 };
