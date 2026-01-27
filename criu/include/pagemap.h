@@ -128,7 +128,7 @@ static inline bool page_read_has_parent(struct page_read *pr)
 #define PE_PARENT  (1 << 0) /* pages are in parent snapshot */
 #define PE_LAZY	   (1 << 1) /* pages can be lazily restored */
 #define PE_PRESENT (1 << 2) /* pages are present in pages*img */
-#define PE_SKIP	   (1 << 3) /* pages are skipped in pages*img */
+#define PE_DEFERRED (1 << 3) /* page was deferred (skipped by DEFER logic) */
 
 static inline bool pagemap_in_parent(PagemapEntry *pe)
 {
@@ -145,9 +145,9 @@ static inline bool pagemap_present(PagemapEntry *pe)
 	return !!(pe->flags & PE_PRESENT);
 }
 
-static inline bool pagemap_skip(PagemapEntry *pe)
+static inline bool pagemap_deferred(PagemapEntry *pe)
 {
-	return !!(pe->flags & PE_SKIP);
+	return !!(pe->flags & PE_DEFERRED);
 }
 
 #endif /* __CR_PAGE_READ_H__ */

@@ -1527,8 +1527,8 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		mdc.use_dirty_map = true;
 
 	if (mdc.use_dirty_map) {
-		pr_info("[Obsidian0215]init dirty-track and dirty-map for %d\n", item->pid->real);
-		ret = init_dirty_map(item, &vmas, opts.dirty_map_dir);
+		/* pr_info("[Obsidian0215]init dirty-track and dirty-map for %d\n", item->pid->real); */
+		ret = init_dirty_map(item, opts.dirty_map_dir);
 		if (ret) {
 			pr_err("[Obsidian0215]init dirty map failed\n");
 		}
@@ -1715,8 +1715,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		mdc.use_dirty_map = false;
 
 	if (mdc.use_dirty_map) {
-		pr_info("[Obsidian0215]init dirty-track and dirty-map for %d\n", item->pid->real);
-		ret = init_dirty_map(item, &vmas, opts.dirty_map_dir);
+		/* pr_info("[Obsidian0215]init dirty-track and dirty-map for %d\n", item->pid->real); */
+		ret = init_dirty_map(item, opts.dirty_map_dir);
 		if (ret) {
 			pr_err("init %d's dirty map failed\n", item->dl->pid);
 		}

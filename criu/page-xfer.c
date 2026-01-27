@@ -178,25 +178,17 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 {
 	ssize_t ret, left = len;
 
-	if (opts.mode == CR_RESTORE)
-		timing_start(TIME_PAGE_XFER);
-
 	if (opts.tls) {
 		pr_debug("Sending %lu bytes / %lu pages\n", len, len / PAGE_SIZE);
 
-		if (tls_send_data_from_fd(p, len)) {
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_PAGE_XFER);
+		if (tls_send_data_from_fd(p, len))
 			return -1;
-		}
 	} else {
 		pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
 
 		while (left > 0) {
 			ret = splice(p, NULL, xfer->sk, NULL, left, SPLICE_F_MOVE);
 			if (ret < 0) {
-				if (opts.mode == CR_RESTORE)
-					timing_stop(TIME_PAGE_XFER);
 				pr_perror("Can't write pages to socket");
 				return -1;
 			}
@@ -205,9 +197,6 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 			left -= ret;
 		}
 	}
-
-	if (opts.mode == CR_RESTORE)
-		timing_stop(TIME_PAGE_XFER);
 
 	return 0;
 }
@@ -268,20 +257,14 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
-	if (opts.mode == CR_RESTORE)
-		timing_start(TIME_PAGE_XFER);
 
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_PAGE_XFER);
 			pr_perror("Unable to spice data");
 			return -1;
 		}
 		if (ret == 0) {
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_PAGE_XFER);
 			pr_err("A pipe was closed unexpectedly\n");
 			return -1;
 		}
@@ -290,60 +273,88 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 			break;
 	}
 
-	if (opts.mode == CR_RESTORE)
-		timing_stop(TIME_PAGE_XFER);
-
 	return 0;
 }
 
-static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov, struct dirty_log *dl)
+static int check_pagehole_in_parent(struct page_xfer *xfer, struct page_read *p, struct iovec *iov)
 {
 	int ret;
 	unsigned long off, end;
-	struct dirty_diffmap *dhm;
 
 	/*
-	 * Try to find pagemap entry in parent, from which
-	 * the data will be read on restore.
-	 *
-	 * This is the optimized version of the page-by-page
-	 * read_pagemap_page routine.
-	 */
+	* Try to find pagemap entry in parent, from which
+	* the data will be read on restore.
+	*
+	* This is the optimized version of the page-by-page
+	* read_pagemap_page routine.
+	*/
 
 	pr_debug("Checking %p/%zu hole\n", iov->iov_base, iov->iov_len);
 	off = (unsigned long)iov->iov_base;
 	end = off + iov->iov_len;
 	while (1) {
-		unsigned long pend;
-
+		unsigned long pend = 0;
 		ret = p->seek_pagemap(p, off);
-		if (ret <= 0 || !p->pe) {
-			if (!dl && !opts.use_dirty_map) {
-				pr_err("Missing %lx in parent pagemap\n", off);
-			} else {
-				dhm = search_dirty_map(dl, off);
-				if (dhm) {
-				    // pr_info("[Obsidian0215]Found %lx in dirty map\n", off);
-					off += PAGE_SIZE;
-					if (off >= end)
-						return 0;
-					else
-						continue;
-				}
-				pr_err("[Obsidian0215]Missing %lx both in dirtymap and parent pagemap\n", off);
-			}
+		if (ret < 0 || !p->pe) {
+			/* Real error or invalid pagemap */
+			pr_err("Missing %lx in parent pagemap\n", off);
 			return -1;
 		}
 
+		if (ret == 0) {
+			/* Gap in parent pagemap.
+			 * In standard CRIU, this means we should look in the grandparent.
+			 */
+			if (p->parent) {
+				struct iovec niov = {
+						.iov_base = (void *)off,
+						.iov_len = PAGE_SIZE,
+				};
+				ret = check_pagehole_in_parent(xfer, p->parent, &niov);
+				if (ret)
+					return -1;
+			} else {
+				/* [Obsidian] Bottom of the chain. If it's still a gap,
+				 * in standard CRIU it's treated as a zero page or
+				 * something that hasn't changed from the base image.
+				 * We allow this to avoid "Missing in parent pagemap" errors
+				 * for sparse incremental images.
+				 */
+				pr_debug("\tPage %lx is a gap reached root parent\n", off);
+			}
+			off += PAGE_SIZE; // Advance one page at a time for gaps
+			if (off >= end)
+				return 0;
+			continue;
+		}
+
 		pr_debug("\tFound %" PRIx64 "/%lu\n", p->pe->vaddr, pagemap_len(p->pe));
+		pend = p->pe->vaddr + pagemap_len(p->pe);
+
+		if (pagemap_in_parent(p->pe)) {
+			if (p->parent) {
+				struct iovec niov = {
+						.iov_base = (void *)off,
+						.iov_len = min(pend, end) - off,
+				};
+				ret = check_pagehole_in_parent(xfer, p->parent, &niov);
+				if (ret)
+					return -1;
+			} else {
+				/* [Obsidian] Bottom of the chain. Even if it still says PE_PARENT,
+				 * we trust that it points to a root image (like the Base image)
+				 * that is not currently in our available chain.
+				 */
+				pr_debug("\tPage %lx marked in parent reached root\n", off);
+			}
+		}
 
 		/*
-		 * The pagemap entry in parent may happen to be
-		 * shorter, than the hole we write. In this case
-		 * we should go ahead and check the remainder.
-		 */
+		* The pagemap entry in parent may happen to be
+		* shorter, than the hole we write. In this case
+		* we should go ahead and check the remainder.
+		*/
 
-		pend = p->pe->vaddr + pagemap_len(p->pe);
 		if (end <= pend)
 			return 0;
 
@@ -372,13 +383,13 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 		}
 	} else if (flags & PE_PARENT) {
 		if (xfer->parent != NULL) {
-			ret = check_pagehole_in_parent(xfer->parent, iov, xfer->dl);
+			ret = check_pagehole_in_parent(xfer, xfer->parent, iov);
 			if (ret) {
 				pr_err("Hole %p/%zu not found in parent\n", iov->iov_base, iov->iov_len);
 				return -1;
 			}
 		}
-	} else if (flags & PE_SKIP) {
+	} else {
 		/* Nothing to do */
 	}
 
@@ -488,16 +499,18 @@ static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 f
 
 static int get_hole_flags(struct page_pipe *pp, int n)
 {
-	unsigned int hole_flags = pp->hole_flags[n];
+	unsigned int pp_flags = pp->hole_flags[n];
+	u32 pe_flags = 0;
 
-	if (hole_flags == PP_HOLE_PARENT)
-		return PE_PARENT;
-	else if (hole_flags == PP_HOLE_SKIP)
-		return PE_SKIP;
-	else
+	if (pp_flags & PP_HOLE_PARENT)
+		pe_flags |= PE_PARENT;
+	if (pp_flags & PP_HOLE_DEFERRED)
+		pe_flags |= (PE_DEFERRED | PE_PARENT);
+
+	if (pe_flags == 0)
 		BUG();
 
-	return -1;
+	return pe_flags;
 }
 
 static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp, unsigned int *cur_hole, void *limit)
@@ -906,7 +919,11 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 	xfree(aux_iov);
 	timing_start(TIME_MEMWRITE);
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	ret = dump_holes(xfer, pp, &cur_hole, NULL);
+	if (ret)
+		return ret;
+
+	return 0;
 err:
 	munmap(userbuf, userbuf_len);
 	xfree(aux_iov);
@@ -947,7 +964,11 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		}
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	ret = dump_holes(xfer, pp, &cur_hole, NULL);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 /*

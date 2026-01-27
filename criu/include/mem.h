@@ -52,4 +52,8 @@ int unmap_guard_pages(struct pstree_item *t);
 int prepare_mappings(struct pstree_item *t);
 
 u64 should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, bool *softdirty);
+
+/* Helper: Detect trivial DUMP decisions (heat==0 and heat_trend==0) which should be
+ * suppressed at source to reduce telemetry noise. Exposed for regression tests. */
+bool is_trivial_dump_decision(const char *decision, float heat, float heat_trend);
 #endif /* __CR_MEM_H__ */

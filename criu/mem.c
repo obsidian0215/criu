@@ -34,14 +34,67 @@
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "image.h"
 #include "dirty-map.h"
-#include  <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* Helper used to suppress trivial DUMP telemetry lines:
+ * returns true if the decision represents an uninteresting DUMP (heat==0 && heat_trend==0).
+ * Kept here (in mem.c) so it's linked into the main binary without requiring additional build system changes.
+ */
+bool is_trivial_dump_decision(const char *decision, float heat, float heat_trend) {
+    if (!decision)
+        return false;
+    if (strcmp(decision, "DUMP") == 0 && fabsf(heat) < 1e-9f && fabsf(heat_trend) < 1e-9f)
+        return true;
+    return false;
+}
+
+/* [Obsidian0215] Simplified parent reliability check: inspect only the immediate parent layer.
+ * Avoid recursively traversing the parent chain (expensive). Treat gaps and PE_PARENT
+ * as permissive (do not traverse further). If the immediate layer explicitly marks the
+ * page as DEFERRED, consider it unreliable. Root-level DEFERRED is handled at restore time
+ * (it will abort with an artifact) to avoid silent zero-fill.
+ */
+static bool parent_has_reliable_page(struct page_read *pr, unsigned long vaddr) {
+    int ret;
+    if (!pr)
+        return false;
+
+    ret = pr->seek_pagemap(pr, vaddr);
+    if (ret == 1) {
+        /* Explicit entry in immediate parent */
+        if (pagemap_deferred(pr->pe))
+            return false; /* deferred in parent -> unreliable */
+        if (pagemap_present(pr->pe))
+            return true;  /* parent has concrete data */
+        /* PE_PARENT or other explicit entry: permissive, do not walk */
+        return true;
+    } else if (ret == 0) {
+        /* Gap in immediate parent: permissive (do not walk) */
+        return true;
+    } else {
+        /* Error/seek failure: be conservative */
+        return false;
+    }
+}
+
+static int get_parent_chain_len(struct page_read *pr) {
+    int len = 0;
+    struct page_read *curr = pr;
+    while (curr) {
+        len++;
+        curr = curr->parent;
+    }
+    return len;
+}
 
 static int task_reset_dirty_track(struct pstree_item *item, struct mem_dump_ctl *mdc) {
 	int ret, pid = item->pid->real;
 	struct dirty_log *dl = item->dl;
 	bool use_dirty_map = mdc->use_dirty_map;
-	bool pre_dump = mdc->pre_dump;
 	struct pid_check pc = {.pid = pid, .is_tracked = 0};
 
 	if (!opts.track_mem)
@@ -49,29 +102,29 @@ static int task_reset_dirty_track(struct pstree_item *item, struct mem_dump_ctl 
 
 	BUG_ON(!kdat.has_dirty_track);
 
-	if (use_dirty_map && pre_dump) {
+	// [Phase0] Use dirty-map path for both pre-dump AND final dump
+	// Final dump needs dirty-map to handle PE_DEFERRED pages
+	if (use_dirty_map) {
 		// fd = item->dl->dirty_track_fd;
 		if (!dl || (dl->dirty_track_fd == -1) || (dl->pid != pid)) {
 			pr_err("[Obsidian0215]No available dirty-track fd for %d\n", pid);
 			return -1;
+
 		}
 		ret = check_dirty_track(dl, &pc);
 		if (!ret && !pc.is_tracked) {
 			ret = start_dirty_track(dl);
 			if (ret) {
-				pr_perror("[Obsidian0215]failed to start dirty-track for %d", pid);
+				pr_err("[Obsidian0215]failed to start dirty-track for %d\n", pid);
 			} else {
-				pr_info("[Obsidian0215]dirty-track started for %d\n", pid);
+				// pr_info("[Obsidian0215]dirty-track started for %d\n", pid);
 			}
 		} else if (!ret && pc.is_tracked) {
-			pr_info("[Obsidian0215]dirty-track already started for %d\n", pid);
-		} else if (ret) {
-			pr_perror("[Obsidian0215]failed to check dirty-track for %d", pid);
+			/* pr_info("[Obsidian0215]dirty-track already started for %d\n", pid); */
+		} else {
+			pr_err("[Obsidian0215]failed to check dirty-track for %d\n", pid);
 		}
-		/* [Obsidian0215] According to user, LKM clears soft-dirty on start.
-		 * We keep this commented out for now to avoid redundant page table walks.
-		 * do_task_reset_dirty_track(pid);
-		 */
+
 	} else {
 		ret = do_task_reset_dirty_track(pid);
 	}
@@ -509,162 +562,687 @@ again:
 	return ret;
 }
 
-// [Obsidian0215] make the decision whether to dump the pages
-static inline bool choose_page_by_dirtymap_optimized(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty, struct dirty_diffmap *dhm) {
-	if (pre_dump) {
+
+static inline int telemetry_decisions_enabled(void) {
+    static int enabled = -1;
+    const char *env;
+    if (enabled != -1)
+        return enabled;
+    env = getenv("CRIU_DECISION_TELEMETRY");
+	/* default: disabled unless explicitly enabled */
+	if (!env || !env[0])
+		enabled = 0;
+	else
+		enabled = (env[0] == '0') ? 0 : 1;
+    return enabled;
+}
+
+/* Environment variables related to decision telemetry (still supported):
+ * - CRIU_DECISION_TELEMETRY: decision telemetry mode (0=off,1=light-sample,2=full)
+ * - CRIU_DECISION_TELEMETRY_SAMPLE: sampling rate (integer, default 1000)
+ *
+ * Note: previous env knobs that influenced defer behavior (CRIU_MAX_DEFER_ROUNDS,
+ * CRIU_DEFER_PTHR_BASE, CRIU_DEFER_SOFT_BUDGET_RATIO) are now deprecated and
+ * ignored. Defer behavior is controlled via adaptive runtime parameters in
+ * `struct dirty_log` (no external configuration required).
+ */
+
+static inline int get_env_decision_telemetry_mode(void) {
+    static int mode = -2; /* -2 == uninitialized */
+    const char *env;
+    if (mode != -2)
+        return mode;
+    env = getenv("CRIU_DECISION_TELEMETRY");
+	if (!env || !env[0])
+		mode = 0; /* default: disabled */
+    else if (env[0] == '0')
+        mode = 0;
+    else if (env[0] == '1')
+        mode = 1;
+    else if (env[0] == '2')
+        mode = 2;
+    else
+        mode = atoi(env) ? atoi(env) : 1;
+    return mode;
+}
+
+static inline int get_env_decision_telemetry_sample(void) {
+    static int val = -2; /* -2 == uninitialized */
+    const char *env;
+    if (val != -2)
+        return val;
+    env = getenv("CRIU_DECISION_TELEMETRY_SAMPLE");
+    if (!env || !env[0])
+        val = 1000; /* default: sample every 1000 decisions */
+    else {
+        val = atoi(env);
+        if (val <= 0)
+            val = 1000;
+    }
+    return val;
+}
+
+
+
+
+static inline void log_page_decision(struct dirty_log *dl, pid_t pid, unsigned long vaddr, int round, bool pre_dump, const char *decision, const char *reason, struct dirty_diffmap *dhm, int deferred_count, bool is_warm, float p_next, float p_model, float score, float p_thresh) {
+    /* Light / sampled decision telemetry to avoid log explosion. */
+    float track_s = 1.0f;
+    float writes_est = 0.0f;
+    int hist_count = 0;
+    int hist_declining = 0;
+    float hist_mean = 0.0f, hist_var = 0.0f;
+    float deferred_risk = 0.0f;
+    page_history_t *hist = NULL;
+
+    if (!telemetry_decisions_enabled())
+        return;
+
+    /* Suppress trivial DUMP decision logs at source: these are high-volume noise with
+     * dhm->heat == 0 && dhm->heat_trend == 0. Parsing and later filtering is costly
+     * and produces huge decisions.csv files; skip such logging to reduce noise.
+     */
+    if (dhm && decision && is_trivial_dump_decision(decision, dhm->heat, dhm->heat_trend))
+        return;
+
+    if (dhm) {
+        if (dl && dl->ldm_header && dl->ldm_header->track_duration_ns > 0)
+            track_s = (float)dl->ldm_header->track_duration_ns / 1e9f;
+        writes_est = dhm->heat * track_s;
+    }
+
+    if (dl && dl->page_history_map) {
+        hist = g_hash_table_lookup(dl->page_history_map, GSIZE_TO_POINTER(vaddr));
+        if (hist) {
+            hist_count = hist->history_count;
+            hist_declining = hist->is_declining ? 1 : 0;
+            hist_mean = hist->mean_heat;
+            hist_var = hist->variance_heat;
+        }
+    }
+
+
+
+    /* Sampling and mode control */
+    {
+        static unsigned long decision_log_counter = 0;
+        unsigned long cnt = __sync_fetch_and_add(&decision_log_counter, 1);
+        int mode = get_env_decision_telemetry_mode(); /* 0=off,1=light-sample,2=full */
+        int sample_n = get_env_decision_telemetry_sample();
+
+        if (mode == 0)
+            return; /* disabled */
+
+        if (mode == 1) {
+            /* light sampling: only log 1/sample_n of decisions to avoid noise */
+            if ((cnt % (unsigned long)sample_n) != 0)
+                return;
+            if (dl && dl->diffmap_size > 0 && dl->global_mean_heat > 0.0f)
+                deferred_risk = dl->deferred_heat_sum / (dl->global_mean_heat * (float)dl->diffmap_size + 1e-6f);
+            pr_info("[ObsidianDecision] pid=%d round=%d pre_dump=%d addr=0x%lx decision=%s reason=%s dhm_present=%d heat=%.6f writes_est=%.3f deferred=%d deferred_risk=%.3f is_warm=%d p=%.6f p_model=%.6f score=%.3f pthr=%.3f\n",
+                pid, round, pre_dump ? 1 : 0, vaddr, decision, reason, dhm ? 1 : 0,
+                dhm ? dhm->heat : 0.0, writes_est, deferred_count, deferred_risk, is_warm ? 1 : 0, p_next, p_model, score, p_thresh);
+            return;
+        }
+
+        /* compute deferred risk (diagnostic, normalized) */
+        if (dl && dl->diffmap_size > 0 && dl->global_mean_heat > 0.0f)
+            deferred_risk = dl->deferred_heat_sum / (dl->global_mean_heat * (float)dl->diffmap_size + 1e-6f);
+
+        pr_info("[ObsidianDecision] pid=%d round=%d pre_dump=%d addr=0x%lx decision=%s reason=%s dhm_present=%d heat=%.6f heat_trend=%.6f writes_est=%.3f track_s=%.3f deferred=%d deferred_risk=%.3f is_warm=%d hist_count=%d hist_declining=%d hist_mean=%.6f hist_var=%.6f thresholds=%.2f/%.2f/min=%.2f p=%.6f p_model=%.6f score=%.6f pthr=%.6f\n",
+            pid, round, pre_dump ? 1 : 0, vaddr, decision, reason, dhm ? 1 : 0,
+            dhm ? dhm->heat : 0.0, dhm ? dhm->heat_trend : 0.0,
+            writes_est, track_s,
+            deferred_count, deferred_risk, is_warm ? 1 : 0,
+            hist_count, hist_declining, hist_mean, hist_var,
+            dl ? dl->heat_threshold : 0.0, dl ? dl->trend_threshold : 0.0, dl ? dl->min_heat : 0.0, p_next, p_model, score, p_thresh);    }
+}
+
+static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long vaddr, bool pre_dump, bool has_parent, bool softdirty) {
+    struct dirty_diffmap *dhm = search_dirty_map(dl, vaddr);
+
+    if (pre_dump) {
         if (!dhm) {
-            // 未在dirty_map中找到，说明是极冷页或长时间未变动
-            // [Obsidian0215] If no parent exists, we MUST dump the page.
-            if (!has_parent)
-                return true;
-            // 如果已经有父镜像且没有脏，可以跳过到父镜像
-            if (page_in_parent(softdirty))
+            // 未在dirty_map中找到，根据是否有父镜像决定
+            if (!has_parent) {
+				// 没有父镜像，选择没有变脏的冷页
+				if (!page_in_parent(softdirty))
+                	return true;
+				else	// 若之前没有被track，可以跳过
+                	return false;
+            } else {
+				// (现在脏页追踪到进程冻结才结束，一般dirtymap不会遗漏脏页)
+				// 有父镜像且无dirty-map记录的一定是冷页且被传输过，跳过
                 return false;
-            return true;
+            }
         } else {
-            // 被dirty_map记录，根据热度决定
+            // 被dirty_map记录则基于热度和热度变化确定
             if (dhm->heat < dl->min_heat) {
-				// 极其冷的页
+				// 冷页（一般只会从第二次predump出现）, 选择变冷的
 				if (dhm->heat_trend < 0) {
-					// 刚变冷的页：捕捉它，因为它正在退出热态
-					if (search_warm_list(dl, vaddr)) {
-						sub_warm_list(dl, vaddr, true);
-						return true;
+					// 判断是否在温页列表中，若在则删除该地址
+					if (0) { /* warm_list disabled */
+						// pr_info("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
+						// sub_warm_list(dl, vaddr, true);
+						return false;
 					}
-                	// 否则，如果它不在父镜像中，补传一次
-					return !has_parent || !page_in_parent(softdirty);
-				} else {
-					// 一直很冷
-                    if (!has_parent)
-                        return true;
-					return !page_in_parent(softdirty);
+                	return true;
+				} else {	// 一般不会走该分支
+					return false;
 				}
             } else if (dhm->heat <= dl->heat_threshold && dhm->heat >= dl->min_heat) {
-				// 温页：如果已经在冷却，或者我们正处于后续迭代中，则进行转储以防积累到 Final Dump
-                if (dhm->heat_trend < 0 || has_parent) {
-					inc_warm_list(dl, vaddr);
+				// 温页，选择热度下降较快的（超过trend_threshold）
+				// 并加入温页列表
+                if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
+					// if (!search_warm_list(dl, vaddr))
+					// 	pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
+					// else
+					// 	pr_info("[Obsidian0215]update 0x%lx to warm list\n", vaddr);
+						float writes_est = 0.0f;
+						if (dl && dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
+							float td = (float)dl->ldm_header->track_duration_ns / 1e9f;
+							writes_est = dhm->heat * td;
+						} else {
+							writes_est = dhm->heat;
+						}
+						if (writes_est <= 2.0f) {
+						/* immediate warm insertion disabled: rely on promotion */
+                    pr_debug("[Obsidian0215]WarmFilter init/no-immediate-insert 0x%lx\\n", vaddr);
+					} else {
+						pr_debug("[Obsidian0215]WarmFilter skip add 0x%lx writes_est=%.1f\\n", vaddr, writes_est);
+					}
                     return true;
-                } else {
-                    // 第一轮迭代且热度稳定，可以选择跳过以减少首轮压力
-                    inc_skip_list(dl, vaddr);
-                    return false;
-				}
+                } else
+                	return false;
             } else {
-				 // 热页：
-				 // 如果热度在显著下降（趋势低于 -1.0），说明页面正在退出热态，捕捉它以减少 Final Dump 压力。
-				 // 否则，对于持续高频写入的页面，选择跳过。
-				 if (dhm->heat_trend < -1.0f) {
-					 return true;
-				 }
-                 inc_skip_list(dl, vaddr);
-                 return false;
+				 // 热页被跳过
+				// 判断是否在温页列表中，若在则删除该地址
+				if (0) { /* warm_list disabled */
+					/* sub_warm_list disabled */
+				}
+                return false;
             }
         }
-    } else { // Final dump 模式
+    } else { // dump模式下
         if (dhm) {
+            // pr_info("[Obsidian0215]DECISION 0x%lx -> SEND (dhm present)\n", vaddr);
+			// 被dirty-map记录的页——最后一次需要传输
             return true;
-        } else if (!has_parent || !page_in_parent(softdirty)) {
+        } else if (!dhm && has_parent && !page_in_parent(softdirty)) {
+            // pr_info("[Obsidian0215]DECISION 0x%lx -> SEND (parent covers or softdirty)\n", vaddr);
+			// 未被dirty-map记录但soft-dirty置位(发生过修改)——最后一次需要传输
+			// (目前这种情况应该不太可能触发，dirty-map能覆盖进程运行的所有脏页)
             return true;
+        } else if (!dhm && !has_parent) {
+            // pr_info("[Obsidian0215]DECISION 0x%lx -> SEND (no parent)\n", vaddr);
+			// 未被dirty-map记录, 且无父镜像——需要传输
+			// 进程在dump前创建且未被track会产生这种情况
+			return true;
 		} else {
+            // pr_info("[Obsidian0215]DECISION 0x%lx -> SKIP (dhm=NULL has_parent=%d softdirty=%d)\n", vaddr, has_parent ? 1 : 0, softdirty ? 1 : 0);
+			// 未被dirty-map记录且soft-dirty未置位(冷页)
+			// 能找到父镜像则可以跳过
 			return false;
 		}
     }
 }
 
-//[Obsidian0215]put pages into page-pipe with dirty-map
-static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, bool pre_dump) {
-	int ret = 0;
-	// struct dirty_log *dl = &item->dirty_log;
-	unsigned long nr_scanned;
-	unsigned long pages[3] = {};
-	unsigned long vaddr;
-	bool dump_all_pages;
+// [Obsidian0215] Optimized version of generate_iovs for dirty-map.
 
-	dump_all_pages = should_dump_entire_vma(vma->e);
+/* Decision model implemented in dirty-map.c (migrated). */
+/* See include/dirty-map.h for public prototypes: compute_p_next_dirty / decision_p_threshold */
 
-	nr_scanned = 0;
-	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
-		unsigned int ppb_flags = 0;
-		bool softdirty = false;
-		u64 next;
-		int st;
+/* env_getf removed: decision thresholds are now driven by dl->adaptive_* fields. */
 
-		/* If dump_all_pages is true, should_dump_page is called to get pme. */
-		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
-		if (!dump_all_pages && next != vaddr) {
-			vaddr = next - PAGE_SIZE;
-			continue;
-		}
+static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
+                    pmc_t *pmc, u64 *pvaddr, bool has_parent, struct mem_dump_ctl *mdc, struct page_xfer *xfer,
+                    struct page_read *parent_pr)
+{
+    unsigned long nr_scanned;
+    unsigned long pages[3] = {};
+    unsigned long vaddr;
+    bool dump_all_pages;
+    int ret = 0;
+    /* Decision counters */
+    float track_s = 1.0f, writes_est = 0.0f;
+	unsigned long cnt_hole_parent __attribute__((unused)) = 0,
+				  cnt_hole_skip __attribute__((unused)) = 0,
+				  cnt_page_lazy __attribute__((unused)) = 0,
+				  cnt_page_present __attribute__((unused)) = 0,
+				  cnt_parent_missing __attribute__((unused)) = 0;
+    /* Phase0诊断统计 */
+	unsigned long cnt_dhm_null __attribute__((unused)) = 0,
+				  cnt_dhm_exist __attribute__((unused)) = 0;
+	unsigned long cnt_class[NUM_PAGE_CLASSES] __attribute__((unused)) = {0}; // FREEZING, COLD, WARM, HOT
+	unsigned long cnt_softdirty_only __attribute__((unused)) = 0,
+				  cnt_heat_only __attribute__((unused)) = 0,
+				  cnt_both_dirty __attribute__((unused)) = 0;
+	unsigned long cnt_anomaly_dhm_null_softdirty __attribute__((unused)) = 0; // dhm=NULL but softdirty=1
+	int round = 0;
+	bool allow_defer = 1;
+	/* We use per-class adaptive max-defer limits stored in dl; do not consult environment variables. */
+	/* allow_defer will be checked per-page against class-specific limits */
+	int env_max_defer __attribute__((unused)) = -1;
 
-		/* Make criu restorer to use the parent image for this page. */
-		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr) && !pre_dump)
-			ppb_flags |= PPB_LAZY;
+    // Simplified round calculation: just count how many parents exist
+    // Round 1 has no parent (round=1), Round 2 has 1 parent (round=2), etc.
+    round = get_parent_chain_len(parent_pr) + 1;
 
-		/*
-		 * If we're doing incremental dump (parent images
-		 * specified) and page is not soft-dirty -- we dump
-		 * hole and expect the parent images to contain this
-		 * page. The latter would be checked in page-xfer.
-		 */
-		// [Obsidian0215] for pages in writable vma, check dirty-map to decide whether to dump
-		if ((vma->e->prot & PROT_WRITE) || !(vma->e->status & VMA_NO_PROT_WRITE)) {
-			struct dirty_diffmap *dhm = search_dirty_map(item->dl, vaddr);
-			if (!choose_page_by_dirtymap_optimized(item->dl, vaddr, pre_dump, has_parent, softdirty, dhm)) {
-				// [Obsidian0215] 如果是热页被跳过(存在于dirtymap中)，使用 PP_HOLE_SKIP 显式标记为空洞
-				// 这样下一轮迭代检查父镜像时能找到该空洞记录，防止 page-xfer 报错
-				if (pre_dump && dhm)
-					ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_SKIP);
-				else
-					ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-				st = 0;
-			} else {
-				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-					st = 1;
-				else
-					st = 2;
+	// pr_info("[Phase0Timing] generate_iovs START for Round %d (has_parent=%d, pre_dump=%d), vma [%lx-%lx]\n",
+	//     round, has_parent, mdc->pre_dump, vma->e->start, vma->e->end);
+
+    /* NOTE: enforcement of deferred soft-budget is intentionally NOT performed per-VMA
+     * anymore. It has been moved to the pre-dump entry point so that urgent-force marks
+     * are prepared before scanning ANY VMA. Per-VMA calls could pick pages late in the
+     * pass and those picks would only be applied in the next pre-dump, causing
+     * alternating spikes in pages transferred (observed bug).
+     */
+
+    /* Initialize loop-local state (was accidentally removed during refactor) */
+    dump_all_pages = should_dump_entire_vma(vma->e);
+    nr_scanned = 0;
+
+    for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
+        unsigned int ppb_flags = 0;
+        unsigned int hf = 0;
+        bool softdirty = false;
+        u64 next;
+        int st;
+
+        /* [Obsidian0215] We must not skip gaps in incremental dumps when using our
+         * selective-skipping optimization, because a "gap" (unchanged page) in
+         * standard CRIU logic might lead back to an unreliable PE_DEFERRED in a parent.
+         */
+        if (mdc->use_dirty_map && has_parent) {
+            u64 original_next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
+            if (original_next != vaddr) {
+                /* Not mapped or not present in this process. Keep as gap. */
+                vaddr = original_next - PAGE_SIZE;
+                continue;
+            }
+            next = vaddr;
+        } else {
+            next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
+            if (!dump_all_pages && next != vaddr) {
+                vaddr = next - PAGE_SIZE;
+                continue;
+            }
+        }
+
+        st = 0;
+        if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
+            ppb_flags |= PPB_LAZY;
+
+        if (next == vaddr) {
+            struct dirty_log *dl = item->dl;
+            struct dirty_diffmap *dhm = NULL;
+			page_class_t page_class __attribute__((unused)) = PAGE_FREEZING;      // Phase0优化
+			access_pattern_t access_pattern __attribute__((unused)) = PATTERN_UNKNOWN; // Phase0优化，未来可能使用
+			bool is_warm = false;
+			bool parent_has_page = false;
+			bool can_use_parent = false;
+			bool effectively_dirty = false;
+			bool should_defer = false;  // Conservative per-page defer decision (DEFERRED semantics)
+			bool dirty_now = false;
+
+			bool is_deferred = false;
+			int deferred_count = 0;
+			bool force_dump_now = false;
+			bool deferred_resolved = false;
+
+
+            /* Check parent coverage using our local reader recursively. */
+            if (parent_pr) {
+                if (parent_has_reliable_page(parent_pr, vaddr)) {
+                    parent_has_page = true;
+                }
+            }
+
+			if (dl) {
+				dhm = search_dirty_map(dl, vaddr);
+				if (dhm) {
+					/* 不使用阈值/分类逻辑，仅统计 dirty-map 覆盖率 */
+					cnt_dhm_exist++;
+					track_s = 1.0f;
+					if (dl && dl->ldm_header && dl->ldm_header->track_duration_ns > 0)
+						track_s = (float)dl->ldm_header->track_duration_ns / 1e9f;
+					writes_est = dhm->heat * track_s;
+					dirty_now = (writes_est > 0.0f);
+
+					/* Record heat history for EMA/trend calculations */
+					update_page_history(dl, vaddr, dhm, round);
+
+					/* warm detection deprecated under queue-mode: mark as not warm */
+					is_warm = false;
+
+					pr_debug("[Obsidian0215]WarmFilter disabled (queue-mode) 0x%lx\\n", vaddr);
+				}
+				/* Track whether this page was deferred in prior rounds */
+				deferred_count = get_deferred_count(dl, vaddr);
+				is_deferred = (deferred_count > 0);
+				/* Per-round defer cap to avoid deferring too many pages */
+				if (dl && dl->diffmap_size > 0) {
+					float defer_cap_ratio = 0.60f - 0.05f * (float)(round - 1);
+					if (round == 1) {
+						if (!skip_model_loaded())
+							defer_cap_ratio = 52.00f;
+						else
+							defer_cap_ratio = 38.00f;
+					}
+					if (defer_cap_ratio < 0.30f)
+						defer_cap_ratio = 0.30f;
+					if ((float)dl->deferred_size / (float)dl->diffmap_size >= defer_cap_ratio)
+						allow_defer = 0;
+					else
+						allow_defer = 1;
+				}
 			}
-		} else {
-		    // [Obsidian0215] for pages in non-writable vma, check soft-dirty bit and parent images
-			if (has_parent && page_in_parent(softdirty)) {
-				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-				st = 0;
-			} else {
-				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-					st = 1;
-				else
-					st = 2;
+
+            /* [Obsidian0215] Multi-Stage Iterative Strategy:
+             * 1. Get current pre-dump round.
+             * 2. Choose heat threshold based on round (gradually absorbing warmer pages).
+             * 3. Determine if page is dirty since LAST iteration (using soft-dirty + heat trend).
+             */
+            can_use_parent = has_parent && parent_has_page;
+
+			// pr_info("[Phase0-TRACE] vaddr=%#lx pre_dump=%d has_parent=%d parent_has_page=%d can_use_parent=%d softdirty=%d\n",
+			// 		 vaddr, mdc->pre_dump, has_parent, parent_has_page, can_use_parent, softdirty);
+
+            /* [Obsidian0215] Delta detection with PP_HOLE_DEFERRED handling. */
+			if (mdc->pre_dump && dl) {
+				int defer_drain_round = 4;
+				int defer_stop_round = 5;
+				bool near_final_round = false;
+
+				near_final_round = (round >= defer_drain_round);
+
+				/* urgent-force prepared earlier (soft-budget enforcement) */
+				if (search_urgent_force(dl, vaddr)) {
+					force_dump_now = true;
+					del_urgent_force(dl, vaddr);
+					deferred_resolved = true;
+				}
+
+				if (force_dump_now) {
+					if (is_deferred) {
+						del_deferred_list(dl, vaddr);
+						deferred_resolved = true;
+					}
+					if (telemetry_decisions_enabled())
+						log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "FORCE_DUMP", "budget_enforce", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+				} else if (!dirty_now && is_deferred) {
+					if (near_final_round) {
+						/* Do not carry deferred pages into final dump */
+						force_dump_now = true;
+						del_deferred_list(dl, vaddr);
+						deferred_resolved = true;
+						if (telemetry_decisions_enabled())
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "defer_drain_final_round", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+					} else if (force_dump_now) {
+						/* urgent-force overrides cooldown: dump now */
+						del_deferred_list(dl, vaddr);
+						deferred_resolved = true;
+						if (telemetry_decisions_enabled())
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "budget_enforce", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+					} else {
+						int protected_until = -1;
+						if (dl && dl->deferred_protected_until) {
+							gpointer pr = NULL;
+							pthread_mutex_lock(&dl->deferred_list_mutex);
+							pr = g_hash_table_lookup(dl->deferred_protected_until, GSIZE_TO_POINTER(vaddr));
+							if (pr)
+								protected_until = GPOINTER_TO_INT(pr);
+							pthread_mutex_unlock(&dl->deferred_list_mutex);
+						}
+						if ((deferred_count < MIN_DEFER_COUNT_FOR_ENFORCE) || (protected_until >= 0 && dl->current_round >= 0 && dl->current_round <= protected_until)) {
+							/* Respect cooldown/min-count protections: keep deferred */
+							should_defer = true;
+							if (telemetry_decisions_enabled())
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "cooled_and_deferred_cooldown", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						} else {
+							/* cooled_and_deferred -> force and send now */
+							force_dump_now = true;
+							del_deferred_list(dl, vaddr);
+							deferred_resolved = true;
+							if (telemetry_decisions_enabled())
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "cooled_and_deferred", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						}
+					}
+				} else if (round == 1 && !skip_model_loaded()) {
+					int allow_defer_local;
+					bool first_round_dirty;
+					deferred_count = get_deferred_count(dl, vaddr);
+					allow_defer_local = allow_defer;
+					if (round >= defer_stop_round)
+						allow_defer_local = 0;
+					first_round_dirty = (dhm && dirty_now);
+					if (allow_defer_local && first_round_dirty) {
+						should_defer = true;
+						add_deferred_list(dl, vaddr, round);
+						if (telemetry_decisions_enabled()) {
+							int dc = get_deferred_count(dl, vaddr);
+							const char *reason = "first_round_defer_dirtymap";
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", reason, dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						}
+					} else {
+						if (telemetry_decisions_enabled()) {
+							const char *reason = allow_defer_local ? "first_round_skip_cold" : "defer_cap_reached";
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						}
+					}
+				} else if (round == 1 && skip_model_loaded()) {
+					int allow_defer_local;
+					bool first_round_dirty;
+					deferred_count = get_deferred_count(dl, vaddr);
+					allow_defer_local = allow_defer;
+					if (round >= defer_stop_round)
+						allow_defer_local = 0;
+					first_round_dirty = (dhm && dirty_now);
+					if (allow_defer_local && first_round_dirty) {
+						should_defer = true;
+						add_deferred_list(dl, vaddr, round);
+						if (telemetry_decisions_enabled()) {
+							int dc = get_deferred_count(dl, vaddr);
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "first_round_defer_model_dirtymap", dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						}
+					} else {
+						if (telemetry_decisions_enabled()) {
+							const char *reason = allow_defer_local ? "first_round_skip_cold" : "defer_cap_reached";
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						}
+					}
+				} else if (dirty_now) {
+					if (mdc->pre_dump) {
+						float score = 0.0f;
+						float p_next;
+						float p_model = -1.0f;
+						float p_thr;
+						int max_defer_local;
+						int allow_defer_local;
+						const char *block_reason;
+
+						deferred_count = get_deferred_count(dl, vaddr);
+						p_next = compute_p_next_dirty(dl, dhm, vaddr, softdirty, round, !parent_has_page, deferred_count, is_warm, &score, &p_model);
+						page_class = classify_page(dl, dhm, round);
+						p_thr = decision_p_threshold(dl, page_class);
+
+						max_defer_local = get_max_defer_rounds_for_class(dl, page_class);
+						allow_defer_local = allow_defer;
+						if (round >= defer_stop_round)
+							allow_defer_local = 0;
+						if (!(round == 1 && !skip_model_loaded())) {
+							if (deferred_count >= max_defer_local)
+								allow_defer_local = 0;
+						}
+						block_reason = allow_defer ? "defer_limit_reached" : "defer_cap_reached";
+
+						if (round == 1 && skip_model_loaded()) {
+							/* round1/model handled earlier in the unconditional defer branch */
+							const char *reason = "first_round_model_handled";
+							if (telemetry_decisions_enabled())
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, p_next, p_model, score, p_thr);
+						} else {
+							if (ENABLE_HOT_DEFER && p_next >= p_thr && allow_defer_local) {
+								should_defer = true;
+								add_deferred_list(dl, vaddr, round);
+								if (telemetry_decisions_enabled()) {
+									int dc = get_deferred_count(dl, vaddr);
+									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "prob_defer_hot", dhm, dc, is_warm, p_next, p_model, score, p_thr);
+								}
+							} else {
+								const char *reason = (p_next >= p_thr && !allow_defer_local) ? block_reason : "prob_dump";
+								if (telemetry_decisions_enabled())
+									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, p_next, p_model, score, p_thr);
+							}
+						}
+					}
+				} else if (is_deferred) {
+                    /* Keep deferred until cooled/expired/final dump */
+                    if (telemetry_decisions_enabled()) {
+                        int dc = get_deferred_count(dl, vaddr);
+                        log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "deferred_keep", dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+                    }
+                }
+            } else if (!mdc->pre_dump && is_deferred) {
+                /* final dump: force-dump any deferred pages to ensure correctness */
+                force_dump_now = true;
+                del_deferred_list(dl, vaddr);
+                deferred_resolved = true;
+                if (telemetry_decisions_enabled())
+                    log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "FORCE_DUMP", "final_dump", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+            }
+            if (!should_defer) {
+                if (mdc->use_dirty_map && dl) {
+                    /* dirty-map 为权威来源：缺失条目视为未写 */
+                    effectively_dirty = force_dump_now ? true : dirty_now;
+
+                    /* 统计 soft-dirty 与 dirty-map 的差异，仅作诊断 */
+                    if (!dhm && softdirty)
+                        cnt_anomaly_dhm_null_softdirty++;
+                    if (softdirty && !effectively_dirty)
+                        cnt_softdirty_only++;
+                    else if (!softdirty && effectively_dirty)
+                        cnt_heat_only++;
+                    else if (softdirty && effectively_dirty)
+                        cnt_both_dirty++;
+                } else {
+                    /* dirty-map 不可用时退化为 soft-dirty */
+                    effectively_dirty = softdirty;
+                }
+            }
+
+			if (should_defer) {
+                hf = PP_HOLE_DEFERRED;
+                ret = page_pipe_add_hole(pp, vaddr, hf);
+				// pr_info("[Phase0-INFO] vaddr=%#lx -> PP_HOLE_DEFERRED (pre_dump=%d)\n", vaddr, mdc->pre_dump);
+                st = 0;
+                cnt_hole_skip++;
+            } else if (can_use_parent && !effectively_dirty) {
+                /* [Obsidian0215] Add parent hole for unchanged pages */
+                hf = PP_HOLE_PARENT;
+                ret = page_pipe_add_hole(pp, vaddr, hf);
+				// pr_info("[Phase0-INFO] vaddr=%#lx -> PP_HOLE_PARENT (pre_dump=%d, can_use_parent=%d, effectively_dirty=%d)\n",
+				// 		 vaddr, mdc->pre_dump, can_use_parent, effectively_dirty);
+                st = 0;
+                cnt_hole_parent++;
+            } else {
+                if (has_parent && !parent_has_page) {
+                    cnt_parent_missing++;
+					// pr_info("[Phase0-DEBUG] vaddr=%#lx parent_missing in final dump\n", vaddr);
+                }
+
+				// pr_info("[Phase0-DEBUG] vaddr=%#lx calling page_pipe_add_page (has_parent=%d, parent_has_page=%d, effectively_dirty=%d)\n",
+				// 		 vaddr, has_parent, parent_has_page, effectively_dirty);
+				if (dl && is_deferred) {
+					del_deferred_list(dl, vaddr);
+				}
+                ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				// pr_info("[Phase0-DEBUG] vaddr=%#lx page_pipe_add_page returned %d\n", vaddr, ret);
+                if (ret == 0) {
+                    if (telemetry_decisions_enabled())
+                        log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", deferred_resolved ? "forced" : "normal", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+                    if (dl) {
+                        /* If this address was previously deferred, mark it as sent (only count once) */
+                        pthread_mutex_lock(&dl->deferred_list_mutex);
+                        if (dl->deferred_ever) {
+                            gpointer everv = g_hash_table_lookup(dl->deferred_ever, GSIZE_TO_POINTER(vaddr));
+                            if (everv) {
+                                int flags = GPOINTER_TO_INT(everv);
+                                if (!(flags & 1)) {
+                                    flags |= 1;
+                                    g_hash_table_insert(dl->deferred_ever, GSIZE_TO_POINTER(vaddr), GINT_TO_POINTER(flags));
+                                    dl->deferred_sent_after_defer++;
+                                }
+                            }
+                        }
+                        pthread_mutex_unlock(&dl->deferred_list_mutex);
+
+                        /* 页面已被传输，从 warm_list 中移除（避免长期保留/重复计数） */
+                        sub_warm_list(dl, vaddr, true);
+                    }
+                    st = (ppb_flags & PPB_LAZY) ? 1 : 2;
+                    if (st == 1)
+                        cnt_page_lazy++;
+                    else
+                        cnt_page_present++;
+                } else {
+                    /* [Obsidian0215] Preserve -EAGAIN for chunk mode processing */
+                    pr_debug("[Obsidian0215]DECISION vaddr=%#lx -> PAGE failed (ret=%d)\n", vaddr, ret);
+                }
+            }
+        }
+
+        if (ret) {
+            pr_debug("Pagemap full (ret=%d)\n", ret);
+            break;
+        }
+
+        pages[st]++;
+    }
+
+    *pvaddr = vaddr;
+
+	/* [ObsidianStats] Per-VMA stats for post-analysis */
+	if (mdc->pre_dump && mdc->use_dirty_map) {
+
+		/* [Phase0Stats] Dynamic threshold info */
+		if (item->dl) {
+			if (round == 1 && item->dl->stats_collected) {
+				// pr_info("[Phase0Stats] Global heat: max=%.2f mean=%.2f p75=%.2f p90=%.2f\n",
+				// 		item->dl->global_max_heat, item->dl->global_mean_heat,
+				// 		item->dl->global_p75_heat, item->dl->global_p90_heat);
 			}
 		}
 
-		if (ret) {
-			/* Do not do pfn++, just bail out */
-			pr_debug("Pagemap full\n");
-			break;
+		if (round > 1) {
+			// pr_info("[Phase0Stats] Dirty detection (R%d): sd_only=%lu dw_only=%lu both=%lu\n",
+			// 		round, cnt_softdirty_only, cnt_heat_only, cnt_both_dirty);
+			if (cnt_anomaly_dhm_null_softdirty > 0) {
+				// pr_info("[Phase0Stats] ANOMALY (R%d): dhm=NULL+softdirty=1: %lu pages\n",
+				// 		round, cnt_anomaly_dhm_null_softdirty);
+			}
 		}
-
-		pages[st]++;
+		// pr_info("[Phase0Timing] generate_iovs END for Round %d, vma [%lx-%lx]\n",
+		// 		round, vma->e->start, vma->e->end);
 	}
 
-	*pvaddr = vaddr;
-	cnt_add(CNT_PAGES_SCANNED, nr_scanned);
-	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
-	cnt_add(CNT_PAGES_LAZY, pages[1]);
-	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+    cnt_add(CNT_PAGES_SCANNED, nr_scanned);
+    cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
+    cnt_add(CNT_PAGES_LAZY, pages[1]);
+    cnt_add(CNT_PAGES_WRITTEN, pages[2]);
 
-	pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
-	return ret;
+    pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
+    return ret;
 }
 
-// [Obsidian0215] 使用dirty_map的generate_vma_iovs
 static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
-			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode,
+                 struct page_read *parent_pr)
 {
 	u64 vaddr;
 	int ret;
+	struct mem_dump_ctl mdc;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
@@ -699,13 +1277,18 @@ static int generate_vma_iovs_with_dirty_map(struct pstree_item *item, struct vma
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 
+mdc.pre_dump = pre_dump;
+mdc.use_dirty_map = true;
+
 again:
-	// [Obsidian0215]若dump时没有父镜像，则无法使用dirty-map，退化为标准pre-copy
-	// 该情况会发生在：1. 上次pre-dump到dump之前才创建的进程；2. 共享内存(pre-dump不会转储)
-	if (!has_parent && !pre_dump)
-		ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
-	else
-		ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, pre_dump);
+    if (parent_pr) {
+        parent_pr->reset(parent_pr);
+    }
+	/* [Obsidian] Always use dirty-map path when enabled. If parent is missing,
+	 * the dirty-map logic will still dump pages (can_use_parent=false), avoiding
+	 * reliance on soft-dirty in final dump.
+	 */
+	ret = generate_iovs_with_dirty_map(item, vma, pp, pmc, &vaddr, has_parent, &mdc, xfer, parent_pr);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -735,6 +1318,9 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	int possible_pid_reuse = 0;
 	bool has_parent;
 	int parent_predump_mode = -1;
+	/* [Obsidian0215] Local parent reader for decision logic */
+	struct page_read local_parent;
+	struct page_read *parent_pr = NULL;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -798,17 +1384,42 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
+	/* [Obsidian0215] Open the parent reader once for the entire task. */
+	if (mdc->use_dirty_map && has_parent) {
+		int pfd;
+		if (open_parent(get_service_fd(IMG_FD_OFF), &pfd) == 0 && pfd >= 0) {
+			if (open_page_read_at(pfd, vpid(item), &local_parent, PR_TASK) > 0) {
+				parent_pr = &local_parent;
+			}
+			close(pfd);
+		}
+	}
+
+	/* Run deferred soft-budget enforcement once at the start of pre-dump so
+	 * urgent-force markers are available before we scan any VMAs. This avoids
+	 * late selections which would otherwise only be applied in the next
+	 * pre-dump and produce alternating spikes in transfer pages.
+	 */
+	if (mdc->pre_dump && item->dl) {
+		int curr_round = 1;
+		if (parent_pr)
+			curr_round = get_parent_chain_len(parent_pr) + 1;
+		item->dl->current_round = curr_round;
+		pr_info("[ObsidianEnforce] pid=%d: running pre-dump deferred soft-budget enforcement\n", item->pid->real);
+		enforce_deferred_soft_budget(item->dl);
+	}
+
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		if (mdc->use_dirty_map)	{
 			ret = generate_vma_iovs_with_dirty_map(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-						parent_predump_mode);
+						parent_predump_mode, parent_pr);
 			if (ret < 0)
-				goto out_xfer;
+				goto out_xfer_parent;
 		} else {
 			ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
 						parent_predump_mode);
 			if (ret < 0)
-				goto out_xfer;
+				goto out_xfer_parent;
 		}
 	}
 
@@ -829,7 +1440,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (!ret && !mdc->pre_dump)
 		ret = xfer_pages(pp, &xfer);
 	if (ret)
-		goto out_xfer;
+		goto out_xfer_parent;
 
 	timing_stop(TIME_MEMDUMP);
 
@@ -839,13 +1450,16 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	ret = task_reset_dirty_track(item, mdc);
 	if (ret)
-		goto out_xfer;
+		goto out_xfer_parent;
 	exit_code = 0;
 
 	//[Obsidian0215]destroy pid's dirty-log for non-predump
 	if (mdc->use_dirty_map && !mdc->pre_dump)
 		fini_dirty_map(item);
 
+out_xfer_parent:
+	if (parent_pr)
+		parent_pr->close(parent_pr);
 out_xfer:
 	if (!mdc->pre_dump)
 		xfer.close(&xfer);
@@ -1434,64 +2048,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			if (vma_inherited(vma)) {
 				clear_bit(off, vma->pvma->page_bitmap);
 
-				/* Bulk read + compare/copy when configured */
-				if (opts.restore_bulk_pages > 0) {
-					unsigned int max_nr = min_t(unsigned int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
-					unsigned int chunk = min_t(unsigned int, opts.restore_bulk_pages, max_nr);
-					int k;
-
-					/* allocate temp buffer for bulk read */
-					{
-						void *tmp = xmalloc(chunk * PAGE_SIZE);
-						if (!tmp)
-							goto err_read;
-
-						ret = pr->read_pages(pr, va, chunk, tmp, 0);
-						if (ret < 0) {
-							xfree(tmp);
-							goto err_read;
-						}
-
-						va += chunk * PAGE_SIZE;
-						nr_compared += chunk;
-
-						/* mark the bitmap for all pages read */
-						for (k = 0; k < (int)chunk; k++)
-							set_bit(off + k, vma->page_bitmap);
-
-						/* if all pages equal, count as shared */
-						timing_start(TIME_COMPARE_PAGES);
-						if (memcmp(p, tmp, chunk * PAGE_SIZE) == 0) {
-							timing_stop(TIME_COMPARE_PAGES);
-							nr_shared += chunk;
-						} else {
-							timing_stop(TIME_COMPARE_PAGES);
-							/* Otherwise compare page-by-page and copy differing pages */
-							for (k = 0; k < (int)chunk; k++) {
-								timing_start(TIME_COMPARE_PAGES);
-								if (memcmp((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE) != 0) {
-									timing_stop(TIME_COMPARE_PAGES);
-									timing_start(TIME_COPY_PAGES);
-									memcpy((char *)p + k * PAGE_SIZE, (char *)tmp + k * PAGE_SIZE, PAGE_SIZE);
-									timing_stop(TIME_COPY_PAGES);
-									nr_restored++;
-								} else {
-									timing_stop(TIME_COMPARE_PAGES);
-									nr_shared++;
-								}
-							}
-						}
-
-						xfree(tmp);
-
-						/* advance indices */
-						i += chunk - 1;
-						off += chunk;
-						continue;
-					}
-				}
-
-				/* Fall back to single-page path */
 				ret = pr->read_pages(pr, va, 1, buf, 0);
 				if (ret < 0)
 					goto err_read;
@@ -1557,7 +2113,6 @@ err_read:
 			if (i >= size)
 				break;
 
-			/* fallback to single page madvise */
 			ret = madvise(addr + PAGE_SIZE * i, PAGE_SIZE, MADV_DONTNEED);
 			if (ret < 0) {
 				pr_perror("madvise failed");

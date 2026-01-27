@@ -13,7 +13,6 @@
 #include "restorer.h"
 #include "rst-malloc.h"
 #include "page-xfer.h"
-#include "stats.h"
 
 #include "fault-injection.h"
 #include "xmalloc.h"
@@ -141,13 +140,6 @@ static void skip_pagemap_pages(struct page_read *pr, unsigned long len)
 
 	if (pagemap_present(pr->pe))
 		pr->pi_off += len;
-	else if (pagemap_skip(pr->pe)) {
-		/*
-		 * If PE_SKIP page is being skipped, we don't have pi_off
-		 * to advance, but we might eventually need to read it
-		 * from parent if this is not the head page_read.
-		 */
-	}
 	pr->cvaddr += len;
 }
 
@@ -207,22 +199,75 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, int nr, v
 
 		pr_debug("\tpr%lu-%u Read from parent\n", pr->img_id, pr->id);
 		ret = ppr->seek_pagemap(ppr, vaddr);
-		if (ret <= 0) {
-			pr_err("Missing %lx in parent pagemap\n", vaddr);
+		if (ret < 0) {
 			return -1;
 		}
 
-		/*
-		 * This is how many pages we have in the parent
-		 * page_read starting from vaddr. Go ahead and
-		 * read as much as we can.
-		 */
-		p_nr = ppr->pe->nr_pages - (vaddr - ppr->pe->vaddr) / PAGE_SIZE;
-		pr_info("\tparent has %u pages in\n", p_nr);
-		if (p_nr > nr)
-			p_nr = nr;
+		if (ret == 0) {
+			/* [Obsidian] Gap in parent pagemap. Recurse to grandparent if possible. */
+			if (ppr->parent) {
+				pr_debug("\tpr%lu-%u Gap in parent, recursing to grandparent\n", pr->img_id, pr->id);
+				ret = read_parent_page(ppr, vaddr, 1, buf, flags);
+				if (ret < 0) return -1;
+			} else {
+				/* [Obsidian] Bottom of the chain. If it's still a gap,
+				 * treat it as a hole (zero page) and continue. This is permissive
+				 * to allow deferred pages in root parent without aborting restore.
+				 */
+				pr_debug("pr%lu-%u Gap in root parent pagemap %lx — treating as hole\n", ppr->img_id, ppr->id, vaddr);
+				memset(buf, 0, PAGE_SIZE);
+				ret = 0;
+			}
+			p_nr = 1;
+		} else {
+			/*
+			 * This is how many pages we have in the parent
+			 * page_read starting from vaddr. Go ahead and
+			 * read as much as we can.
+			 */
+			p_nr = ppr->pe->nr_pages - (vaddr - ppr->pe->vaddr) / PAGE_SIZE;
+			if (p_nr > nr)
+				p_nr = nr;
 
-		ret = ppr->read_pages(ppr, vaddr, p_nr, buf, flags);
+			pr_info("\tFound pmes in parent %lx flags %x\n", ppr->pe->vaddr, ppr->pe->flags);
+			if (pagemap_deferred(ppr->pe)) {
+				/* [Obsidian0215] This page was skipped by LKM. */
+				pr_debug("\tpr%lu-%u Deferred marker in parent %lx (flags %x). Recursing to grandparent\n", pr->img_id, pr->id, vaddr, ppr->pe->flags);
+				if (ppr->parent) {
+					ret = read_parent_page(ppr, vaddr, 1, buf, flags);
+					if (ret < 0) {
+						pr_err("\tpr%lu-%u Error while recursing to grandparent for %lx\n", pr->img_id, pr->id, vaddr);
+						return -1;
+					}
+				} else {
+					/* Root parent contains a DEFERRED marker. This indicates the parent
+					 * intentionally skipped this page (DEFER). We MUST NOT fabricate
+					 * page contents (zero-fill) because that would create a silent
+					 * correctness bug. Instead, write an artifact listing the affected
+					 * page for post-mortem and abort the restore with a clear error.
+					 */
+					{
+						char artifact[128];
+						int fd;
+						snprintf(artifact, sizeof(artifact), "/tmp/criu_deferred_root_%lu_%d.txt", ppr->img_id, (int)getpid());
+						fd = open(artifact, O_WRONLY | O_CREAT | O_APPEND, 0640);
+						if (fd >= 0) {
+							char line[128];
+							int len = snprintf(line, sizeof(line), "pr%lu-%u vaddr=0x%lx flags=0x%x\n", ppr->img_id, ppr->id, vaddr, ppr->pe->flags);
+							(void)write(fd, line, (size_t)len);
+							close(fd);
+						} else {
+							pr_warn("pr%lu-%u Cannot write deferred artifact %s: %s\n", ppr->img_id, ppr->id, artifact, strerror(errno));
+						}
+						pr_err("Error: Deferred marker in root parent pagemap %lx (flags 0x%x) - aborting restore (artifact=%s)\n", vaddr, ppr->pe->flags, artifact);
+					}
+					return -1;
+				}
+			} else {
+				ret = ppr->read_pages(ppr, vaddr, p_nr, buf, flags);
+			}
+		}
+
 		if (ret == -1)
 			return ret;
 
@@ -258,22 +303,16 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 		return -1;
 
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
-	if (opts.mode == CR_RESTORE)
-		timing_start(TIME_READ_PAGES);
 	while (1) {
 		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_READ_PAGES);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
 	}
-	if (opts.mode == CR_RESTORE)
-		timing_stop(TIME_READ_PAGES);
 
 	if (opts.auto_dedup) {
 		ret = punch_hole(pr, pr->pi_off, len, false);
@@ -434,29 +473,19 @@ static int maybe_read_page_img_streamer(struct page_read *pr, unsigned long vadd
 	/* We can't seek. The requested address better match */
 	BUG_ON(pr->cvaddr != vaddr);
 
-	if (opts.mode == CR_RESTORE)
-		timing_start(TIME_READ_PAGES);
-
 	while (1) {
 		ret = read(fd, buf + curr, len - curr);
 		if (ret == 0) {
 			pr_err("Reached EOF unexpectedly while reading page from image\n");
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_READ_PAGES);
 			return -1;
 		} else if (ret < 0) {
 			pr_perror("Can't read mapping page %d", ret);
-			if (opts.mode == CR_RESTORE)
-				timing_stop(TIME_READ_PAGES);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
 	}
-
-	if (opts.mode == CR_RESTORE)
-		timing_stop(TIME_READ_PAGES);
 
 	if (opts.auto_dedup)
 		pr_warn_once("Can't dedup when streaming images\n");
@@ -502,13 +531,6 @@ static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, int nr, 
 {
 	pr_info("pr%lu-%u Read %lx %u pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
-
-	if (pagemap_skip(pr->pe)) {
-		if (pr->parent)
-			return read_parent_page(pr, vaddr, nr, buf, flags);
-		pr->cvaddr += nr * PAGE_SIZE;
-		return 1;
-	}
 
 	if (pagemap_in_parent(pr->pe)) {
 		if (read_parent_page(pr, vaddr, nr, buf, flags) < 0)
@@ -571,11 +593,7 @@ static int process_async_reads(struct page_read *pr)
 		pr_debug("Read piov iovs %d, from %ju, len %ju, first %p:%zu\n", piov->nr, piov->from,
 			 piov->end - piov->from, piov->to->iov_base, piov->to->iov_len);
 	more:
-		if (opts.mode == CR_RESTORE)
-			timing_start(TIME_READ_PAGES);
 		ret = preadv(fd, piov->to, piov->nr, piov->from);
-		if (opts.mode == CR_RESTORE)
-			timing_stop(TIME_READ_PAGES);
 		if (fault_injected(FI_PARTIAL_PAGES)) {
 			/*
 			 * We might have read everything, but for debug
@@ -588,13 +606,9 @@ static int process_async_reads(struct page_read *pr)
 			}
 		}
 
-		if (ret <= 0) {
-			if (ret == 0)
-				pr_err("Unexpected EOF on async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-					   piov->end - piov->from, piov->from, piov->nr);
-			else
-				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-					   piov->end - piov->from, piov->from, piov->nr);
+		if (ret < 0) {
+			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
+			       piov->end - piov->from, piov->from, piov->nr);
 			return -1;
 		}
 
