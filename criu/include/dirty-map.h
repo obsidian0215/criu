@@ -31,33 +31,11 @@
 #define MIN_ADJUSTMENT_STEP 0.1f         // 最小调整步长
 #define HISTORY_BUFFER_SIZE 10            // 历史数据缓冲区大小
 
-// 优化1：反馈控制参数
-#define TARGET_WARM_RATIO 0.05f          // 目标温页比例 (5%)
-#define KP_DEFAULT 0.1f                  // PID控制器比例系数
-#define KI_DEFAULT 0.01f                 // PID控制器积分系数
-#define KD_DEFAULT 0.05f                 // PID控制器微分系数
-
-// Warm promotion & throttle tuning
-/* NOTE: `WARM_PROMOTE_REQUIRED_ROUNDS` and the env override `CRIU_ENABLE_WARM_PROMOTE` have been removed
- * from the runtime test grid and environment overrides to simplify the search space. Promotion still
- * occurs using an internal fixed observation window (3 rounds) and is driven by the heat/trend/history
- * logic in `dirty-map.c` (not tunable via env).
- */
-/* delta_writes removed; use heat-only logic */
-#define WARM_HEAT_THRESHOLD 1.0f         // Max heat (writes/sec) allowed for promotion (normalized)
-#define WARM_MAX_RATIO 0.05f             // If warm_size > diffmap_size * WARM_MAX_RATIO, apply throttling
-#define WARM_THROTTLE_BATCH_RATIO 0.25f  // Fraction of warm entries to remove when throttling (min 1)
-
-/* Warm score tuning and promotion thresholds */
-#define WARM_SCORE_ALPHA 0.20f           // EMA alpha for warm_score update (0..1)
-#define WARM_PROMOTE_THRESHOLD 1.00f     // warm_score threshold to consider immediate promotion
-#define WARM_DEMOTE_THRESHOLD 0.00f      // warm_score demotion threshold (if score falls below this, candidate is weak)
-
 
 // Phase2优化：细粒度页面分类（4级分类）
 typedef enum {
-    PAGE_FREEZING = 0,   // 冰冷页：heat==0 或长期未访问
-    PAGE_COLD = 1,       // 冷页：热度为0（真正冷页）
+    PAGE_COLD = 0,       // 冷页：heat == 0（真正冷页）
+    PAGE_FREEZING = 1,   // 冷却页：低热且强降温（relative trend <= -0.6）
     PAGE_WARM = 2,       // 温页：低热但稳定（谨慎延迟）
     PAGE_HOT = 3         // 热页：高热（合并原 BURNING 行为）
 } page_class_t;
@@ -79,16 +57,12 @@ struct pid_check {
     bool is_tracked;
 };
 
-// 纪录被选择传输的页地址和次数
-typedef struct __attribute__((__packed__)) warm_page
-{
-    unsigned long address;
-    char s_count;  // 被选择转储的次数
-} warm_page_t;
-
 #define ENABLE_HOT_DEFER 1
 #define MIN_DEFER_COOLDOWN_ROUNDS 2
 #define MIN_DEFER_COUNT_FOR_ENFORCE 2
+/* Deferred eviction countdown (cooling pages are gradually evicted from defer list) */
+#define DEFER_EVICT_TTL_BASE 2
+#define DEFER_EVICT_TTL_MAX 5
 typedef struct __attribute__((__packed__)) deferred_page
 {
     unsigned long address;
@@ -105,18 +79,13 @@ typedef struct {
     // 趋势统计 (基于 heat)
     float mean_heat;                        // heat均值
     float variance_heat;                    // heat方差
+    float dirty_freq;                       // dirty频次（heat>0的占比）
     bool is_stable;                         // 是否稳定（方差小）
     bool is_declining;                      // 是否持续下降（heat持续下降）
 
     /* EMA of decision score (for smoothing). Updated by decision logic. */
     float score_ema;                        // 指数移动平均的 score（初始为0）
 
-    /* warm_score: EMA of 'cooled' evidence. Positive values indicate evidence page is cooling
-     * and thus a candidate for promotion to warm_list. Updated each round using:
-     *   warm_score = (1 - alpha) * warm_score + alpha * evidence
-     * with `alpha` controlled by `WARM_SCORE_ALPHA` (default 0.2).
-     */
-    float warm_score;
 } page_history_t;
 
 // 脏页heatmap信息 (delta_writes removed; use heat only)
@@ -137,29 +106,6 @@ typedef struct __attribute__((__packed__)) dirty_map
 typedef struct {
     u64 track_duration_ns;
 } dirtymap_header_t;
-
-// Phase 1优化：历史统计信息结构
-typedef struct {
-    float hit_rates[HISTORY_BUFFER_SIZE];           // 历史命中率
-    float threshold_history[HISTORY_BUFFER_SIZE];   // 历史阈值
-    float adjustment_factors[HISTORY_BUFFER_SIZE];  // 历史调整因子
-    int history_idx;                                 // 历史数据索引
-    float ema_hit_rate;                             // 指数移动平均命中率
-    float learning_rate;                            // 学习率
-    float momentum_factor;                          // 动量因子
-    int update_count;                               // 更新次数
-} historical_stats_t;
-
-// Phase 1优化：反馈控制结构
-typedef struct {
-    float target_warm_ratio;                        // 目标温页比例
-    float adjustment_step;                          // 当前调整步长
-    float integral_error;                           // 积分误差
-    float prev_error;                               // 上一轮误差
-    float kp, ki, kd;                               // PID控制器参数
-    unsigned int new_warm_count;                    // 新温页数量
-    unsigned int total_warm_count;                  // 总温页数量
-} feedback_controller_t;
 
 struct dirty_log {
     pid_t pid;
@@ -183,25 +129,18 @@ struct dirty_log {
         dirtymap_header_t *lldm_header;
     };
 
-    // list for addresses of warm pages in pre-dump
-    pthread_mutex_t warm_list_mutex;  // 互斥锁保护warm_list及相关字段
-    // warm_page_t *warm_list;
-    GTree *warm_list;
-    unsigned long warm_size;
-    unsigned long warm_pruned;
-    unsigned long warm_decayed;
-
-    /* Multi-round warm candidate cache: addresses seen cooling in previous rounds */
-    pthread_mutex_t warm_cand_mutex;
-    GHashTable *warm_candidates_prev; /* keys: GSIZE_TO_POINTER(addr) */
-    GHashTable *warm_candidates_prev2; /* previous-previous round candidates (for 3-round promotion) */
-
     // 延迟转储页集合（pre-dump 中跳过的热页）
     pthread_mutex_t deferred_list_mutex;
     GHashTable *deferred_list;       // 页地址集合 (key: vaddr)
     GHashTable *deferred_protected_until; // Key: vaddr, Value: protected-until round (inclusive)
     int current_round;               // 当前 pre-dump 轮次（用于冷却保护）
     unsigned long deferred_size;
+
+    /* Deferred eviction countdown per page (key: vaddr, value: ttl) */
+    GHashTable *deferred_evict_ttl;
+
+    /* Previous-round dirty set: addresses dirty in last dirtymap (for accuracy accounting) */
+    GHashTable *prev_dirty_set;
 
     /* 分级延迟队列：为每个页面分类维护 FIFO 队列，用于基于类的分批出队 */
     GQueue *deferred_queues[NUM_PAGE_CLASSES];
@@ -235,6 +174,20 @@ struct dirty_log {
     unsigned long predicted_hit;
     unsigned long predicted_miss;
 
+    /* 扩展准确率：上一轮未defer页在本轮的正确性 */
+    unsigned long predicted_total_nondefer;
+    unsigned long predicted_hit_nondefer;
+    unsigned long predicted_miss_nondefer;
+
+    /* 组合准确率（defer + nondefer） */
+    unsigned long predicted_total_all;
+    unsigned long predicted_hit_all;
+    unsigned long predicted_miss_all;
+
+    /* Per-process first pre-dump aggressiveness tracking */
+    bool first_predump_done;
+    int first_predump_round;
+
     // thresholds for warm page selection
     float heat_threshold;
     float trend_threshold;
@@ -256,9 +209,7 @@ struct dirty_log {
     // Phase4优化：历史趋势数据存储（地址 → page_history_t*）
     GHashTable *page_history_map;  // 页地址 → 历史数据映射
 
-    // 优化1：历史统计和学习
-    historical_stats_t *historical_stats;           // 历史统计信息
-    feedback_controller_t *feedback_ctrl;           // 反馈控制
+    /* warm_list 已移除：不再维护 warm 统计/反馈控制结构 */
 };
 
 #define INIT_DIRTY_LOG(log) do { \
@@ -274,27 +225,32 @@ struct dirty_log {
     (log).lldm_size = 0; \
     (log).diffmap = NULL; \
     (log).diffmap_size = 0; \
-    (log).warm_list = NULL; \
-    (log).warm_size = 0; \
-    (log).warm_pruned = 0; \
-    (log).warm_decayed = 0; \
-    (log).warm_candidates_prev = NULL; \
-    (log).warm_candidates_prev2 = NULL; \
     (log).ldm_header = NULL; \
     (log).lldm_header = NULL; \
-    (log).historical_stats = NULL; \
-    (log).feedback_ctrl = NULL; \
     (log).deferred_heat_sum = 0.0f; \
     (log).urgent_force = NULL; \
     (log).deferred_ever = NULL; \
+    (log).deferred_evict_ttl = NULL; \
+    (log).prev_dirty_set = NULL; \
     (log).deferred_unique_total = 0; \
     (log).deferred_sent_after_defer = 0; \
+    (log).predicted_total = 0; \
+    (log).predicted_hit = 0; \
+    (log).predicted_miss = 0; \
+    (log).predicted_total_nondefer = 0; \
+    (log).predicted_hit_nondefer = 0; \
+    (log).predicted_miss_nondefer = 0; \
+    (log).predicted_total_all = 0; \
+    (log).predicted_hit_all = 0; \
+    (log).predicted_miss_all = 0; \
+    (log).first_predump_done = false; \
+    (log).first_predump_round = -1; \
     (log).adaptive_p_base = 0.60f; \
     (log).adaptive_soft_ratio = 0.05f; \
-    (log).adaptive_max_defer[0] = 0; \
-    (log).adaptive_max_defer[1] = 1; \
-    (log).adaptive_max_defer[2] = 2; \
-    (log).adaptive_max_defer[3] = 10; \
+    (log).adaptive_max_defer[PAGE_COLD] = 1; \
+    (log).adaptive_max_defer[PAGE_FREEZING] = 0; \
+    (log).adaptive_max_defer[PAGE_WARM] = 2; \
+    (log).adaptive_max_defer[PAGE_HOT] = 10; \
 } while (0)
 
 #define INIT_DIRTY_LOG_PTR(log_ptr) do { \
@@ -310,12 +266,10 @@ struct dirty_log {
     (log_ptr)->lldm_size = 0; \
     (log_ptr)->diffmap = NULL; \
     (log_ptr)->diffmap_size = 0; \
-    (log_ptr)->warm_list = NULL; \
-    (log_ptr)->warm_size = 0; \
-    (log_ptr)->warm_pruned = 0; \
-    (log_ptr)->warm_decayed = 0; \
     (log_ptr)->deferred_list = NULL; \
     (log_ptr)->deferred_size = 0; \
+    (log_ptr)->deferred_evict_ttl = NULL; \
+    (log_ptr)->prev_dirty_set = NULL; \
     (log_ptr)->deferred_queues[0] = NULL; \
     (log_ptr)->deferred_queues[1] = NULL; \
     (log_ptr)->deferred_queues[2] = NULL; \
@@ -323,6 +277,12 @@ struct dirty_log {
     (log_ptr)->predicted_total = 0; \
     (log_ptr)->predicted_hit = 0; \
     (log_ptr)->predicted_miss = 0; \
+    (log_ptr)->predicted_total_nondefer = 0; \
+    (log_ptr)->predicted_hit_nondefer = 0; \
+    (log_ptr)->predicted_miss_nondefer = 0; \
+    (log_ptr)->predicted_total_all = 0; \
+    (log_ptr)->predicted_hit_all = 0; \
+    (log_ptr)->predicted_miss_all = 0; \
     (log_ptr)->ldm_header = NULL; \
     (log_ptr)->lldm_header = NULL; \
     (log_ptr)->threshold_low = 0.0f; \
@@ -335,8 +295,6 @@ struct dirty_log {
     (log_ptr)->global_p90_heat = 0.0f; \
     (log_ptr)->stats_collected = false; \
     (log_ptr)->page_history_map = NULL; \
-    (log_ptr)->historical_stats = NULL; \
-    (log_ptr)->feedback_ctrl = NULL; \
     (log_ptr)->deferred_heat_sum = 0.0f; \
     (log_ptr)->urgent_force = NULL; \
     (log_ptr)->deferred_protected_until = NULL; \
@@ -344,12 +302,14 @@ struct dirty_log {
     (log_ptr)->deferred_ever = NULL; \
     (log_ptr)->deferred_unique_total = 0; \
     (log_ptr)->deferred_sent_after_defer = 0; \
+    (log_ptr)->first_predump_done = false; \
+    (log_ptr)->first_predump_round = -1; \
     (log_ptr)->adaptive_p_base = 0.60f; \
     (log_ptr)->adaptive_soft_ratio = 0.05f; \
-    (log_ptr)->adaptive_max_defer[0] = 0; \
-    (log_ptr)->adaptive_max_defer[1] = 1; \
-    (log_ptr)->adaptive_max_defer[2] = 2; \
-    (log_ptr)->adaptive_max_defer[3] = 10; \
+    (log_ptr)->adaptive_max_defer[PAGE_COLD] = 1; \
+    (log_ptr)->adaptive_max_defer[PAGE_FREEZING] = 0; \
+    (log_ptr)->adaptive_max_defer[PAGE_WARM] = 2; \
+    (log_ptr)->adaptive_max_defer[PAGE_HOT] = 10; \
 } while (0)
 
 int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir);
@@ -359,9 +319,6 @@ int start_dirty_track(struct dirty_log* dl);
 int check_dirty_track(struct dirty_log* dl, struct pid_check *pc);
 int stop_dirty_track(struct dirty_log* dl);
 struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr);
-int search_warm_list(struct dirty_log *dl, unsigned long addr);
-void inc_warm_list(struct dirty_log *dl, unsigned long addr);
-void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero);
 int search_deferred_list(struct dirty_log *dl, unsigned long addr);
 int get_deferred_count(struct dirty_log *dl, unsigned long addr);
 void add_deferred_list(struct dirty_log *dl, unsigned long addr, int round);
@@ -381,14 +338,14 @@ void update_page_history(struct dirty_log *dl, unsigned long vaddr, struct dirty
 page_history_t *get_page_history(struct dirty_log *dl, unsigned long vaddr);
 void compute_page_stability(page_history_t *hist);
 
-/* Runtime accessor for warm promotion threshold (reads CRIU_WARM_PROMOTE_THRESHOLD env override if present) */
-float warm_promote_threshold_runtime(void);
 bool should_skip_with_history(struct dirty_log *dl, unsigned long vaddr, struct dirty_diffmap *dhm, int round, page_class_t page_class);
 
 // Decision model API (moved into dirty-map.c)
 float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsigned long vaddr, bool softdirty, int round, bool parent_missing, int deferred_count, bool is_warm, float *out_score, float *out_p_model);
 float decision_p_threshold(struct dirty_log *dl, page_class_t page_class);
 bool skip_model_loaded(void);
+/* Per-process hotness factor (<1.0 for hotter processes, >1.0 for cooler) */
+float dirtymap_pid_hotness_factor(struct dirty_log *dl);
 
 // Soft-budget / urgent-force support (heat-driven partial recovery)
 void enforce_deferred_soft_budget(struct dirty_log *dl);

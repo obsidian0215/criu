@@ -29,28 +29,18 @@
 #include "protobuf.h"
 
 #define TIMESTAMP_LIST_PREFIX "timestamp_list"
-#define WARM_LIST_PREFIX "warm_list"
 #define DEFERRED_LIST_PREFIX "deferred_list"
 #define PREDICTION_METRICS_PREFIX "prediction_metrics"
 #define THRESHOLD_PREFIX "threshold"
 
 #define MAX_FILES 32
-#define EXPAND_WARM_BATCH 128
-
-// 遍历统计温页预测的准确性
-typedef struct {
-    struct dirty_log *dl;
-    unsigned int hit_warm;
-    unsigned int miss_warm;
-} traversal_data_t;
-
-// 用于收集需要从 warm_list 中删除的地址
-typedef struct {
-    struct dirty_log *dl;
-    GArray *rem; /* stores unsigned long addresses */
-} collect_ctx_t;
 
 static void rebuild_deferred_queues(struct dirty_log *dl);
+static void update_prev_dirty_set(struct dirty_log *dl);
+static void decision_model_init(void);
+static int decision_model_online_active(void);
+static void decision_model_online_snapshot(float *bias, float *scale, unsigned long *updates);
+static void decision_model_online_update(float score, float p, float y, page_class_t page_class);
 
 static inline int decision_telemetry_enabled(void) {
     static int enabled = -1;
@@ -85,35 +75,6 @@ void sort_dirty_map(struct dirty_map *dm, unsigned long size) {
 }
 
 
-// 比较函数，用于GTree排序
-gint compare_warm_page(gconstpointer a, gconstpointer b, gpointer user_data) {
-    unsigned long addr_a = *(const unsigned long *)a;
-    unsigned long addr_b = *(const unsigned long *)b;
-    if (addr_a < addr_b)
-        return -1;
-    else if (addr_a > addr_b)
-        return 1;
-    else
-        return 0;
-}
-
-// 回调函数，用于遍历 GTree 并写入文件
-static gboolean write_warm_page(gpointer key, gpointer value, gpointer user_data) {
-    FILE *f = (FILE *)user_data;
-    unsigned long *addr = (unsigned long *)key;
-    char *s_count = (char *)value;
-    warm_page_t wp;
-
-    wp.address = *addr;
-    wp.s_count = *s_count;
-
-    if (fwrite(&wp, sizeof(warm_page_t), 1, f) != 1) {
-        perror("[Obsidian0215] fwrite");
-        return TRUE;  // 停止遍历
-    }
-    return FALSE;  // 继续遍历
-}
-
 // 回调函数，用于遍历 deferred_list 并写入文件
 static void write_deferred_page(gpointer key, gpointer value, gpointer user_data) {
     FILE *f = (FILE *)user_data;
@@ -125,159 +86,6 @@ static void write_deferred_page(gpointer key, gpointer value, gpointer user_data
     if (fwrite(&dp, sizeof(dp), 1, f) != 1) {
         perror("[Obsidian0215] fwrite deferred");
     }
-}
-
-/**
- * @brief 从warm.pid文件中读取warm_list到GTree
- *
- * @param dirty_map_dir dirty_map目录的路径
- * @param pid 进程pid
- * @param dl 指向存储warm_list的dirty_log结构体
- * @return int 成功返回0，失败返回-1并设置errno。
- */
-static __attribute__((unused)) int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
-    char warm_list_filepath[PATH_MAX];
-    FILE *file = NULL;
-    warm_page_t wp;
-    unsigned long addr, *new_key;
-    char *existing_scount, *new_scount;
-    int ret;
-
-    if (!dl) {
-        fprintf(stderr, "[Obsidian0215] Invalid dl pointer\n");
-        errno = EINVAL;
-        return -1;
-    }
-
-    // 构造文件路径
-    ret = snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
-    if (ret < 0 || ret >= sizeof(warm_list_filepath)) {
-        fprintf(stderr, "[Obsidian0215] Error constructing warm list file path\n");
-        errno = EINVAL;
-        return -1;
-    }
-
-    // 打开文件，不存在时创建一个空文件
-    file = fopen(warm_list_filepath, "rb");
-    if (!file) {
-        if (errno == ENOENT) {
-            // 文件不存在，初始化空的GTree
-            return 0;
-        } else {
-            perror("[Obsidian0215] fopen");
-            return -1;
-        }
-    }
-
-    // 加锁
-    pthread_mutex_lock(&dl->warm_list_mutex);
-
-    // 读取文件中的warm_page_t记录并插入到GTree
-    while (fread(&wp, sizeof(warm_page_t), 1, file) == 1) {
-        addr = wp.address;
-        existing_scount = g_tree_lookup(dl->warm_list, &addr);
-        if (existing_scount) {
-            *existing_scount += wp.s_count;
-        } else {
-            new_key = malloc(sizeof(unsigned long));
-            if (!new_key) {
-                perror("[Obsidian0215] malloc");
-                fclose(file);
-                pthread_mutex_unlock(&dl->warm_list_mutex);
-                return -1;
-            }
-
-            *new_key = addr;
-            new_scount = malloc(sizeof(char));
-            if (!new_scount) {
-                perror("[Obsidian0215] malloc failed");
-                free(new_key);
-                fclose(file);
-                pthread_mutex_unlock(&dl->warm_list_mutex);
-                return -1;
-            }
-            *new_scount = wp.s_count;
-
-            g_tree_insert(dl->warm_list, new_key, new_scount);
-            dl->warm_size++;
-        }
-    }
-
-    if (ferror(file)) {
-        perror("[Obsidian0215] fread");
-        fclose(file);
-        pthread_mutex_unlock(&dl->warm_list_mutex);
-        return -1;
-    }
-
-    fclose(file);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    return 0;
-}
-
-/**
- * @brief 将warm_list保存到warm.pid文件中
- *
- * @param dirty_map_dir dirty_map目录的路径
- * @param pid 进程pid
- * @param dl 指向存储warm_list的dirty_log结构体
- * @return int 成功返回0，失败返回-1并设置errno。
- */
-static __attribute__((unused)) int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
-    char warm_list_filepath[PATH_MAX];
-    pid_t pid;
-    FILE *file = NULL;
-    int ret = 0;
-    // gboolean traverse_status;
-
-    if (!dl) {
-        fprintf(stderr, "[Obsidian0215] Invalid dl pointer\n");
-        errno = EINVAL;
-        return -1;
-    }
-
-    pid = dl->pid;
-    // 构造文件路径
-    ret = snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
-    if (ret < 0 || ret >= sizeof(warm_list_filepath)) {
-        fprintf(stderr, "[Obsidian0215] Error constructing warm list file path\n");
-        errno = EINVAL;
-        return -1;
-    }
-
-    // 打开文件用于写入（覆盖）
-    file = fopen(warm_list_filepath, "wb");
-    if (!file) {
-        perror("[Obsidian0215] fopen");
-        return -1;
-    }
-
-    // 加锁
-    pthread_mutex_lock(&dl->warm_list_mutex);
-
-    // 遍历GTree并写入文件
-    g_tree_foreach(dl->warm_list, write_warm_page, file);
-    // traverse_status = g_tree_foreach(dl->warm_list, write_warm_page, file);
-
-    // if (!traverse_status) {
-    //     fprintf(stderr, "[Obsidian0215] Error during g_tree_foreach\n");
-    //     fclose(file);
-    //     pthread_mutex_unlock(&dl->warm_list_mutex);
-    //     return -1;
-    // }
-
-    if (ferror(file)) {
-        perror("[Obsidian0215] fwrite");
-        fclose(file);
-        pthread_mutex_unlock(&dl->warm_list_mutex);
-        return -1;
-    }
-
-    fclose(file);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    return 0;
 }
 
 /**
@@ -417,128 +225,6 @@ static int write_deferred_list(struct dirty_log *dl, const char *dirty_map_dir) 
     pthread_mutex_unlock(&dl->deferred_list_mutex);
     return 0;
 }
-
-
-// /**
-//  * @brief 从warm.pid文件中读取warm_list
-//  *
-//  * @param dirty_map_dir dirty_map目录的路径
-//  * @param pid 进程pid
-//  * @param warm_list 指向存储warm_list的指针
-//  * @param warm_size 指针，存储warm_list的大小
-//  * @return int 成功返回0，失败返回-1并设置errno。
-//  */
-// static int load_warm_list(const char *dirty_map_dir, pid_t pid, struct dirty_log *dl) {
-//     char warm_list_filepath[PATH_MAX];
-//     void *mapped = NULL;
-//     unsigned long current_count, required_size;
-//     int fd;
-//     struct stat st;
-
-//     if (!dl) {
-//         pr_perror("[Obsidian0215]Invalid dl pointer");
-//         return -1;
-//     }
-
-//     snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, pid);
-//     warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-//     // 打开文件，不存在时创建一个文件
-//     fd = open(warm_list_filepath, O_RDWR | O_CREAT, 0666);
-//     if (fd == -1) {
-//         pr_perror("[Obsidian0215]open %s", warm_list_filepath);
-//         return -1;
-//     }
-
-//     // 获取文件大小
-//     if (fstat(fd, &st) == -1) {
-//         pr_perror("[Obsidian0215]fstat");
-//         close(fd);
-//         return -1;
-//     }
-
-//     // 如果文件大小不是整数倍的sizeof(unsigned long)，修正
-//     if (st.st_size % sizeof(unsigned long) != 0) {
-//         pr_perror("[Obsidian0215]Invalid warm_list file size");
-//         close(fd);
-//         return -1;
-//     }
-
-//     current_count = st.st_size / sizeof(warm_page_t);
-//     dl->warm_size = current_count;
-
-//     // 需要映射的总大小为(current_count+EXPAND_WARM_BATCH)个unsigned long
-//     // 增加32是用于减小warm_list的扩展次数
-//     required_size = (current_count + EXPAND_WARM_BATCH) * sizeof(warm_page_t);
-
-//     // 映射文件到内存
-//     mapped = mmap(NULL, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//     if (mapped == MAP_FAILED) {
-//         perror("mmap");
-//         close(fd);
-//         return -1;
-//     }
-//     close(fd);
-
-//     dl->warm_list = (warm_page_t *)mapped;
-//     dl->warm_max = current_count + EXPAND_WARM_BATCH;
-
-//     return 0;
-// }
-
-// /**
-//  * @brief 将warm_list更新到对应的文件中
-//  *
-//  * @param dl 进程dirty-log实例的指针
-//  * @return int 成功返回0，失败返回-1并设置errno
-//  */
-// static int write_warm_list(struct dirty_log *dl, const char *dirty_map_dir) {
-//     char warm_list_filepath[PATH_MAX];
-//     unsigned long warm_size;
-//     int fd;
-//     struct stat st;
-
-//     if (!dl) {
-//         pr_perror("[Obsidian0215]Invalid dl pointer");
-//         return -1;
-//     }
-//     snprintf(warm_list_filepath, sizeof(warm_list_filepath), "%s/%s.%d", dirty_map_dir, WARM_LIST_PREFIX, dl->pid);
-//     warm_list_filepath[sizeof(warm_list_filepath) - 1] = '\0';
-//     // 打开文件
-//     fd = open(warm_list_filepath, O_RDWR, 0666);
-//     if (fd == -1) {
-//         pr_perror("[Obsidian0215]open %s", warm_list_filepath);
-//         return -1;
-//     }
-//     // 获取文件大小
-//     if (fstat(fd, &st) == -1) {
-//         pr_perror("[Obsidian0215]fstat");
-//         close(fd);
-//         return -1;
-//     }
-//     warm_size = dl->warm_size * sizeof(unsigned long);
-//     // 若当前文件大小不足以容纳warm_list，则扩展文件
-//     if (st.st_size < warm_size) {
-//         if (ftruncate(fd, warm_size) == -1) {
-//             pr_perror("[Obsidian0215]ftruncate");
-//             close(fd);
-//             return -1;
-//         }
-//     }
-
-//     // 同步更改到文件
-//     if (msync(dl->warm_list, warm_size, MS_SYNC) == -1) {
-//         perror("[Obsidian0215]msync");
-//         return -1;
-//     }
-
-//     // 解除映射
-//     if (munmap(dl->warm_list, dl->warm_max * sizeof(unsigned long)) == -1) {
-//         pr_perror("[Obsidian0215]Error unmapping warm_list");
-//         return -1;
-//     }
-//     return 0;
-// }
-
 /**
  * @brief 从timestamp_list.pid文件中读取timestamp_list
  *
@@ -876,27 +562,112 @@ struct dirty_diffmap* merge_dirty_maps(struct dirty_log *dl) {
 static void update_prediction_from_deferred(struct dirty_log *dl) {
     GHashTableIter iter;
     gpointer key, value;
+    int do_online = 0;
+    int round = 0;
+    page_class_t page_class = PAGE_COLD;
+    float online_bias_before = 0.0f;
+    float online_scale_before = 0.0f;
+    float online_bias_after = 0.0f;
+    float online_scale_after = 0.0f;
+    unsigned long updates_before = 0;
+    unsigned long updates_after = 0;
 
     if (!dl || !dl->deferred_list)
         return;
 
+    do_online = decision_model_online_active();
+    if (dl->current_round > 0)
+        round = dl->current_round;
+    if (round < 0)
+        round = 0;
+    if (do_online)
+        decision_model_online_snapshot(&online_bias_before, &online_scale_before, &updates_before);
+
     dl->predicted_total = 0;
     dl->predicted_hit = 0;  /* success: deferred -> cooled */
     dl->predicted_miss = 0; /* miss   : deferred -> still dirty */
+    dl->predicted_total_nondefer = 0;
+    dl->predicted_hit_nondefer = 0;
+    dl->predicted_miss_nondefer = 0;
+    dl->predicted_total_all = 0;
+    dl->predicted_hit_all = 0;
+    dl->predicted_miss_all = 0;
 
     pthread_mutex_lock(&dl->deferred_list_mutex);
     g_hash_table_iter_init(&iter, dl->deferred_list);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         unsigned long addr = GPOINTER_TO_SIZE(key);
         struct dirty_diffmap *dhm = search_dirty_map(dl, addr);
+        int deferred_count = value ? GPOINTER_TO_INT(value) : 0;
+        float score = 0.0f;
+        float p_model = -1.0f;
+        float p_next = 0.0f;
+        float p_use = 0.0f;
+        float y = 0.0f;
+        float cool_thresh = dl->min_heat;
         dl->predicted_total++;
-        /* Consider page 'cooled' (success) when no DHM entry or heat <= min_heat */
-        if (!dhm || dhm->heat <= dl->min_heat)
+        /* Consider page 'cooled' (success) when no DHM entry or heat <= cool_thresh.
+         * Be slightly lenient in early rounds to avoid penalizing first-round-only
+         * decisions that rely on a single dirtymap snapshot.
+         */
+        if (dl->threshold_low > 0.0f)
+            cool_thresh = fmaxf(cool_thresh, dl->threshold_low * 0.5f);
+        if (round <= 1)
+            cool_thresh *= 1.5f;
+        if (!dhm || dhm->heat <= cool_thresh || (dhm->heat_trend < 0.0f && dhm->heat <= dl->threshold_mid))
             dl->predicted_hit++;
         else
             dl->predicted_miss++;
+
+        if (do_online) {
+            /* Online calibration target: y=1 if cooled, y=0 if still dirty */
+            y = (!dhm || dhm->heat <= dl->min_heat) ? 1.0f : 0.0f;
+            p_next = compute_p_next_dirty(dl, dhm, addr, false, round, false, deferred_count, false, &score, &p_model);
+            p_use = (p_model >= 0.0f) ? p_model : p_next;
+            page_class = classify_page(dl, dhm, round);
+            decision_model_online_update(score, p_use, y, page_class);
+        }
     }
     pthread_mutex_unlock(&dl->deferred_list_mutex);
+
+    /* Evaluate non-deferred pages that were dirty in previous round (prev_dirty_set)
+     * If they are still dirty now, count as miss; otherwise count as hit.
+     * This extends accuracy beyond deferred-only evaluation.
+     */
+    if (dl->prev_dirty_set && g_hash_table_size(dl->prev_dirty_set) > 0) {
+        GHashTableIter pit;
+        gpointer pkey, pval;
+        pthread_mutex_lock(&dl->deferred_list_mutex);
+        g_hash_table_iter_init(&pit, dl->prev_dirty_set);
+        while (g_hash_table_iter_next(&pit, &pkey, &pval)) {
+            unsigned long addr = GPOINTER_TO_SIZE(pkey);
+            struct dirty_diffmap *dhm_prev = NULL;
+            int was_deferred = g_hash_table_lookup(dl->deferred_list, pkey) ? 1 : 0;
+            if (was_deferred)
+                continue; /* deferred pages evaluated above */
+            dl->predicted_total_nondefer++;
+            dhm_prev = search_dirty_map(dl, addr);
+            if (!dhm_prev || dhm_prev->heat <= dl->min_heat)
+                dl->predicted_hit_nondefer++;
+            else
+                dl->predicted_miss_nondefer++;
+        }
+        pthread_mutex_unlock(&dl->deferred_list_mutex);
+    }
+
+    dl->predicted_total_all = dl->predicted_total + dl->predicted_total_nondefer;
+    dl->predicted_hit_all = dl->predicted_hit + dl->predicted_hit_nondefer;
+    dl->predicted_miss_all = dl->predicted_miss + dl->predicted_miss_nondefer;
+
+    if (do_online) {
+        decision_model_online_snapshot(&online_bias_after, &online_scale_after, &updates_after);
+        if (updates_after > updates_before && decision_telemetry_enabled()) {
+            pr_info("[ObsidianOnline] updates=%lu bias=%.4f (d=%.4f) scale=%.4f (d=%.4f)\n",
+                updates_after,
+                online_bias_after, online_bias_after - online_bias_before,
+                online_scale_after, online_scale_after - online_scale_before);
+        }
+    }
 }
 
 /**
@@ -940,26 +711,6 @@ static void update_prediction_from_deferred(struct dirty_log *dl) {
 //             diffmap[i].address, diffmap[i].heat, diffmap[i].heat_trend);
 // 	}
 // }
-
-/**
- * @brief 回调函数，用于打印每个 warm_page_t 节点
- *
- * @param key 指向 warm_page_t 的指针
- * @param value 此处为 NULL（根据您的 GTree 初始化方式）
- * @param user_data 额外用户数据，此处未使用
- * @return gboolean 返回 TRUE 以继续遍历，返回 FALSE 以停止遍历
- */
-gboolean print_warm_page(gpointer key, gpointer value, gpointer user_data) {
-    unsigned long *addr = (unsigned long *)key;
-    char *s_count = (char *)value;
-    if (addr) {
-        pr_info("Address: 0x%lx, s_count: %d\n", *addr, *s_count);
-    } else {
-        pr_perror("Invalid warm_page_t pointer.\n");
-        return TRUE;
-    }
-    return FALSE; // 继续遍历
-}
 
 /**
  * @brief 从thresholds.pid加载dirty_log的温页判断阈值
@@ -1044,689 +795,107 @@ static void load_thresholds(struct dirty_log *dl, const char *dirty_map_dir) {
     close(fd);
 }
 
-// 优化1：初始化历史统计信息
-static int init_historical_stats(struct dirty_log *dl) {
-    if (!dl)
-        return -1;
-
-    if (!dl->historical_stats) {
-        dl->historical_stats = (historical_stats_t *)xzalloc(sizeof(historical_stats_t));
-        if (!dl->historical_stats) {
-            pr_perror("[Obsidian0215] Failed to allocate historical_stats");
-            return -1;
-        }
-    }
-
-    // 初始化历史统计信息
-    memset(dl->historical_stats->hit_rates, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
-    memset(dl->historical_stats->threshold_history, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
-    memset(dl->historical_stats->adjustment_factors, 0, sizeof(float) * HISTORY_BUFFER_SIZE);
-
-    dl->historical_stats->history_idx = 0;
-    dl->historical_stats->ema_hit_rate = 0.0f;
-    dl->historical_stats->learning_rate = 0.1f;
-    dl->historical_stats->momentum_factor = 0.8f;
-    dl->historical_stats->update_count = 0;
-
-    return 0;
-}
-
-// 优化1：初始化反馈控制器
-static int init_feedback_controller(struct dirty_log *dl) {
-    if (!dl)
-        return -1;
-
-    if (!dl->feedback_ctrl) {
-        dl->feedback_ctrl = (feedback_controller_t *)xzalloc(sizeof(feedback_controller_t));
-        if (!dl->feedback_ctrl) {
-            pr_perror("[Obsidian0215] Failed to allocate feedback_ctrl");
-            return -1;
-        }
-    }
-
-    // 初始化反馈控制器参数
-    dl->feedback_ctrl->target_warm_ratio = TARGET_WARM_RATIO;
-    dl->feedback_ctrl->adjustment_step = 0.5f; // 初始调整步长
-    dl->feedback_ctrl->integral_error = 0.0f;
-    dl->feedback_ctrl->prev_error = 0.0f;
-    dl->feedback_ctrl->kp = KP_DEFAULT;
-    dl->feedback_ctrl->ki = KI_DEFAULT;
-    dl->feedback_ctrl->kd = KD_DEFAULT;
-    dl->feedback_ctrl->new_warm_count = 0;
-    dl->feedback_ctrl->total_warm_count = 0;
-
-    return 0;
-}
-
-// 优化1：计算指数移动平均命中率
-static float calculate_ema_hit_rate(historical_stats_t *stats, float current_hit_rate) {
-    if (!stats)
-        return current_hit_rate;
-
-    // 指数移动平均计算
-    stats->ema_hit_rate = DM_EMA_ALPHA * current_hit_rate + (1.0f - DM_EMA_ALPHA) * stats->ema_hit_rate;
-    return stats->ema_hit_rate;
-}
-
-// 优化1：计算波动性（用于动态调整步长）
-static float calculate_volatility(historical_stats_t *stats) {
-    float sum = 0.0f, mean = 0.0f, variance = 0.0f;
-    int count = 0, i;
-
-    if (!stats || stats->update_count < 2)
-        return 0.0f;
-
-    // 计算最近10次调整因子的平均值和方差
-    for (i = 0; i < HISTORY_BUFFER_SIZE; i++) {
-        if (stats->adjustment_factors[i] != 0.0f) {
-            sum += stats->adjustment_factors[i];
-            count++;
-        }
-    }
-
-    if (count < 2)
-        return 0.0f;
-    mean = sum / count;
-
-    // 计算方差
-    for (i = 0; i < HISTORY_BUFFER_SIZE; i++) {
-        if (stats->adjustment_factors[i] != 0.0f) {
-            float diff = stats->adjustment_factors[i] - mean;
-            variance += diff * diff;
-        }
-    }
-
-    variance /= count;
-    return sqrtf(variance); // 返回标准差作为波动性度量
-}
-
-// 优化1：计算动态调整步长
-static float calculate_dynamic_step(historical_stats_t *stats, feedback_controller_t *fb) {
-    float volatility, adaptive_step;
-
-    if (!stats || !fb)
-        return 0.0f;
-
-    volatility = calculate_volatility(stats);
-    adaptive_step = fb->adjustment_step * (1.0f + volatility);
-
-    // 限制调整步长在合理范围内
-    if (adaptive_step > MAX_ADJUSTMENT_STEP)
-        adaptive_step = MAX_ADJUSTMENT_STEP;
-    else if (adaptive_step < MIN_ADJUSTMENT_STEP)
-        adaptive_step = MIN_ADJUSTMENT_STEP;
-
-    return adaptive_step;
-}
-
-// 优化1：更新历史统计信息
-static void update_historical_stats(historical_stats_t *stats, float hit_rate,
-                                   float threshold, float adjustment_factor) {
-    int idx;
-    if (!stats)
-        return;
-
-    // 更新历史数据（循环缓冲区）
-    idx = stats->history_idx;
-
-    stats->hit_rates[idx] = hit_rate;
-    stats->threshold_history[idx] = threshold;
-    stats->adjustment_factors[idx] = adjustment_factor;
-
-    stats->history_idx = (idx + 1) % HISTORY_BUFFER_SIZE;
-    stats->update_count++;
-}
-
-// 遍历回调函数，用于统计hit_warm和miss_warm
-static gboolean count_warm_pages(gpointer key, gpointer value, gpointer user_data) {
-    traversal_data_t *data = (traversal_data_t *)user_data;
-    unsigned long addr = *(unsigned long *)key;
-    struct dirty_diffmap *dm = search_dirty_map(data->dl, addr);
-
-    if (!dm || dm->heat < data->dl->min_heat) {
-        data->hit_warm++;
-    } else {
-        data->miss_warm++;
-    }
-
-    return FALSE; // 继续遍历
-}
-
-/* Callback to collect warm entries that are considered 'hit' (cooled) */
-static gboolean collect_warm_hits(gpointer key, gpointer value, gpointer user_data) {
-    collect_ctx_t *ctx = (collect_ctx_t *)user_data;
-    unsigned long addr = *(unsigned long *)key;
-    struct dirty_diffmap *dm = search_dirty_map(ctx->dl, addr);
-
-    if (!dm || dm->heat < ctx->dl->min_heat) {
-        /* append address to rem array */
-        g_array_append_val(ctx->rem, addr);
-    }
-    return FALSE;
-}
-
-/* Collect every warm address (used for decay pass) */
-static gboolean collect_warm_all(gpointer key, gpointer value, gpointer user_data) {
-    collect_ctx_t *ctx = (collect_ctx_t *)user_data;
-    unsigned long addr = *(unsigned long *)key;
-    g_array_append_val(ctx->rem, addr);
-    return FALSE;
-}
-
-/* Collect s_count histogram (value is pointer to char containing s_count) */
-static gboolean collect_s_count_hist(gpointer key, gpointer value, gpointer user_data) {
-    unsigned int *hist = (unsigned int *)user_data;
-    unsigned char sc = *(unsigned char *)value;
-    if (sc < 8) hist[sc]++;
-    else hist[7]++;
-    return FALSE;
-}
-
-/* warm_score helpers */
-typedef struct { unsigned long addr; float score; } warm_score_entry_t;
-typedef struct { struct dirty_log *dl; GArray *arr; } warm_score_ctx_t;
-
-static gboolean collect_warm_scores(gpointer key, gpointer value, gpointer user_data) {
-    warm_score_ctx_t *ctx = (warm_score_ctx_t *)user_data;
-    unsigned long addr = *(unsigned long *)key;
-    page_history_t *hist = NULL;
-    warm_score_entry_t e;
-
-    if (ctx && ctx->dl && ctx->dl->page_history_map)
-        hist = g_hash_table_lookup(ctx->dl->page_history_map, GSIZE_TO_POINTER(addr));
-
-    e.addr = addr;
-    e.score = hist ? hist->warm_score : 0.0f;
-    g_array_append_val(ctx->arr, e);
-    return FALSE;
-}
-
-static int warm_score_compare(const void *a, const void *b) {
-    const warm_score_entry_t *A = (const warm_score_entry_t *)a;
-    const warm_score_entry_t *B = (const warm_score_entry_t *)b;
-    if (A->score < B->score) return -1;
-    if (A->score > B->score) return 1;
-    return 0;
-}
-
-/* Runtime-configurable heat threshold helper (can be overridden via env var CRIU_WARM_HEAT_THRESHOLD) */
-static inline float get_warm_heat_threshold(void) {
-    static int inited = 0;
-    static float val = 0.0f;
-    if (!inited) {
-        const char *env = getenv("CRIU_WARM_HEAT_THRESHOLD");
-        if (env) {
-            char *end = NULL;
-            double v = strtod(env, &end);
-            if (end != env && v > 0.0)
-                val = (float)v;
-            else
-                val = WARM_HEAT_THRESHOLD;
-        } else {
-            val = WARM_HEAT_THRESHOLD;
-        }
-        inited = 1;
-    }
-    return val;
-}
-
-static inline float get_warm_promote_threshold(void) {
-    static int inited = 0;
-    static float val = 0.0f;
-    if (!inited) {
-        const char *env = getenv("CRIU_WARM_PROMOTE_THRESHOLD");
-        if (env && env[0] != '\0') {
-            double v = strtod(env, NULL);
-            if (v > -1000.0) val = (float)v; else val = WARM_PROMOTE_THRESHOLD;
-        } else {
-            val = WARM_PROMOTE_THRESHOLD;
-        }
-        inited = 1;
-    }
-    return val;
-}
-
-/* Public runtime accessor (declared in include/dirty-map.h) */
-float warm_promote_threshold_runtime(void) {
-    return get_warm_promote_threshold();
-}
-
-/**
- * @brief （使用指数移动平均的）算法阈值更新算法
- *
- * @param dl 进程的dirty-log结构体指针
- */
 static void update_thresholds(struct dirty_log *dl) {
-    struct dirty_diffmap *dirtymap = dl->diffmap;
-    unsigned int hit_warm = 0, miss_warm = 0, new_warm = 0, i;
-    float min_heat_threshold = 0.0, min_in_dirtymap = 0.0;
-    float current_hit_rate = 0.0f, ema_hit_rate = 0.0f;
-    float adjustment_factor = 1.0f, dynamic_step = 0.5f;
-    float current_ratio, error, p_term, i_term, d_term, pid_output;
-    traversal_data_t data;
-    /* Auxiliary structures for pruning/decay passes */
-    GArray *to_remove = NULL;
-    GArray *to_decay = NULL;
-    collect_ctx_t cctx;
-    collect_ctx_t dctx;
-    unsigned int pruned = 0, promoted = 0, candidate_count = 0, skipped_promote_heat = 0, decayed_local = 0, promoted_by_score = 0, pruned_by_score = 0;
-    unsigned int sc_hist[8] = {0};
-    float hist_mean_heat = 0.0f;
-    page_history_t *hist = NULL; /* declared up-front for C90 compliance */
+    const float P_ALPHA = 0.05f; /* step for p_base adaptation */
+    const float S_ALPHA = 0.05f; /* step for soft_ratio adaptation */
+    const float P_MIN = 0.05f, P_MAX = 0.95f;
+    const float S_MIN = 0.01f, S_MAX = 0.5f;
+    const float P_TARGET = 0.80f; /* aim for 80% deferred success rate (cooled fraction) */
+    float pred_rate = P_TARGET; /* default: no-op when no predictions available */
+    float old_p;
+    float old_s;
+    float new_p;
+    float round_boost = 1.0f;
+    float hot_boost = 1.0f;
+    int round = 1;
 
-    /* raw write-count distribution (approximated from heat * duration) */
-    unsigned long delta_zero = 0, delta_one_two = 0, delta_three_four = 0, delta_gt4 = 0;
-    unsigned long diffmap_sum_delta = 0;
-
-    GHashTable *next_candidates = NULL;
-
-    // 检查warm_list和dirtymap是否存在
-    if (!dl->warm_list || !dirtymap) {
-        pr_info("[Obsidian0215] warm threshold for %d won't update\n", dl->pid);
+    if (!dl)
         return;
-    }
 
-    // 初始化min_in_dirtymap
-    if (dl->diffmap_size > 0) {
-        min_in_dirtymap = dirtymap[0].heat;
+    old_p = dl->adaptive_p_base;
+    old_s = dl->adaptive_soft_ratio;
+    if (dl->predicted_total > 0)
+        pred_rate = (float)dl->predicted_hit / (float)dl->predicted_total;
 
-        /* Compute writes distribution for diagnostics (derived from heat) */
-        for (i = 0; i < dl->diffmap_size; i++) {
-            float writes_est = 0.0f;
-            if (dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
-                float td = (float)dl->ldm_header->track_duration_ns / 1e9f;
-                writes_est = dirtymap[i].heat * td;
-            } else {
-                writes_est = dirtymap[i].heat;
-            }
-            diffmap_sum_delta += (unsigned long)(writes_est + 0.5f); // rounded estimate
-            if (writes_est < 0.5f) delta_zero++;
-            else if (writes_est <= 2.0f) delta_one_two++;
-            else if (writes_est <= 4.0f) delta_three_four++;
-            else delta_gt4++;
+    /* Update adaptive base probability (more aggressive defer when prediction is good) */
+    new_p = old_p + P_ALPHA * (pred_rate - P_TARGET);
+    if (new_p < P_MIN) new_p = P_MIN;
+    if (new_p > P_MAX) new_p = P_MAX;
+
+    round = (dl->current_round > 0) ? dl->current_round : 1;
+    if (round <= 1)
+        round_boost = 0.90f;
+    else if (round == 2)
+        round_boost = 0.95f;
+    else if (round == 3)
+        round_boost = 0.98f;
+    else
+        round_boost = 1.02f;
+
+    hot_boost = dirtymap_pid_hotness_factor(dl);
+    new_p = new_p * round_boost * hot_boost;
+    if (new_p < P_MIN) new_p = P_MIN;
+    if (new_p > P_MAX) new_p = P_MAX;
+    dl->adaptive_p_base = new_p;
+
+    if (dl->diffmap_size > 0 && dl->global_mean_heat > 0.0f) {
+        float observed_ratio = dl->deferred_heat_sum / (dl->global_mean_heat * (float)dl->diffmap_size + 1e-6f);
+        float new_s = old_s + S_ALPHA * (observed_ratio - old_s);
+        if (new_s < S_MIN) new_s = S_MIN;
+        if (new_s > S_MAX) new_s = S_MAX;
+
+        if (round <= 1)
+            round_boost = 1.20f;
+        else if (round == 2)
+            round_boost = 1.10f;
+        else if (round == 3)
+            round_boost = 1.05f;
+        else
+            round_boost = 1.0f;
+        hot_boost = 1.0f + (1.0f - dirtymap_pid_hotness_factor(dl)) * 0.50f;
+        new_s = new_s * round_boost * hot_boost;
+        if (new_s < S_MIN) new_s = S_MIN;
+        if (new_s > S_MAX) new_s = S_MAX;
+        dl->adaptive_soft_ratio = new_s;
+
+        if (fabsf(new_p - old_p) > 0.0005f || fabsf(new_s - old_s) > 0.0005f) {
+            pr_info("[ObsidianAdaptive] pid=%d adapt_p_base: %.3f->%.3f pred_rate=%.3f, adapt_soft_ratio: %.3f->%.3f observed_ratio=%.3f\n",
+                    dl->pid, old_p, new_p, pred_rate, old_s, new_s, observed_ratio);
         }
-        pr_info("[ObsidianWrtDist] size=%lu zero=%lu one_two=%lu three_four=%lu gt4=%lu avg_writes_est=%.2f\n",
-                dl->diffmap_size, delta_zero, delta_one_two, delta_three_four, delta_gt4,
-                dl->diffmap_size ? (double)diffmap_sum_delta / dl->diffmap_size : 0.0);
-
     } else {
-        // 如果dirtymap为空，无法更新阈值
-        pr_info("[Obsidian0215] dirtymap is empty for %d, thresholds not updated\n", dl->pid);
-        return;
-    }
-
-    // 初始化遍历数据
-    data = (traversal_data_t){ .dl = dl, .hit_warm = 0, .miss_warm = 0 };
-
-    // 加锁并遍历warm_list
-    pthread_mutex_lock(&dl->warm_list_mutex);
-    g_tree_foreach(dl->warm_list, count_warm_pages, &data);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    hit_warm = data.hit_warm;
-    miss_warm = data.miss_warm;
-
-    // 计算当前命中率
-    if (hit_warm + miss_warm > 0) {
-        current_hit_rate = (float)hit_warm / (hit_warm + miss_warm);
-    }
-
-    // Phase 1优化：使用指数移动平均计算平滑命中率
-    if (dl->historical_stats) {
-        ema_hit_rate = calculate_ema_hit_rate(dl->historical_stats, current_hit_rate);
-    } else {
-        // 初始化历史统计信息
-        if (init_historical_stats(dl) == 0) {
-            ema_hit_rate = calculate_ema_hit_rate(dl->historical_stats, current_hit_rate);
-        } else {
-            ema_hit_rate = current_hit_rate; // 降级到当前命中率
+        if (fabsf(new_p - old_p) > 0.0005f) {
+            pr_info("[ObsidianAdaptive] pid=%d adapt_p_base: %.3f->%.3f pred_rate=%.3f\n",
+                    dl->pid, old_p, new_p, pred_rate);
         }
     }
 
-    /* Prune warm_list entries that are 'hit' (cooled) to avoid long-term accumulation */
-    if (dl->warm_size > 0) {
-        to_remove = g_array_new(FALSE, FALSE, sizeof(unsigned long));
-        cctx.dl = dl; cctx.rem = to_remove;
-        pthread_mutex_lock(&dl->warm_list_mutex);
-        g_tree_foreach(dl->warm_list, collect_warm_hits, &cctx);
-        pthread_mutex_unlock(&dl->warm_list_mutex);
-        if (to_remove->len > 0) {
-            pruned = to_remove->len;
-            for (i = 0; i < to_remove->len; i++) {
-                unsigned long addr = g_array_index(to_remove, unsigned long, i);
-                sub_warm_list(dl, addr, true);
-            }
-            pr_debug("[ObsidianWarmPrune] pid %d pruned=%u\n", dl->pid, pruned);
-            /* Update per-run pruned counter */
-            pthread_mutex_lock(&dl->warm_list_mutex);
-            dl->warm_pruned += pruned;
-            pthread_mutex_unlock(&dl->warm_list_mutex);
-        }
-        g_array_free(to_remove, TRUE);
-
-        /* Decay remaining warm entries (decrement s_count by 1) to avoid perpetual growth */
-        to_decay = g_array_new(FALSE, FALSE, sizeof(unsigned long));
-        dctx.dl = dl; dctx.rem = to_decay;
-        pthread_mutex_lock(&dl->warm_list_mutex);
-        g_tree_foreach(dl->warm_list, collect_warm_all, &dctx);
-        pthread_mutex_unlock(&dl->warm_list_mutex);
-        if (to_decay->len > 0) {
-            decayed_local = to_decay->len;
-            for (i = 0; i < to_decay->len; i++) {
-                unsigned long addr = g_array_index(to_decay, unsigned long, i);
-                /* decrement s_count by 1; if reaches 0 it will be removed */
-                sub_warm_list(dl, addr, false);
-            }
-            pr_debug("[ObsidianWarmDecay] pid %d decayed=%u\n", dl->pid, decayed_local);
-            /* Update per-run decayed counter */
-            pthread_mutex_lock(&dl->warm_list_mutex);
-            dl->warm_decayed += decayed_local;
-            pthread_mutex_unlock(&dl->warm_list_mutex);
-        }
-        g_array_free(to_decay, TRUE);
-    }
-
-    // Phase 1优化：当EMA命中率不高于50%时更新阈值
-    if (ema_hit_rate <= 0.5f && miss_warm > 0) {
-        // 计算min_heat_threshold
-        if (dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
-            min_heat_threshold = 1.0f / ((float)dl->ldm_header->track_duration_ns / 1e9f);
-        } else {
-            min_heat_threshold = 0.0f;
-        }
-
-        // Phase 1优化：计算动态调整步长
-        if (dl->feedback_ctrl) {
-            dynamic_step = calculate_dynamic_step(dl->historical_stats, dl->feedback_ctrl);
-        }
-
-        // [Obsidian0215] Use EMA命中率进行调整
-        adjustment_factor = ema_hit_rate * 2.0f;
-        dl->heat_threshold = dl->heat_threshold * adjustment_factor;
-
-        // [Obsidian0215] Keep it within sane bounds
-        if (dl->heat_threshold > 50.0f) dl->heat_threshold = 50.0f;
-        if (dl->heat_threshold < 1.0f) dl->heat_threshold = 1.0f;
-
-        // Phase 1优化：使用动态步长调整trend_threshold
-        dl->trend_threshold = dl->trend_threshold + dynamic_step * (0.35f - dl->trend_threshold * 0.65f);
-
-        pr_debug("[Obsidian0215] PID %d: ema_hit_rate=%.3f, dynamic_step=%.3f, new_heat=%.3f, new_trend=%.3f\n",
-                dl->pid, ema_hit_rate, dynamic_step, dl->heat_threshold, dl->trend_threshold);
-    }
-
-    // 使用候选机制：本轮识别 potential warm candidates（低写量且降温），两轮连见才晋升为 warm_list
-    next_candidates = g_hash_table_new(g_direct_hash, g_direct_equal);
-    for (i = 0; i < dl->diffmap_size; i++) {
-        if (dirtymap[i].heat < min_in_dirtymap) {
-            min_in_dirtymap = dirtymap[i].heat;
-        }
-
-        /* consider promoting candidates seen cooling or with history indicating decline
-         * previously this required heat<=get_warm_heat_threshold; relax to accept historic decline
-         * so long-running declining pages can become warm candidates
-         */
-        hist = NULL;
-        if (dl->page_history_map)
-            hist = g_hash_table_lookup(dl->page_history_map, GSIZE_TO_POINTER(dirtymap[i].address));
-
-        if (!search_warm_list(dl, dirtymap[i].address) &&
-            ( (dirtymap[i].heat <= get_warm_heat_threshold())
-              || (dirtymap[i].heat <= dl->heat_threshold && -dirtymap[i].heat_trend > dl->trend_threshold * dirtymap[i].heat)
-              || (hist && hist->is_declining) )) {
-            g_hash_table_insert(next_candidates, GSIZE_TO_POINTER(dirtymap[i].address), GINT_TO_POINTER(1));
-        }
-    }
-
-    /* Promote candidates seen in the previous two rounds (conservative: require 3-round observation) */
-    if (g_hash_table_size(next_candidates) > 0) {
-        GHashTableIter it;
-        gpointer key, val;
-        pthread_mutex_lock(&dl->warm_cand_mutex);
-        g_hash_table_iter_init(&it, next_candidates);
-        while (g_hash_table_iter_next(&it, &key, &val)) {
-            /* Promotion presence check uses an internal fixed window (3 rounds). */
-            int req_rounds = 3; /* internal fixed promotion window (previously WARM_PROMOTE_REQUIRED_ROUNDS) */
-            bool prev_ok = false;
-            if (req_rounds <= 1) {
-                /* immediate promotion on current candidate */
-                prev_ok = true;
-            } else if (req_rounds == 2) {
-                prev_ok = (dl->warm_candidates_prev && g_hash_table_contains(dl->warm_candidates_prev, key));
-            } else {
-                prev_ok = (dl->warm_candidates_prev && dl->warm_candidates_prev2
-                    && g_hash_table_contains(dl->warm_candidates_prev, key)
-                    && g_hash_table_contains(dl->warm_candidates_prev2, key));
-            }
-
-            if (prev_ok) {
-                unsigned long addr = GPOINTER_TO_SIZE(key);
-                struct dirty_diffmap *dhm = search_dirty_map(dl, addr);
-                if (dhm) {
-                    hist = NULL;
-                    if (dl->page_history_map)
-                        hist = g_hash_table_lookup(dl->page_history_map, GSIZE_TO_POINTER(addr));
-
-                    /* Immediate promotion by warm_score if evidence strong */
-                    if (hist && hist->warm_score >= get_warm_promote_threshold()) {
-                        inc_warm_list(dl, addr);
-                        promoted++;
-                        promoted_by_score++;
-                        continue;
-                    }
-
-                    /* Compute historical mean heat if available */
-                    hist_mean_heat = 0.0f;
-                    if (hist && hist->history_count > 0) {
-                        for (i = 0; i < hist->history_count; i++)
-                            hist_mean_heat += hist->heat[i];
-                        hist_mean_heat /= (float)hist->history_count;
-                    }
-
-                    /* Promotion decision: accept when normalized heat small, sustained historical decline,
-                     * or when current heat is reasonably close to historical mean. This relaxes overly strict promotion.
-                     */
-                    if (dhm->heat <= get_warm_heat_threshold() ||
-                        (hist && hist->is_declining) ||
-                        (hist && dhm->heat <= hist_mean_heat * 1.5f)) {
-                        inc_warm_list(dl, addr);
-                        promoted++;
-                    } else {
-                        /* Track whether failure was due to heat-based check for diagnostics */
-                        skipped_promote_heat++;
-                    }
-                } else {
-                    skipped_promote_heat++;
-                }
-            }
-        }
-        pthread_mutex_unlock(&dl->warm_cand_mutex);
-    }
-
-    new_warm = g_hash_table_size(next_candidates);
-    candidate_count = new_warm;
-
-    /* Swap next_candidates into previous set for next round (shift prev->prev2, prev2 freed) */
-    pthread_mutex_lock(&dl->warm_cand_mutex);
-    if (dl->warm_candidates_prev2)
-        g_hash_table_destroy(dl->warm_candidates_prev2);
-    dl->warm_candidates_prev2 = dl->warm_candidates_prev;
-    dl->warm_candidates_prev = next_candidates;
-    pthread_mutex_unlock(&dl->warm_cand_mutex);
-
-    pr_debug("[ObsidianWarmPromote] PID %d candidates=%u promoted=%u skipped_promote_heat=%u pruned=%u decayed=%u warm_size=%lu sc0=%u sc1=%u sc2=%u sc3=%u\n",
-            dl->pid, new_warm, promoted, skipped_promote_heat, pruned, decayed_local, dl->warm_size,
-            sc_hist[0], sc_hist[1], sc_hist[2], sc_hist[3]);
-
-    /* collect s_count histogram for diagnostics */
-    pthread_mutex_lock(&dl->warm_list_mutex);
-    g_tree_foreach(dl->warm_list, collect_s_count_hist, sc_hist);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    /* Throttle warm_list if it grows too large relative to diffmap */
+    /* Per-class adaptive max-defer rounds (PID/round aware). */
     {
-        unsigned long warm_limit = (unsigned long)(dl->diffmap_size * WARM_MAX_RATIO);
-        if (warm_limit < 1) warm_limit = 1;
-        if (dl->warm_size > warm_limit) {
-            unsigned long need_remove = dl->warm_size - warm_limit;
-            /* Build array of (addr, warm_score) and remove lowest scoring entries first */
-            GArray *scores = g_array_new(FALSE, FALSE, sizeof(warm_score_entry_t));
-            warm_score_ctx_t wctx = { .dl = dl, .arr = scores };
-            pthread_mutex_lock(&dl->warm_list_mutex);
-            g_tree_foreach(dl->warm_list, collect_warm_scores, &wctx);
-            pthread_mutex_unlock(&dl->warm_list_mutex);
+        int bonus = 0;
+        int round_bonus = (round <= 2) ? 1 : 0;
+        int hot_bonus = (dirtymap_pid_hotness_factor(dl) < 0.90f) ? 1 : 0;
+        int hot_max, warm_max, cold_max;
 
-            if (scores->len > 0) {
-                warm_score_entry_t *arr = (warm_score_entry_t *)scores->data;
-                unsigned int removed = 0;
-                qsort(arr, scores->len, sizeof(warm_score_entry_t), warm_score_compare);
-                for (i = 0; i < (int)need_remove && i < (int)scores->len; i++) {
-                    unsigned long addr = arr[i].addr;
-                    sub_warm_list(dl, addr, true);
-                    pruned_by_score++;
-                    removed++;
-                }
-                if (removed > 0) {
-                    pthread_mutex_lock(&dl->warm_list_mutex);
-                    dl->warm_pruned += removed;
-                    pthread_mutex_unlock(&dl->warm_list_mutex);
-                    pr_info("[ObsidianWarmThrottle] PID %d warm_size=%lu limit=%lu pruned_by_score=%u\n", dl->pid, dl->warm_size, warm_limit, removed);
-                }
-            }
+        if (pred_rate > 0.85f)
+            bonus = 1;
+        else if (pred_rate < 0.50f)
+            bonus = -1;
 
-            g_array_free(scores, TRUE);
+        hot_max = 6 + bonus + round_bonus + hot_bonus;
+        warm_max = 3 + bonus + round_bonus + hot_bonus;
+        cold_max = 1 + ((pred_rate > 0.90f) ? 1 : 0);
 
-            /* Compute warm_score mean/max for telemetry */
-            {
-                float sum = 0.0f;
-                float max = -1e6f;
-                unsigned int cnt = 0;
-                float mean = 0.0f;
-                GArray *all = g_array_new(FALSE, FALSE, sizeof(unsigned long));
-                dctx.dl = dl; dctx.rem = all;
-                pthread_mutex_lock(&dl->warm_list_mutex);
-                g_tree_foreach(dl->warm_list, collect_warm_all, &dctx);
-                pthread_mutex_unlock(&dl->warm_list_mutex);
+        if (hot_max < 4) hot_max = 4;
+        if (hot_max > 12) hot_max = 12;
+        if (warm_max < 1) warm_max = 1;
+        if (warm_max > 6) warm_max = 6;
+        if (cold_max < 0) cold_max = 0;
+        if (cold_max > 2) cold_max = 2;
 
-                for (i = 0; i < (int)all->len; i++) {
-                    unsigned long addr;
-                    page_history_t *h;
-                    float s;
-
-                    addr = g_array_index(all, unsigned long, i);
-                    h = NULL;
-                    if (dl->page_history_map)
-                        h = g_hash_table_lookup(dl->page_history_map, GSIZE_TO_POINTER(addr));
-                    s = h ? h->warm_score : 0.0f;
-                    sum += s; if (s > max) max = s; cnt++;
-                }
-                mean = cnt ? (sum / (float)cnt) : 0.0f;
-                g_array_free(all, TRUE);
-
-                pr_info("[ObsidianWarmIter] candidates=%u promoted=%u promoted_by_score=%u skipped_promote_heat=%u pruned=%u pruned_by_score=%u decayed=%u warm_size=%lu warm_score_mean=%.3f warm_score_max=%.3f sc0=%u sc1=%u sc2=%u sc3=%u promote_thresh=%.3f\n",
-                        candidate_count, promoted, promoted_by_score, skipped_promote_heat, pruned, pruned_by_score, decayed_local, dl->warm_size,
-                        mean, max, sc_hist[0], sc_hist[1], sc_hist[2], sc_hist[3], get_warm_promote_threshold());
-                }
-            }
-        }
-
-    /* Adaptive parameter updates: adjust adaptive_p_base and adaptive_soft_ratio automatically */
-    {
-        const float P_ALPHA = 0.05f; /* step for p_base adaptation */
-        const float S_ALPHA = 0.05f; /* step for soft_ratio adaptation */
-        const float P_MIN = 0.05f, P_MAX = 0.95f;
-        const float S_MIN = 0.01f, S_MAX = 0.5f;
-        const float P_TARGET = 0.80f; /* aim for 80% deferred success rate (cooled fraction) */
-        float pred_rate = P_TARGET; /* default: no-op when no predictions available */
-        float old_p = dl->adaptive_p_base;
-        float old_s = dl->adaptive_soft_ratio;
-        float new_p; /* declared up-front to satisfy C90 */
-
-        if (dl->predicted_total > 0)
-            pred_rate = (float)dl->predicted_hit / (float)dl->predicted_total;
-
-        /* Update adaptive base probability (more aggressive defer when prediction is good) */
-        new_p = old_p + P_ALPHA * (pred_rate - P_TARGET);
-        if (new_p < P_MIN) new_p = P_MIN;
-        if (new_p > P_MAX) new_p = P_MAX;
-        dl->adaptive_p_base = new_p;
-
-        /* Update adaptive soft budget ratio to track observed deferred heat fraction */
-        if (dl->diffmap_size > 0 && dl->global_mean_heat > 0.0f) {
-            float observed_ratio = dl->deferred_heat_sum / (dl->global_mean_heat * (float)dl->diffmap_size + 1e-6f);
-            float new_s = old_s + S_ALPHA * (observed_ratio - old_s);
-            if (new_s < S_MIN) new_s = S_MIN;
-            if (new_s > S_MAX) new_s = S_MAX;
-            dl->adaptive_soft_ratio = new_s;
-
-            if (fabsf(new_p - old_p) > 0.0005f || fabsf(new_s - old_s) > 0.0005f) {
-                pr_info("[ObsidianAdaptive] pid=%d adapt_p_base: %.3f->%.3f pred_rate=%.3f, adapt_soft_ratio: %.3f->%.3f observed_ratio=%.3f\n",
-                        dl->pid, old_p, new_p, pred_rate, old_s, new_s, observed_ratio);
-            }
-        } else {
-            if (fabsf(new_p - old_p) > 0.0005f) {
-                pr_info("[ObsidianAdaptive] pid=%d adapt_p_base: %.3f->%.3f pred_rate=%.3f\n",
-                        dl->pid, old_p, new_p, pred_rate);
-            }
-        }
-    }
-
-    // Phase 1优化：改进的反馈控制逻辑
-    if (dl->feedback_ctrl) {
-        dl->feedback_ctrl->new_warm_count = new_warm;
-        dl->feedback_ctrl->total_warm_count = miss_warm;
-
-        // 计算误差（基于目标温页比例）
-        current_ratio = (float)new_warm / dl->diffmap_size;
-        error = dl->feedback_ctrl->target_warm_ratio - current_ratio;
-
-        // PID控制器调整
-        p_term = dl->feedback_ctrl->kp * error;
-        i_term = dl->feedback_ctrl->ki * dl->feedback_ctrl->integral_error;
-        d_term = dl->feedback_ctrl->kd * (error - dl->feedback_ctrl->prev_error);
-
-        pid_output = p_term + i_term + d_term;
-
-        // 新温页过少时，适当放宽选择阈值
-        if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
-            if (min_in_dirtymap > min_heat_threshold) {
-                dl->heat_threshold = fmaxf(dl->heat_threshold, min_in_dirtymap * (1.0f + pid_output));
-            } else {
-                dl->trend_threshold = fmaxf(0.1f, dl->trend_threshold * (0.85f - pid_output));
-            }
-        } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
-            // 新温页过多时，收紧阈值
-            dl->trend_threshold = fminf(2.0f, dl->trend_threshold * (1.15f + pid_output));
-            dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold * (1.0f - fabsf(pid_output)));
-        }
-
-        // 更新积分误差和上一轮误差
-        dl->feedback_ctrl->integral_error += error;
-        dl->feedback_ctrl->prev_error = error;
-
-        // 限制积分误差范围
-        if (dl->feedback_ctrl->integral_error > 1.0f)
-            dl->feedback_ctrl->integral_error = 1.0f;
-        else if (dl->feedback_ctrl->integral_error < -1.0f)
-            dl->feedback_ctrl->integral_error = -1.0f;
-    } else {
-        // 降级到原有逻辑（如果反馈控制器未初始化）
-        if (new_warm < 32 || new_warm < (unsigned int)(0.054f * miss_warm)) {
-            if (min_in_dirtymap > min_heat_threshold) {
-                dl->heat_threshold = 1.25 * min_in_dirtymap;
-            } else {
-                dl->trend_threshold = 0.85f * dl->trend_threshold;
-            }
-        } else if (new_warm >= 32 && new_warm > (unsigned int)(0.25f * miss_warm)) {
-            dl->trend_threshold = 1.15f * dl->trend_threshold;
-            dl->heat_threshold = fmaxf(min_in_dirtymap, dl->heat_threshold);
-        }
-    }
-
-    // Phase 1优化：更新历史统计信息
-    if (dl->historical_stats) {
-        update_historical_stats(dl->historical_stats, ema_hit_rate,
-                               dl->heat_threshold, adjustment_factor);
+        dl->adaptive_max_defer[PAGE_FREEZING] = 0;
+        dl->adaptive_max_defer[PAGE_COLD] = cold_max;
+        dl->adaptive_max_defer[PAGE_WARM] = warm_max;
+        dl->adaptive_max_defer[PAGE_HOT] = hot_max;
     }
 }
 
@@ -1867,8 +1036,6 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
         return -1;
     }
 
-    /* warm_list deprecated for queue-based deferred scheduling: do not load/maintain warm_list */
-
     /* Initialize per-class deferred FIFO queues */
     {
         int qi;
@@ -1888,11 +1055,15 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     if (new_dl) {
         pthread_mutex_init(&dl->deferred_list_mutex, NULL);
         dl->deferred_list = g_hash_table_new(g_direct_hash, g_direct_equal);
+        dl->deferred_evict_ttl = g_hash_table_new(g_direct_hash, g_direct_equal);
         ret = load_deferred_list(dirty_map_dir, pid, dl);
         if (ret < 0) {
             pr_perror("[Obsidian0215]Failed to load deferred_list for pid %d", pid);
             return -1;
         }
+    } else {
+        if (!dl->deferred_evict_ttl)
+            dl->deferred_evict_ttl = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
 
     // 读取timestamp_list.<pid>文件，初始化timestamp_list
@@ -2066,18 +1237,13 @@ int init_dirty_map(struct pstree_item *item, const char *dirty_map_dir){
     /* Compute prediction accuracy based on deferred list from previous round */
     update_prediction_from_deferred(dl);
 
+    /* Snapshot current dirty set for next-round accuracy evaluation */
+    update_prev_dirty_set(dl);
+
     // debug_show_diffmap(dl->diffmap, dl->diffmap_size, pid);
 
     // 加载上次的阈值并更新
     load_thresholds(dl, dirty_map_dir);
-
-    // 优化1：初始化历史统计和反馈控制
-    if (init_historical_stats(dl) != 0) {
-        pr_warn("[Obsidian0215] Failed to initialize historical stats for pid %d\n", pid);
-    }
-    if (init_feedback_controller(dl) != 0) {
-        pr_warn("[Obsidian0215] Failed to initialize feedback controller for pid %d\n", pid);
-    }
 
     update_thresholds(dl);
 
@@ -2224,22 +1390,6 @@ void fini_dirty_map(struct pstree_item *item){
             }
         }
 
-        /* If warm_list exists (deprecated), destroy safely */
-        if (dl->warm_list) {
-            g_tree_destroy(dl->warm_list);
-            dl->warm_list = NULL;
-            dl->warm_size = 0;
-        }
-
-        /* Destroy warm candidate caches if present (deprecated) */
-        if (dl->warm_candidates_prev) {
-            g_hash_table_destroy(dl->warm_candidates_prev);
-            dl->warm_candidates_prev = NULL;
-        }
-        if (dl->warm_candidates_prev2) {
-            g_hash_table_destroy(dl->warm_candidates_prev2);
-            dl->warm_candidates_prev2 = NULL;
-        }
         // 输出本轮 deferred_list 规模，便于脚本统计每轮预测覆盖范围
         pr_info("[ObsidianDef] deferred_total=%lu\n", dl->deferred_size);
 
@@ -2252,6 +1402,14 @@ void fini_dirty_map(struct pstree_item *item){
             pthread_mutex_destroy(&dl->deferred_list_mutex);
             dl->deferred_list = NULL;
             dl->deferred_size = 0;
+        }
+        if (dl->deferred_evict_ttl) {
+            g_hash_table_destroy(dl->deferred_evict_ttl);
+            dl->deferred_evict_ttl = NULL;
+        }
+        if (dl->prev_dirty_set) {
+            g_hash_table_destroy(dl->prev_dirty_set);
+            dl->prev_dirty_set = NULL;
         }
 
         /* Final deferred correctness summary: unique deferred addresses and how many were later sent */
@@ -2271,21 +1429,21 @@ void fini_dirty_map(struct pstree_item *item){
         } else {
             pr_info("[ObsidianPred] predicted_total=0 predicted_hit=0 predicted_miss=0 predicted_accuracy=0.00\n");
         }
+        if (dl->predicted_total_all > 0) {
+            float acc_nd = dl->predicted_total_nondefer > 0 ?
+                (float)dl->predicted_hit_nondefer * 100.0f / (float)dl->predicted_total_nondefer : 0.0f;
+            float acc_all = (float)dl->predicted_hit_all * 100.0f / (float)dl->predicted_total_all;
+            pr_info("[ObsidianPred2] nondefer_total=%lu nondefer_hit=%lu nondefer_miss=%lu nondefer_acc=%.2f all_total=%lu all_hit=%lu all_miss=%lu all_acc=%.2f\n",
+                    dl->predicted_total_nondefer, dl->predicted_hit_nondefer, dl->predicted_miss_nondefer, acc_nd,
+                    dl->predicted_total_all, dl->predicted_hit_all, dl->predicted_miss_all, acc_all);
+        } else {
+            pr_info("[ObsidianPred2] nondefer_total=0 nondefer_hit=0 nondefer_miss=0 nondefer_acc=0.00 all_total=0 all_hit=0 all_miss=0 all_acc=0.00\n");
+        }
 
         // 处理thresholds
         if (write_thresholds(dl, opts.dirty_map_dir)) {
             pr_perror("[Obsidian0215] Error updating thresholds to file");
         }
-        // 优化1：清理历史统计和反馈控制
-        if (dl->historical_stats) {
-            free(dl->historical_stats);
-            dl->historical_stats = NULL;
-        }
-        if (dl->feedback_ctrl) {
-            free(dl->feedback_ctrl);
-            dl->feedback_ctrl = NULL;
-        }
-
         // 释放dl结构体
         free(dl);
         item->dl = NULL;
@@ -2329,28 +1487,6 @@ struct dirty_diffmap *search_dirty_map(struct dirty_log *dl, unsigned long addr)
     }
     // 如果未找到包含地址的范围，返回NULL
     return NULL;
-}
-
-/**
- * @brief 查找warm_list中包含指定address
- *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
- * @param addr 要查找的线性地址
- * @return int 找到则返回1，如果未找到则返回0
- */
-int search_warm_list(struct dirty_log *dl, unsigned long addr) {
-    char *found_s_count = NULL;
-    unsigned long key_addr = addr;
-
-    /* warm_list deprecated: treat as empty unless explicitly created */
-    if (!dl || !dl->warm_list)
-        return 0;
-
-    pthread_mutex_lock(&dl->warm_list_mutex);
-    found_s_count = g_tree_lookup(dl->warm_list, &key_addr);
-    pthread_mutex_unlock(&dl->warm_list_mutex);
-
-    return (found_s_count != NULL) ? 1 : 0;
 }
 
 /**
@@ -2434,6 +1570,25 @@ static void rebuild_deferred_queues(struct dirty_log *dl) {
     pthread_mutex_unlock(&dl->deferred_list_mutex);
 }
 
+/* Rebuild previous-round dirty set from current diffmap for next round accuracy evaluation. */
+static void update_prev_dirty_set(struct dirty_log *dl)
+{
+    unsigned long i;
+    if (!dl)
+        return;
+    if (dl->prev_dirty_set) {
+        g_hash_table_destroy(dl->prev_dirty_set);
+        dl->prev_dirty_set = NULL;
+    }
+    dl->prev_dirty_set = g_hash_table_new(g_direct_hash, g_direct_equal);
+    if (!dl->diffmap || dl->diffmap_size == 0)
+        return;
+    for (i = 0; i < dl->diffmap_size; i++) {
+        unsigned long addr = dl->diffmap[i].address;
+        g_hash_table_insert(dl->prev_dirty_set, GSIZE_TO_POINTER(addr), GINT_TO_POINTER(1));
+    }
+}
+
 void add_deferred_list(struct dirty_log *dl, unsigned long addr, int round) {
     gpointer key;
     gpointer value;
@@ -2450,6 +1605,8 @@ void add_deferred_list(struct dirty_log *dl, unsigned long addr, int round) {
          */
         int count = GPOINTER_TO_INT(value) + 1;
         g_hash_table_insert(dl->deferred_list, key, GINT_TO_POINTER(count));
+        if (dl->deferred_evict_ttl)
+            g_hash_table_remove(dl->deferred_evict_ttl, key);
         if (round >= 0) {
             int protected_until = round + MIN_DEFER_COOLDOWN_ROUNDS - 1;
             if (!dl->deferred_protected_until)
@@ -2460,6 +1617,8 @@ void add_deferred_list(struct dirty_log *dl, unsigned long addr, int round) {
         struct dirty_diffmap *dhm_add = NULL;
         float add_heat = 0.0f;
         g_hash_table_insert(dl->deferred_list, key, GINT_TO_POINTER(1));
+        if (dl->deferred_evict_ttl)
+            g_hash_table_remove(dl->deferred_evict_ttl, key);
         if (round >= 0) {
             int protected_until = round + MIN_DEFER_COOLDOWN_ROUNDS - 1;
             if (!dl->deferred_protected_until)
@@ -2530,6 +1689,8 @@ void del_deferred_list(struct dirty_log *dl, unsigned long addr) {
         dl->deferred_size--;
         if (dl->deferred_protected_until)
             g_hash_table_remove(dl->deferred_protected_until, GSIZE_TO_POINTER(addr));
+        if (dl->deferred_evict_ttl)
+            g_hash_table_remove(dl->deferred_evict_ttl, GSIZE_TO_POINTER(addr));
         /* Subtract deferred heat sum if possible (use dhm or history fallback) */
         dhm_rem = search_dirty_map(dl, addr);
         if (dhm_rem)
@@ -2675,9 +1836,9 @@ void enforce_deferred_soft_budget(struct dirty_log *dl) {
         picked_total = 0;
         removed = 0.0f;
 
-        /* class priority: freezing -> cold -> warm -> hot (cooler pages first) */
-        class_order[0] = PAGE_FREEZING;
-        class_order[1] = PAGE_COLD;
+        /* class priority: cold -> freezing -> warm -> hot (cooler pages first) */
+        class_order[0] = PAGE_COLD;
+        class_order[1] = PAGE_FREEZING;
         class_order[2] = PAGE_WARM;
         class_order[3] = PAGE_HOT;
 
@@ -2813,6 +1974,9 @@ int get_max_defer_rounds_for_class(struct dirty_log *dl, page_class_t page_class
  */
 
 #define NUM_LOGISTIC_FEATURES 12
+#define MODEL_LEGACY  0
+#define MODEL_ONLINE  1
+#define MODEL_OFFLINE 2
 
 typedef struct {
     int inited;
@@ -2823,6 +1987,7 @@ typedef struct {
     float W_BURST;
     float W_WARM;
     float W_PARENT;
+    float W_DIRTY_FREQ;
     float PAT_DECL_PENALTY;
     float HIST_DECL_PENALTY;
     float SCORE_CLAMP;
@@ -2830,6 +1995,9 @@ typedef struct {
     float EMA_ALPHA;
     float DEFERRED_RISK_COEF;
     float CLASS_BIAS[NUM_PAGE_CLASSES];
+
+    /* Predictor selection */
+    int model_kind; /* legacy | online | offline */
 
     /* Logistic skip model (learned) - optional replacement for legacy score->sigmoid.
      * Features order (mapped to decisions.csv columns):
@@ -2850,6 +2018,15 @@ typedef struct {
     float logistic_weights[NUM_LOGISTIC_FEATURES];
     float logistic_intercept;
     float logistic_threshold;
+
+    /* Online calibration (score -> sigmoid(scale*score + bias)) */
+    float online_bias;
+    float online_scale;
+    float online_class_bias[NUM_PAGE_CLASSES];
+    float online_class_scale[NUM_PAGE_CLASSES];
+    float online_lr;
+    float online_l2;
+    unsigned long online_updates;
 } decision_model_t;
 
 static decision_model_t dm; /* internal model state */
@@ -2863,8 +2040,22 @@ static inline float sigmoidf(float x) {
 /* Forward-declare runtime skip-model loader */
 static int load_skip_model_from_file(const char *path);
 
+static int parse_model_kind(void) {
+    const char *env = getenv("CRIU_PREDICT_MODEL");
+    if (!env || !env[0])
+        return MODEL_ONLINE;
+    if (!strcmp(env, "online"))
+        return MODEL_ONLINE;
+    if (!strcmp(env, "offline"))
+        return MODEL_OFFLINE;
+    if (!strcmp(env, "legacy"))
+        return MODEL_LEGACY;
+    return MODEL_LEGACY;
+}
+
 /* Initialize the model defaults (one-time) */
 static void decision_model_init(void) {
+    int i;
     if (dm.inited)
         return;
     dm.inited = 1;
@@ -2876,6 +2067,7 @@ static void decision_model_init(void) {
     dm.W_BURST = 1.5f;
     dm.W_WARM = -0.5f; /* warmer bias: be more conservative for warm pages */
     dm.W_PARENT = 0.0f;
+    dm.W_DIRTY_FREQ = 1.0f; /* favor deferring long-lived dirty pages */
     dm.PAT_DECL_PENALTY = 1.6f; /* stronger penalty for declining patterns (favor dump) */
     dm.HIST_DECL_PENALTY = 1.6f; /* stronger penalty for historical decline */
     dm.SCORE_CLAMP = 20.0f;
@@ -2889,43 +2081,107 @@ static void decision_model_init(void) {
     dm.CLASS_BIAS[PAGE_WARM] = -0.2f;
     dm.CLASS_BIAS[PAGE_HOT] = 0.6f; /* merged burning bias */
 
-    /* Learned logistic skip-model (exported from offline training).
-     * These weights were derived from standardized-feature logistic training and
-     * converted back to original-scale coefficients for direct use here.
-     */
-    dm.logistic_intercept = -4.136679308607224f;
-    dm.logistic_weights[0] = 0.55834068f;  /* heat */
-    dm.logistic_weights[1] = -0.67787106f; /* heat_trend */
-    dm.logistic_weights[2] = 1.72105007f;  /* writes_est */
-    dm.logistic_weights[3] = -0.04490118f; /* track_s */
-    dm.logistic_weights[4] = 6.85988958f;  /* hist_count */
-    dm.logistic_weights[5] = 0.0f;         /* hist_mean */
-    dm.logistic_weights[6] = 0.0f;         /* hist_variance */
-    dm.logistic_weights[7] = -0.96270833f; /* deferred */
-    dm.logistic_weights[8] = -2.49302051f; /* p (legacy sigmoid(score)) */
-    dm.logistic_weights[9] = 0.38833379f;  /* score */
-    dm.logistic_weights[10] = 3.92609268f; /* pthr (adaptive threshold) */
-    dm.logistic_weights[11] = -0.86282808f;/* round */
+    dm.model_kind = parse_model_kind();
 
-    /* Runtime model loading: only enable if an explicit model file is provided */
+    /* Offline logistic model state (only used when model_kind == MODEL_OFFLINE) */
+    dm.logistic_intercept = 0.0f;
+    memset(dm.logistic_weights, 0, sizeof(dm.logistic_weights));
     dm.logistic_threshold = -1.0f;
-    dm.use_logistic_model = 0; /* will be set if model file loaded */
+    dm.use_logistic_model = 0;
 
-    /* Only load an explicitly specified model file */
+    /* Online calibration defaults (only used when model_kind == MODEL_ONLINE) */
+    dm.online_bias = 0.0f;
+    dm.online_scale = 1.0f;
+    dm.online_lr = 0.05f;
+    dm.online_l2 = 0.0001f;
+    dm.online_updates = 0;
+    for (i = 0; i < NUM_PAGE_CLASSES; i++) {
+        dm.online_class_bias[i] = 0.0f;
+        dm.online_class_scale[i] = 0.0f;
+    }
     {
+        const char *lr_env = getenv("CRIU_ONLINE_LR");
+        const char *l2_env = getenv("CRIU_ONLINE_L2");
+        if (lr_env && lr_env[0]) {
+            double v = strtod(lr_env, NULL);
+            if (v > 0.0)
+                dm.online_lr = (float)v;
+        }
+        if (l2_env && l2_env[0]) {
+            double v = strtod(l2_env, NULL);
+            if (v >= 0.0)
+                dm.online_l2 = (float)v;
+        }
+    }
+
+    /* Only load an explicitly specified model file when offline model is requested */
+    if (dm.model_kind == MODEL_OFFLINE) {
         const char *mf = getenv("CRIU_SKIP_MODEL_FILE");
         if (mf && mf[0]) {
             if (access(mf, R_OK) == 0 && load_skip_model_from_file(mf))
-                pr_info("Loaded skip model from %s\n", mf);
+                pr_info("Loaded offline skip model from %s\n", mf);
             else
-                pr_info("Skip model file not found or failed to load: %s\n", mf);
+                pr_info("Offline skip model file not found or failed to load: %s\n", mf);
         }
+        if (!dm.use_logistic_model)
+            dm.model_kind = MODEL_LEGACY; /* fallback if no model loaded */
     }
+}
+
+static int decision_model_online_active(void) {
+    decision_model_init();
+    return dm.model_kind == MODEL_ONLINE;
+}
+
+static void decision_model_online_snapshot(float *bias, float *scale, unsigned long *updates) {
+    if (bias)
+        *bias = dm.online_bias;
+    if (scale)
+        *scale = dm.online_scale;
+    if (updates)
+        *updates = dm.online_updates;
+}
+
+static void decision_model_online_update(float score, float p, float y, page_class_t page_class) {
+    float err;
+    const float max_bias = 10.0f;
+    const float max_scale = 10.0f;
+    int idx;
+
+    decision_model_init();
+    if (dm.model_kind != MODEL_ONLINE)
+        return;
+
+    err = p - y;
+    dm.online_bias -= dm.online_lr * (err + dm.online_l2 * dm.online_bias);
+    dm.online_scale -= dm.online_lr * (err * score + dm.online_l2 * dm.online_scale);
+
+    idx = (int)page_class;
+    if (idx < 0 || idx >= NUM_PAGE_CLASSES)
+        idx = PAGE_COLD;
+    dm.online_class_bias[idx] -= dm.online_lr * (err + dm.online_l2 * dm.online_class_bias[idx]);
+    dm.online_class_scale[idx] -= dm.online_lr * (err * score + dm.online_l2 * dm.online_class_scale[idx]);
+
+    if (dm.online_bias > max_bias) dm.online_bias = max_bias;
+    if (dm.online_bias < -max_bias) dm.online_bias = -max_bias;
+    if (dm.online_scale > max_scale) dm.online_scale = max_scale;
+    if (dm.online_scale < -max_scale) dm.online_scale = -max_scale;
+
+    if (dm.online_class_bias[idx] > max_bias) dm.online_class_bias[idx] = max_bias;
+    if (dm.online_class_bias[idx] < -max_bias) dm.online_class_bias[idx] = -max_bias;
+    if (dm.online_class_scale[idx] > max_scale) dm.online_class_scale[idx] = max_scale;
+    if (dm.online_class_scale[idx] < -max_scale) dm.online_class_scale[idx] = -max_scale;
+
+    dm.online_updates++;
 }
 
 bool skip_model_loaded(void) {
     decision_model_init();
-    return dm.use_logistic_model ? true : false;
+    if (dm.model_kind == MODEL_ONLINE)
+        return true;
+    if (dm.model_kind == MODEL_OFFLINE && dm.use_logistic_model)
+        return true;
+    return false;
 }
 
 /* Helper: load a skip_model JSON file (simple robust parser for our schema).
@@ -3046,7 +2302,14 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
     float confidence = 0.0f;
     float deferred_risk = 0.0f;
     float deferred_norm_denom = 1.0f;
+    float dirty_freq = 0.0f;
+    float pred_rate = -1.0f;
+    float w_dirty = 0.0f;
     float p_thr_model;
+    float transient_penalty = 0.0f;
+    float hist_cv = 0.0f;
+    float persistent_penalty = 0.0f;
+    int warm_hint = 0;
     /* temporaries for optional logistic model */
     int i;
     float logit;
@@ -3080,6 +2343,14 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
     hist = get_page_history(dl, vaddr);
     if (hist && hist->history_count >= 3 && hist->is_declining)
         hist_decl = 1.0f;
+    if (hist)
+        dirty_freq = hist->dirty_freq;
+    w_dirty = dm.W_DIRTY_FREQ;
+    if (dl && dl->predicted_total > 100) {
+        pred_rate = (float)dl->predicted_hit / (float)dl->predicted_total;
+        if (pred_rate < 0.65f)
+            w_dirty *= (pred_rate / 0.65f);
+    }
 
     if (dl && dl->ldm_header && dl->ldm_header->track_duration_ns > 0)
         track_s = (float)dl->ldm_header->track_duration_ns / 1e9f;
@@ -3087,6 +2358,17 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
     confidence = writes_est / (writes_est + dm.CONF_K);
 
     page_class = classify_page(dl, dhm, round);
+
+    /* Derive a warm-hint when warm_list is removed: stable low-heat pages are treated as warm. */
+    warm_hint = is_warm ? 1 : 0;
+    if (!warm_hint && page_class == PAGE_WARM) {
+        if (hist && hist->is_stable)
+            warm_hint = 1;
+        else if (dl && dl->threshold_mid > 0.0f && dhm && dhm->heat > 0.0f) {
+            if (dhm->heat < dl->threshold_mid * 0.5f)
+                warm_hint = 1;
+        }
+    }
 
     if (dl && dl->diffmap_size > 0 && dl->global_mean_heat > 0.0f) {
         deferred_norm_denom = dl->global_mean_heat * (float)dl->diffmap_size + 1e-6f;
@@ -3098,7 +2380,8 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
           + dm.W_TREND * trend_norm * confidence
           + dm.W_DEFER_CNT * deferred_count
           + dm.W_BURST * pat_burst
-          + dm.W_WARM * (is_warm ? 1.0f : 0.0f)
+          + dm.W_WARM * (warm_hint ? 1.0f : 0.0f)
+          + w_dirty * dirty_freq
           /* NOTE: parent_missing used to be given an explicit weight here (dm.W_PARENT).
            * Recent design changes remove special-casing of parent-missing pages; they are
            * now treated like ordinary pages and evaluated by the general p_next/p_thr
@@ -3120,6 +2403,36 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
         if (hist_boost > 0.8f)
             hist_boost = 0.8f;
         score += hist_boost;
+    }
+
+    /* Defer risk weighting: penalize transient/bursty pages that appear dirty sporadically. */
+    if (hist) {
+        if (hist->dirty_freq < 0.35f)
+            transient_penalty += (0.35f - hist->dirty_freq) * 1.2f;
+        if (hist->mean_heat > 0.0f && hist->variance_heat > 0.0f) {
+            hist_cv = sqrtf(hist->variance_heat) / (hist->mean_heat + 1e-6f);
+            if (hist_cv > 0.6f)
+                transient_penalty += (hist_cv - 0.6f) * 0.5f;
+        }
+    }
+    if (pattern == PATTERN_BURST)
+        transient_penalty += 0.5f;
+    if (transient_penalty > 0.0f)
+        score -= transient_penalty;
+
+    /* Penalize persistently dirty, low-variance pages that are not cooling.
+     * This reduces repeated defers that tend to miss in practice.
+     */
+    if (hist && hist->dirty_freq >= 0.80f) {
+        float rel_trend_p = 0.0f;
+        if (dhm && dhm->heat > 0.0f)
+            rel_trend_p = dhm->heat_trend / (dhm->heat + 1e-6f);
+        if (hist_cv < 0.45f && rel_trend_p > -0.10f) {
+            persistent_penalty = 0.4f + (hist->dirty_freq - 0.80f) * 1.0f;
+            if (persistent_penalty > 1.2f)
+                persistent_penalty = 1.2f;
+            score -= persistent_penalty;
+        }
     }
 
     score -= dm.DEFERRED_RISK_COEF * deferred_risk;
@@ -3145,9 +2458,9 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
     /* compute adaptive p threshold (used as model feature 'pthr') */
     p_thr_model = decision_p_threshold(dl, page_class);
 
-    /* If logistic skip model enabled, compute final p via learned linear model + sigmoid
+    /* Offline logistic model: compute p via learned linear model + sigmoid
      * (we keep 'score' unchanged for telemetry and debugging). */
-    if (dm.use_logistic_model) {
+    if (dm.model_kind == MODEL_OFFLINE && dm.use_logistic_model) {
         float feats[NUM_LOGISTIC_FEATURES];
         feats[0] = dhm ? dhm->heat : 0.0f;
         feats[1] = dhm ? dhm->heat_trend : 0.0f;
@@ -3172,9 +2485,42 @@ float compute_p_next_dirty(struct dirty_log *dl, struct dirty_diffmap *dhm, unsi
         return p_logit;
     }
 
+    /* Online calibration: use sigmoid(scale*score + bias) */
+    if (dm.model_kind == MODEL_ONLINE) {
+        int idx = (int)page_class;
+        float scale;
+        float bias;
+        float p_online;
+
+        if (idx < 0 || idx >= NUM_PAGE_CLASSES)
+            idx = PAGE_COLD;
+        scale = dm.online_scale + dm.online_class_scale[idx];
+        bias = dm.online_bias + dm.online_class_bias[idx];
+        p_online = sigmoidf(scale * score + bias);
+        if (out_p_model) *out_p_model = p_online;
+        if (out_score) *out_score = score;
+        return p_online;
+    }
+
     if (out_p_model) *out_p_model = -1.0f;
     if (out_score) *out_score = score;
     return old_p;
+}
+
+float dirtymap_pid_hotness_factor(struct dirty_log *dl) {
+    float factor = 1.0f;
+    float ratio;
+    if (!dl || !dl->stats_collected || dl->global_median_heat <= 0.0f)
+        return 1.0f;
+    ratio = dl->global_mean_heat / (dl->global_median_heat + 1e-6f);
+    if (ratio > 1.0f) {
+        factor = 1.0f - fminf(0.25f, (ratio - 1.0f) * 0.15f);
+    } else {
+        factor = 1.0f + fminf(0.15f, (1.0f - ratio) * 0.15f);
+    }
+    if (factor < 0.80f) factor = 0.80f;
+    if (factor > 1.20f) factor = 1.20f;
+    return factor;
 }
 
 float decision_p_threshold(struct dirty_log *dl, page_class_t page_class) {
@@ -3186,11 +2532,12 @@ float decision_p_threshold(struct dirty_log *dl, page_class_t page_class) {
     float factor = 1.0f;
     float deferred_util = 0.0f;
     float class_factor = 1.0f; /* declared up-front for C90 compliance */
+    float round_factor = 1.0f;
+    float hot_factor = 1.0f;
     float p = 0.0f;
-
     /* If a logistic model is active and contains a trained best_threshold, prefer it
      * as a minimum (conservative) decision threshold so the runtime respects model bias. */
-    if (dm.use_logistic_model && dm.logistic_threshold > 0.0f) {
+    if (dm.model_kind == MODEL_OFFLINE && dm.use_logistic_model && dm.logistic_threshold > 0.0f) {
         if (dm.logistic_threshold > base) {
             pr_info("[Obsidian0215] decision_p_threshold: model best_threshold=%.3f overrides base %.3f\n", dm.logistic_threshold, base);
             base = dm.logistic_threshold;
@@ -3217,50 +2564,27 @@ float decision_p_threshold(struct dirty_log *dl, page_class_t page_class) {
         class_factor = 1.0f; break;
     }
 
-    p = base * factor * class_factor;
+    /* Round-aware adjustment: be more aggressive early, conservative later. */
+    if (dl && dl->current_round > 0) {
+        int r = dl->current_round;
+        if (r <= 1)
+            round_factor = 0.85f;
+        else if (r == 2)
+            round_factor = 0.90f;
+        else if (r == 3)
+            round_factor = 0.95f;
+        else
+            round_factor = 1.05f;
+    }
+
+    /* PID hotness factor: hotter processes get a lower threshold (more defer budget). */
+    hot_factor = dirtymap_pid_hotness_factor(dl);
+
+    p = base * factor * class_factor * round_factor * hot_factor;
     if (p < min_p) p = min_p;
     if (p > max_p) p = max_p;
 
-    if (dl && dl->historical_stats && dl->historical_stats->update_count > 0) {
-        float alpha = dl->historical_stats->learning_rate;
-        if (alpha > 0.0f) {
-            dl->historical_stats->ema_hit_rate = alpha * p + (1.0f - alpha) * dl->historical_stats->ema_hit_rate;
-            p = dl->historical_stats->ema_hit_rate;
-            if (p < min_p) p = min_p;
-            if (p > max_p) p = max_p;
-        }
-    }
-
     return p;
-}
-
-/**
- * @brief 将指定address插入warm_list中，并保持warm_list升序
- *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
- * @param addr 要插入的线性地址
- * @return void
- */
-void inc_warm_list(struct dirty_log *dl, unsigned long addr) {
-    /* warm_list deprecated under queue-mode: no-op */
-    (void)dl;
-    (void)addr;
-    return;
-}
-
-/**
- * @brief 将warm_list中指定address的s_count减1，若为0则删除保持warm_list升序
- *
- * @param dl <pid>对应dirtylog指针。其中包含已排序的warm_list
- * @param addr 要操作的线性地址
- * @return void
- */
-void sub_warm_list(struct dirty_log *dl, unsigned long addr, bool zero) {
-    /* warm_list deprecated under queue-mode: no-op */
-    (void)dl;
-    (void)addr;
-    (void)zero;
-    return;
 }
 
 /**
@@ -3469,7 +2793,7 @@ void update_dynamic_thresholds(struct dirty_log *dl, int round) {
         /* baseline: half of median heat (user requirement: first dirtymap median / 2) */
         base = dl->global_median_heat * 0.5f;
     } else {
-        base = get_warm_heat_threshold(); /* fallback to configured warm heat */
+        base = INITIAL_HEAT_THRESHOLD; /* fallback when no stats */
     }
 
     /* Aggression schedule: start at half-median for round 1 and then slightly relax threshold
@@ -3496,7 +2820,7 @@ void update_dynamic_thresholds(struct dirty_log *dl, int round) {
 
     /* Safety clamps */
     if (dl->threshold_mid < 0.0001f)
-        dl->threshold_mid = get_warm_heat_threshold();
+        dl->threshold_mid = INITIAL_HEAT_THRESHOLD;
 
     /* Diagnostic info for troubleshooting */
     pr_info("[Phase0Dynamic] PID=%d Round=%d: base(half_median)=%.6f aggression=%.3f thresholds=[%.6f, %.6f, %.6f]\n",
@@ -3526,12 +2850,28 @@ page_history_t *get_page_history(struct dirty_log *dl, unsigned long vaddr)
             hist->is_stable = false;
             hist->is_declining = false;
             hist->score_ema = 0.0f; /* init EMA */
-            hist->warm_score = 0.0f; /* init warm score */
             g_hash_table_insert(dl->page_history_map, GSIZE_TO_POINTER(vaddr), hist);
         }
     }
 
     return hist;
+}
+
+/* Push a heat sample into history (rolling FIFO). */
+static void push_history_heat(page_history_t *hist, float heat)
+{
+    int i;
+    if (!hist)
+        return;
+    if (hist->history_count < MAX_HISTORY_ROUNDS) {
+        hist->heat[hist->history_count] = heat;
+        hist->history_count++;
+    } else {
+        for (i = 0; i < MAX_HISTORY_ROUNDS - 1; i++) {
+            hist->heat[i] = hist->heat[i + 1];
+        }
+        hist->heat[MAX_HISTORY_ROUNDS - 1] = heat;
+    }
 }
 
 /**
@@ -3541,7 +2881,7 @@ page_history_t *get_page_history(struct dirty_log *dl, unsigned long vaddr)
 void update_page_history(struct dirty_log *dl, unsigned long vaddr, struct dirty_diffmap *dhm, int round)
 {
     page_history_t *hist;
-    int idx, i;
+    int gap, i;
 
     if (!dl || !dhm || round < 0) return;
 
@@ -3556,32 +2896,26 @@ void update_page_history(struct dirty_log *dl, unsigned long vaddr, struct dirty
         return;
     }
 
-    // 只记录连续的round（跳过非连续的round）
-    if (hist->last_round >= 0 && round != hist->last_round + 1) {
-        // Round不连续，重置历史
-        hist->history_count = 0;
+    // 允许非连续round：用“缺失轮次=未修改(heat=0)”近似全历史
+    if (hist->last_round >= 0) {
+        if (round <= hist->last_round) {
+            /* round回退或重复，重置历史避免污染 */
+            hist->history_count = 0;
+        } else {
+            gap = round - hist->last_round - 1;
+            for (i = 0; i < gap; i++)
+                push_history_heat(hist, 0.0f);
+        }
     }
 
-    // 滚动存储（FIFO），仅记录 heat
-    if (hist->history_count < MAX_HISTORY_ROUNDS) {
-        idx = hist->history_count;
-        hist->heat[idx] = dhm->heat;
-        hist->history_count++;
-    } else {
-        // 满了，移除最旧的
-        for (i = 0; i < MAX_HISTORY_ROUNDS - 1; i++) {
-            hist->heat[i] = hist->heat[i + 1];
-        }
-        hist->heat[MAX_HISTORY_ROUNDS - 1] = dhm->heat;
-    }
+    // 滚动存储（FIFO），记录本轮 heat
+    push_history_heat(hist, dhm->heat);
 
     hist->last_round = round;
 
     // 更新统计特征
     compute_page_stability(hist);
 
-    /* warm_score deprecated under queue-mode: keep value at 0 and do not update */
-    hist->warm_score = 0.0f;
 }
 
 /**
@@ -3594,6 +2928,7 @@ void compute_page_stability(page_history_t *hist)
 {
     int n, i;
     float sum, var_sum, cv;
+    int dirty_cnt = 0;
 
     if (!hist || hist->history_count < 2) {
         hist->is_stable = false;
@@ -3607,8 +2942,11 @@ void compute_page_stability(page_history_t *hist)
     sum = 0.0f;
     for (i = 0; i < n; i++) {
         sum += hist->heat[i];
+        if (hist->heat[i] > 0.0f)
+            dirty_cnt++;
     }
     hist->mean_heat = sum / n;
+    hist->dirty_freq = n > 0 ? (float)dirty_cnt / (float)n : 0.0f;
 
     // 计算方差 (基于 heat)
     var_sum = 0.0f;

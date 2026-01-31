@@ -622,6 +622,35 @@ static inline int get_env_decision_telemetry_sample(void) {
     return val;
 }
 
+/* VMA-aware decision adjustment: return a multiplier for p-threshold based on mapping type.
+ * >1.0 => more conservative (harder to defer), <1.0 => more aggressive (easier to defer).
+ */
+static inline float vma_type_pthr_factor(struct pstree_item *item, struct vma_area *vma, unsigned long vaddr)
+{
+	float f = 1.0f;
+
+	if (!vma || !vma->e)
+		return f;
+
+	/* stack pages are typically volatile */
+	if (is_stack(item, vaddr))
+		return 1.15f;
+
+	/* shared/file-backed mappings: slightly more conservative */
+	if (vma_area_is(vma, VMA_ANON_SHARED))
+		return 1.05f;
+	if (vma_area_is(vma, VMA_FILE_SHARED))
+		return 1.15f;
+	if (vma_area_is(vma, VMA_FILE_PRIVATE))
+		return 1.05f;
+
+	/* anonymous private pages: allow more aggressive defer */
+	if (vma_area_is_private(vma, kdat.task_size))
+		return 0.90f;
+
+	return f;
+}
+
 
 
 
@@ -719,25 +748,15 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
             // 被dirty_map记录则基于热度和热度变化确定
             if (dhm->heat < dl->min_heat) {
 				// 冷页（一般只会从第二次predump出现）, 选择变冷的
-				if (dhm->heat_trend < 0) {
-					// 判断是否在温页列表中，若在则删除该地址
-					if (0) { /* warm_list disabled */
-						// pr_info("[Obsidian0215]0x%lx in warm list get cold\n", vaddr);
-						// sub_warm_list(dl, vaddr, true);
-						return false;
-					}
-                	return true;
+					if (dhm->heat_trend < 0) {
+						return true;
 				} else {	// 一般不会走该分支
 					return false;
 				}
             } else if (dhm->heat <= dl->heat_threshold && dhm->heat >= dl->min_heat) {
 				// 温页，选择热度下降较快的（超过trend_threshold）
 				// 并加入温页列表
-                if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
-					// if (!search_warm_list(dl, vaddr))
-					// 	pr_info("[Obsidian0215]add 0x%lx to warm list\n", vaddr);
-					// else
-					// 	pr_info("[Obsidian0215]update 0x%lx to warm list\n", vaddr);
+				if (-dhm->heat_trend > dl->trend_threshold * dhm->heat) {
 						float writes_est = 0.0f;
 						if (dl && dl->ldm_header && dl->ldm_header->track_duration_ns > 0) {
 							float td = (float)dl->ldm_header->track_duration_ns / 1e9f;
@@ -754,13 +773,9 @@ static inline bool choose_page_by_dirtymap(struct dirty_log *dl, unsigned long v
                     return true;
                 } else
                 	return false;
-            } else {
-				 // 热页被跳过
-				// 判断是否在温页列表中，若在则删除该地址
-				if (0) { /* warm_list disabled */
-					/* sub_warm_list disabled */
-				}
-                return false;
+			} else {
+				// 热页被跳过
+				return false;
             }
         }
     } else { // dump模式下
@@ -803,6 +818,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
     unsigned long vaddr;
     bool dump_all_pages;
     int ret = 0;
+	struct dirty_log *dl = item->dl;
     /* Decision counters */
     float track_s = 1.0f, writes_est = 0.0f;
 	unsigned long cnt_hole_parent __attribute__((unused)) = 0,
@@ -820,6 +836,8 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 	unsigned long cnt_anomaly_dhm_null_softdirty __attribute__((unused)) = 0; // dhm=NULL but softdirty=1
 	int round = 0;
 	bool allow_defer = 1;
+	bool first_predump = false;
+	bool aggressive_first = false;
 	/* We use per-class adaptive max-defer limits stored in dl; do not consult environment variables. */
 	/* allow_defer will be checked per-page against class-specific limits */
 	int env_max_defer __attribute__((unused)) = -1;
@@ -827,6 +845,12 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
     // Simplified round calculation: just count how many parents exist
     // Round 1 has no parent (round=1), Round 2 has 1 parent (round=2), etc.
     round = get_parent_chain_len(parent_pr) + 1;
+
+	/* Per-process first pre-dump: use aggressive defer based on single dirtymap features */
+	if (mdc->pre_dump && dl && !dl->first_predump_done)
+		first_predump = true;
+	if (first_predump && dl && dl->less_latest_timestamp == 0)
+		aggressive_first = true;
 
 	// pr_info("[Phase0Timing] generate_iovs START for Round %d (has_parent=%d, pre_dump=%d), vma [%lx-%lx]\n",
 	//     round, has_parent, mdc->pre_dump, vma->e->start, vma->e->end);
@@ -874,7 +898,6 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
             ppb_flags |= PPB_LAZY;
 
         if (next == vaddr) {
-            struct dirty_log *dl = item->dl;
             struct dirty_diffmap *dhm = NULL;
 			page_class_t page_class __attribute__((unused)) = PAGE_FREEZING;      // Phase0优化
 			access_pattern_t access_pattern __attribute__((unused)) = PATTERN_UNKNOWN; // Phase0优化，未来可能使用
@@ -923,12 +946,15 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 				/* Per-round defer cap to avoid deferring too many pages */
 				if (dl && dl->diffmap_size > 0) {
 					float defer_cap_ratio = 0.60f - 0.05f * (float)(round - 1);
-					if (round == 1) {
-						if (!skip_model_loaded())
-							defer_cap_ratio = 52.00f;
-						else
-							defer_cap_ratio = 38.00f;
-					}
+					float hot_factor = dirtymap_pid_hotness_factor(dl);
+					float cap_scale = 1.0f + (1.0f - hot_factor) * 0.60f;
+					if (aggressive_first)
+						defer_cap_ratio = 0.90f; /* more aggressive first pre-dump */
+					if (defer_cap_ratio < 0.30f)
+						defer_cap_ratio = 0.30f;
+					defer_cap_ratio *= cap_scale; /* PID-aware cap (hotter => higher cap) */
+					if (defer_cap_ratio > 0.95f)
+						defer_cap_ratio = 0.95f;
 					if (defer_cap_ratio < 0.30f)
 						defer_cap_ratio = 0.30f;
 					if ((float)dl->deferred_size / (float)dl->diffmap_size >= defer_cap_ratio)
@@ -950,11 +976,7 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 
             /* [Obsidian0215] Delta detection with PP_HOLE_DEFERRED handling. */
 			if (mdc->pre_dump && dl) {
-				int defer_drain_round = 4;
-				int defer_stop_round = 5;
-				bool near_final_round = false;
-
-				near_final_round = (round >= defer_drain_round);
+				/* No fixed drain/stop rounds: eviction is handled per-page via cooldown/TTL. */
 
 				/* urgent-force prepared earlier (soft-budget enforcement) */
 				if (search_urgent_force(dl, vaddr)) {
@@ -971,83 +993,111 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 					if (telemetry_decisions_enabled())
 						log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "FORCE_DUMP", "budget_enforce", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
 				} else if (!dirty_now && is_deferred) {
-					if (near_final_round) {
-						/* Do not carry deferred pages into final dump */
-						force_dump_now = true;
-						del_deferred_list(dl, vaddr);
-						deferred_resolved = true;
+					int protected_until = -1;
+					float rel_trend = 0.0f;
+					bool cooling = true;
+					bool warming = false;
+					page_history_t *hist = NULL;
+					int ttl = 0;
+					int ttl_new = 0;
+					gpointer ttlv = NULL;
+					page_class_t cls_ttl = PAGE_COLD;
+
+					if (dl && dl->deferred_protected_until) {
+						gpointer pr = NULL;
+						pthread_mutex_lock(&dl->deferred_list_mutex);
+						pr = g_hash_table_lookup(dl->deferred_protected_until, GSIZE_TO_POINTER(vaddr));
+						if (pr)
+							protected_until = GPOINTER_TO_INT(pr);
+						pthread_mutex_unlock(&dl->deferred_list_mutex);
+					}
+					if ((deferred_count < MIN_DEFER_COUNT_FOR_ENFORCE) || (protected_until >= 0 && dl->current_round >= 0 && dl->current_round <= protected_until)) {
+						/* Respect cooldown/min-count protections: keep deferred */
+						should_defer = true;
 						if (telemetry_decisions_enabled())
-							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "defer_drain_final_round", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
-					} else if (force_dump_now) {
-						/* urgent-force overrides cooldown: dump now */
-						del_deferred_list(dl, vaddr);
-						deferred_resolved = true;
-						if (telemetry_decisions_enabled())
-							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "budget_enforce", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "cooled_deferred_cooldown", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
 					} else {
-						int protected_until = -1;
-						if (dl && dl->deferred_protected_until) {
-							gpointer pr = NULL;
-							pthread_mutex_lock(&dl->deferred_list_mutex);
-							pr = g_hash_table_lookup(dl->deferred_protected_until, GSIZE_TO_POINTER(vaddr));
-							if (pr)
-								protected_until = GPOINTER_TO_INT(pr);
-							pthread_mutex_unlock(&dl->deferred_list_mutex);
+						if (dhm && dhm->heat > 0.0f) {
+							rel_trend = dhm->heat_trend / (dhm->heat + 1e-6f);
+							cooling = (rel_trend <= -0.2f);
+							warming = (rel_trend >= 0.2f);
+						} else {
+							cooling = true; /* cold or missing in dirtymap */
+							warming = false;
 						}
-						if ((deferred_count < MIN_DEFER_COUNT_FOR_ENFORCE) || (protected_until >= 0 && dl->current_round >= 0 && dl->current_round <= protected_until)) {
-							/* Respect cooldown/min-count protections: keep deferred */
+
+						if (warming) {
+							/* warming: cancel eviction countdown */
+							pthread_mutex_lock(&dl->deferred_list_mutex);
+							if (dl->deferred_evict_ttl)
+								g_hash_table_remove(dl->deferred_evict_ttl, GSIZE_TO_POINTER(vaddr));
+							pthread_mutex_unlock(&dl->deferred_list_mutex);
 							should_defer = true;
 							if (telemetry_decisions_enabled())
-								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "cooled_and_deferred_cooldown", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "deferred_warming_keep", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+						} else if (cooling) {
+							/* cooling: start or decrement eviction countdown */
+							hist = get_page_history(dl, vaddr);
+							cls_ttl = dhm ? classify_page(dl, dhm, round) : PAGE_COLD;
+							ttl_new = DEFER_EVICT_TTL_BASE + (int)roundf((hist ? hist->dirty_freq : 0.0f) * (float)(DEFER_EVICT_TTL_MAX - DEFER_EVICT_TTL_BASE));
+							if (cls_ttl == PAGE_HOT)
+								ttl_new += 1;
+							if (ttl_new > DEFER_EVICT_TTL_MAX)
+								ttl_new = DEFER_EVICT_TTL_MAX;
+							if (ttl_new < DEFER_EVICT_TTL_BASE)
+								ttl_new = DEFER_EVICT_TTL_BASE;
+
+							pthread_mutex_lock(&dl->deferred_list_mutex);
+							if (!dl->deferred_evict_ttl)
+								dl->deferred_evict_ttl = g_hash_table_new(g_direct_hash, g_direct_equal);
+							ttlv = g_hash_table_lookup(dl->deferred_evict_ttl, GSIZE_TO_POINTER(vaddr));
+							if (ttlv)
+								ttl = GPOINTER_TO_INT(ttlv) - 1;
+							else
+								ttl = ttl_new;
+							if (ttl <= 0) {
+								g_hash_table_remove(dl->deferred_evict_ttl, GSIZE_TO_POINTER(vaddr));
+							}
+							pthread_mutex_unlock(&dl->deferred_list_mutex);
+
+							if (ttl <= 0) {
+								force_dump_now = true;
+								del_deferred_list(dl, vaddr);
+								deferred_resolved = true;
+								if (telemetry_decisions_enabled())
+									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "deferred_evicted_cooldown", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+							} else {
+								pthread_mutex_lock(&dl->deferred_list_mutex);
+								g_hash_table_insert(dl->deferred_evict_ttl, GSIZE_TO_POINTER(vaddr), GINT_TO_POINTER(ttl));
+								pthread_mutex_unlock(&dl->deferred_list_mutex);
+								should_defer = true;
+								if (telemetry_decisions_enabled())
+									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "deferred_cooling_ttl", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+							}
 						} else {
-							/* cooled_and_deferred -> force and send now */
-							force_dump_now = true;
-							del_deferred_list(dl, vaddr);
-							deferred_resolved = true;
+							/* stable: keep deferred without changing countdown */
+							should_defer = true;
 							if (telemetry_decisions_enabled())
-								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", "cooled_and_deferred", dhm, 0, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "deferred_stable_keep", dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
 						}
 					}
-				} else if (round == 1 && !skip_model_loaded()) {
+				} else if (aggressive_first && dirty_now) {
 					int allow_defer_local;
-					bool first_round_dirty;
+					float heat_thr = 0.0f;
 					deferred_count = get_deferred_count(dl, vaddr);
 					allow_defer_local = allow_defer;
-					if (round >= defer_stop_round)
-						allow_defer_local = 0;
-					first_round_dirty = (dhm && dirty_now);
-					if (allow_defer_local && first_round_dirty) {
+					page_class = dhm ? classify_page(dl, dhm, round) : PAGE_COLD;
+					heat_thr = (dl->threshold_low > 0.0f) ? dl->threshold_low : dl->min_heat;
+					if (allow_defer_local && dhm && dhm->heat >= heat_thr) {
 						should_defer = true;
 						add_deferred_list(dl, vaddr, round);
 						if (telemetry_decisions_enabled()) {
 							int dc = get_deferred_count(dl, vaddr);
-							const char *reason = "first_round_defer_dirtymap";
-							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", reason, dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
+							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "first_predump_heat_defer", dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
 						}
 					} else {
 						if (telemetry_decisions_enabled()) {
-							const char *reason = allow_defer_local ? "first_round_skip_cold" : "defer_cap_reached";
-							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
-						}
-					}
-				} else if (round == 1 && skip_model_loaded()) {
-					int allow_defer_local;
-					bool first_round_dirty;
-					deferred_count = get_deferred_count(dl, vaddr);
-					allow_defer_local = allow_defer;
-					if (round >= defer_stop_round)
-						allow_defer_local = 0;
-					first_round_dirty = (dhm && dirty_now);
-					if (allow_defer_local && first_round_dirty) {
-						should_defer = true;
-						add_deferred_list(dl, vaddr, round);
-						if (telemetry_decisions_enabled()) {
-							int dc = get_deferred_count(dl, vaddr);
-							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "first_round_defer_model_dirtymap", dhm, dc, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
-						}
-					} else {
-						if (telemetry_decisions_enabled()) {
-							const char *reason = allow_defer_local ? "first_round_skip_cold" : "defer_cap_reached";
+							const char *reason = allow_defer_local ? "first_predump_heat_dump" : "defer_cap_reached";
 							log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, -1.0f, -1.0f, -1.0f, -1.0f);
 						}
 					}
@@ -1061,39 +1111,86 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
 						int allow_defer_local;
 						const char *block_reason;
 
+						/* dirty again: cancel any pending eviction countdown */
+						if (is_deferred && dl && dl->deferred_evict_ttl) {
+							pthread_mutex_lock(&dl->deferred_list_mutex);
+							g_hash_table_remove(dl->deferred_evict_ttl, GSIZE_TO_POINTER(vaddr));
+							pthread_mutex_unlock(&dl->deferred_list_mutex);
+						}
+
 						deferred_count = get_deferred_count(dl, vaddr);
 						p_next = compute_p_next_dirty(dl, dhm, vaddr, softdirty, round, !parent_has_page, deferred_count, is_warm, &score, &p_model);
 						page_class = classify_page(dl, dhm, round);
 						p_thr = decision_p_threshold(dl, page_class);
+						/* Type-aware threshold adjustment (VMA sensitive) */
+						{
+							float vma_factor = vma_type_pthr_factor(item, vma, vaddr);
+							p_thr *= vma_factor;
+							if (p_thr < 0.05f) p_thr = 0.05f;
+							if (p_thr > 0.95f) p_thr = 0.95f;
+						}
+						/* Trend/dirty-frequency risk adjustment: favor cooling pages, penalize warming/persistent pages.
+						 * Only apply after round 1 to preserve aggressive first pre-dump.
+						 */
+						if (round > 1 && dhm) {
+							float rel_trend = 0.0f;
+							float adj = 1.0f;
+							page_history_t *hist_risk = NULL;
+							float hit_rate = 0.0f;
+							float acc_adj = 1.0f;
+							float fatigue = 1.0f;
+							if (dhm->heat > 0.0f)
+								rel_trend = dhm->heat_trend / (dhm->heat + 1e-6f);
+							if (rel_trend > 0.30f)
+								adj *= 1.12f; /* warming -> harder to defer */
+							else if (rel_trend < -0.30f)
+								adj *= 0.90f; /* cooling -> easier to defer */
+							hist_risk = get_page_history(dl, vaddr);
+							if (hist_risk && hist_risk->history_count >= 2) {
+								if (hist_risk->dirty_freq >= 0.80f)
+									adj *= 1.12f; /* persistently dirty */
+								else if (hist_risk->dirty_freq <= 0.30f)
+									adj *= 0.90f; /* sparse dirty */
+							}
+							if (deferred_count >= 2 && rel_trend > -0.10f) {
+								fatigue = 1.05f + 0.03f * (float)(deferred_count - 1);
+								if (fatigue > 1.25f)
+									fatigue = 1.25f;
+								adj *= fatigue;
+							}
+							if (dl && dl->predicted_total > 100) {
+								hit_rate = (float)dl->predicted_hit / (float)dl->predicted_total;
+								if (hit_rate < 0.70f) {
+									acc_adj = 1.0f + (0.70f - hit_rate) * 0.6f;
+									if (acc_adj > 1.25f)
+										acc_adj = 1.25f;
+									adj *= acc_adj;
+								} else if (hit_rate > 0.90f) {
+									adj *= 0.97f;
+								}
+							}
+							p_thr *= adj;
+							if (p_thr < 0.05f) p_thr = 0.05f;
+							if (p_thr > 0.95f) p_thr = 0.95f;
+						}
 
 						max_defer_local = get_max_defer_rounds_for_class(dl, page_class);
 						allow_defer_local = allow_defer;
-						if (round >= defer_stop_round)
+						if (deferred_count >= max_defer_local)
 							allow_defer_local = 0;
-						if (!(round == 1 && !skip_model_loaded())) {
-							if (deferred_count >= max_defer_local)
-								allow_defer_local = 0;
-						}
 						block_reason = allow_defer ? "defer_limit_reached" : "defer_cap_reached";
 
-						if (round == 1 && skip_model_loaded()) {
-							/* round1/model handled earlier in the unconditional defer branch */
-							const char *reason = "first_round_model_handled";
+						if (ENABLE_HOT_DEFER && p_next >= p_thr && allow_defer_local) {
+							should_defer = true;
+							add_deferred_list(dl, vaddr, round);
+							if (telemetry_decisions_enabled()) {
+								int dc = get_deferred_count(dl, vaddr);
+								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "prob_defer_hot", dhm, dc, is_warm, p_next, p_model, score, p_thr);
+							}
+						} else {
+							const char *reason = (p_next >= p_thr && !allow_defer_local) ? block_reason : "prob_dump";
 							if (telemetry_decisions_enabled())
 								log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, p_next, p_model, score, p_thr);
-						} else {
-							if (ENABLE_HOT_DEFER && p_next >= p_thr && allow_defer_local) {
-								should_defer = true;
-								add_deferred_list(dl, vaddr, round);
-								if (telemetry_decisions_enabled()) {
-									int dc = get_deferred_count(dl, vaddr);
-									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DEFER", "prob_defer_hot", dhm, dc, is_warm, p_next, p_model, score, p_thr);
-								}
-							} else {
-								const char *reason = (p_next >= p_thr && !allow_defer_local) ? block_reason : "prob_dump";
-								if (telemetry_decisions_enabled())
-									log_page_decision(dl, item->pid->real, vaddr, round, mdc->pre_dump, "DUMP", reason, dhm, deferred_count, is_warm, p_next, p_model, score, p_thr);
-							}
 						}
 					}
 				} else if (is_deferred) {
@@ -1177,8 +1274,6 @@ static int generate_iovs_with_dirty_map(struct pstree_item *item, struct vma_are
                         }
                         pthread_mutex_unlock(&dl->deferred_list_mutex);
 
-                        /* 页面已被传输，从 warm_list 中移除（避免长期保留/重复计数） */
-                        sub_warm_list(dl, vaddr, true);
                     }
                     st = (ppb_flags & PPB_LAZY) ? 1 : 2;
                     if (st == 1)
@@ -1421,6 +1516,13 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			if (ret < 0)
 				goto out_xfer_parent;
 		}
+	}
+
+	/* Mark per-process first pre-dump completion after scanning all VMAs */
+	if (mdc->pre_dump && item->dl && !item->dl->first_predump_done) {
+		item->dl->first_predump_done = true;
+		if (item->dl->first_predump_round < 0)
+			item->dl->first_predump_round = item->dl->current_round;
 	}
 
 	if (mdc->lazy)
