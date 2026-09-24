@@ -23,6 +23,24 @@ jobs:
           test -s "$patch"
           git apply --check "$patch"
           git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/ci/run-ci-tests.sh')
+          text = path.read_text()
+          marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
+          early = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
+          \ttime make -C test/others/remote-parent-experiment check
+          \texit 0
+          fi
+
+          '''
+          if early not in text:
+              if marker not in text:
+                  raise SystemExit('unable to locate unit-test marker')
+              text = text.replace(marker, early + marker, 1)
+              path.write_text(text)
+          PY
           git diff --check
       - name: Run targeted validation
         run: |
