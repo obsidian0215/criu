@@ -1,0 +1,50 @@
+diff --git a/criu/remote-parent.c b/criu/remote-parent.c
+--- a/criu/remote-parent.c
++++ b/criu/remote-parent.c
+@@ -39,20 +39,22 @@ static unsigned long writer_sequence;
+ static bool writer_error;
+ 
+ static int coverage_name(char *buf, size_t size, int fd_type, unsigned long img_id)
+ {
+-	const char *kind;
+ 	int ret;
+ 
+-	if (fd_type == CR_FD_PAGEMAP)
+-		kind = "pagemap";
+-	else if (fd_type == CR_FD_SHMEM_PAGEMAP)
+-		kind = "shmem";
+-	else
++	if (fd_type == CR_FD_PAGEMAP) {
++		ret = snprintf(buf, size, "pagemap-%lu.img", img_id);
++	} else if (fd_type == CR_FD_SHMEM_PAGEMAP) {
++		ret = snprintf(buf, size, "pagemap-shmem-%lu.img", img_id);
++	} else {
+ 		return 0;
++	}
+ 
+-	ret = snprintf(buf, size, "remote-parent-%s-%lu.img", kind, img_id);
+ 	if (ret < 0 || (size_t)ret >= size) {
+ 		errno = ENAMETOOLONG;
+ 		return -1;
+@@ -119,6 +121,20 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
+ 		pr_perror("Unable to duplicate image directory");
+ 		goto err;
+ 	}
++
++	/*
++	 * A normal CRIU pagemap reader opens its referenced pages image even
++	 * when the source-side metadata is used only for parent-range checks.
++	 * Keep that pages image empty: the real payload remains exclusively on
++	 * the destination page server.
++	 */
++	fd = openat(writer->dirfd, "pages-0.img",
++		    O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
++	if (fd < 0) {
++		pr_perror("Unable to create empty source parent pages image");
++		goto err;
++	}
++	close(fd);
++	fd = -1;
+ 
+ 	fd = openat(writer->dirfd, writer->tmp_name,
+ 		    O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
