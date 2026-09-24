@@ -1,7 +1,7 @@
 diff --git a/images/inventory.proto b/images/inventory.proto
 --- a/images/inventory.proto
 +++ b/images/inventory.proto
-@@ -45,4 +45,6 @@ message inventory_entry {
+@@ -45,5 +45,7 @@ message inventory_entry {
  	 */
  	optional uint32			compress = 15;
  	/* Block size in bytes when compress = 1. Informational. */
@@ -49,7 +49,7 @@ diff --git a/criu/page-xfer.c b/criu/page-xfer.c
  #include "page-pipe.h"
  #include "util.h"
  #include "protobuf.h"
-@@ -361,7 +362,8 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
+@@ -361,6 +362,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
  	xfer->close = close_server_xfer;
  	xfer->dst_id = encode_pm(fd_type, img_id);
  	xfer->parent = NULL;
@@ -82,7 +82,7 @@ diff --git a/criu/page-xfer.c b/criu/page-xfer.c
  	if (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP) {
  		int ret;
  		int pfd;
-@@ -902,14 +906,22 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
+@@ -902,13 +906,20 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
  		}
  
  		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
@@ -105,7 +105,7 @@ diff --git a/criu/page-xfer.c b/criu/page-xfer.c
  		close(pfd);
  	}
  
-@@ -1582,7 +1594,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
+@@ -1582,7 +1593,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
  	cxfer.dst_id = pi->dst_id;
  
  	if (sk >= 0) {
@@ -114,7 +114,7 @@ diff --git a/criu/page-xfer.c b/criu/page-xfer.c
  		if (send_full(sk, &has_parent, sizeof(has_parent), "page-server open response")) {
  			page_server_close();
  			return -1;
-@@ -1952,7 +1964,11 @@ static int page_server_serve(int sk)
+@@ -1952,7 +1963,11 @@ static int page_server_serve(int sk)
  		case PS_IOV_FORCE_CLOSE: {
  			int32_t status = 0;
  
@@ -130,7 +130,7 @@ diff --git a/criu/page-xfer.c b/criu/page-xfer.c
 diff --git a/criu/mem.c b/criu/mem.c
 --- a/criu/mem.c
 +++ b/criu/mem.c
-@@ -559,13 +559,15 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+@@ -559,13 +559,16 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
  	pmc_t pmc = PMC_INIT;
  	struct page_pipe *pp;
  	struct vma_area *vma_area;
@@ -148,7 +148,7 @@ diff --git a/criu/mem.c b/criu/mem.c
  
  	pr_info("\n");
  	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
-@@ -604,19 +606,21 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+@@ -604,16 +607,16 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
  			goto out_pp;
  
  		xfer.transfer_lazy = !mdc->lazy;
@@ -161,8 +161,6 @@ diff --git a/criu/mem.c b/criu/mem.c
 -
 -		if (ret)
 -			xfer.parent = NULL + 1;
-+		if (!ret && remote_parent)
-+			ret = 1;
 +		xfer.has_parent = ret;
  	}
  
@@ -171,8 +169,7 @@ diff --git a/criu/mem.c b/criu/mem.c
  		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
  		if (possible_pid_reuse == -1)
  			goto out_xfer;
- 	}
-@@ -624,7 +628,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+@@ -624,7 +627,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
  	 * Step 1 -- generate the pagemap
  	 */
  	args->off = 0;
