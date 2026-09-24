@@ -4,20 +4,30 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 TOP=$(cd "$SCRIPT_DIR/../../.." && pwd)
 ROUTE=$(cat "$TOP/experiments/remote-parent/route")
-PRE_DUMP_MODE=${PRE_DUMP_MODE:-splice}
-case "$PRE_DUMP_MODE" in
-	read|splice) ;;
-	*) echo "invalid pre-dump mode: $PRE_DUMP_MODE" >&2; exit 2 ;;
+SEQUENCE=${PRE_DUMP_SEQUENCE:-${PRE_DUMP_MODE:-splice}}
+COMPRESSION=${REMOTE_PARENT_COMPRESSION:-plain}
+
+case "$SEQUENCE" in
+	read) ROUND_MODES=(read read read) ;;
+	splice) ROUND_MODES=(splice splice splice) ;;
+	mixed) ROUND_MODES=(read splice read) ;;
+	*) echo "invalid pre-dump sequence: $SEQUENCE" >&2; exit 2 ;;
+esac
+case "$COMPRESSION" in
+	plain) MEMORY_OPTS=() ;;
+	lz4) MEMORY_OPTS=(--compress) ;;
+	*) echo "invalid compression variant: $COMPRESSION" >&2; exit 2 ;;
 esac
 case "$ROUTE" in
-	final-page-server|local-no-parent|local-pagemap) ;;
+	final-page-server|local-no-parent|local-pagemap|custom-coverage) ;;
 	*) echo "invalid route: $ROUTE" >&2; exit 2 ;;
 esac
 
 CRIU_CMD=("$TOP/criu/criu" --no-default-config)
 ZDTM_DIR="$TOP/test/zdtm/static"
-WORK_DIR="$SCRIPT_DIR/work-$ROUTE-$PRE_DUMP_MODE"
-RESULT_DIR="$SCRIPT_DIR/results/$PRE_DUMP_MODE"
+CASE_ID="$SEQUENCE-$COMPRESSION"
+WORK_DIR="$SCRIPT_DIR/work-$ROUTE-$CASE_ID"
+RESULT_DIR="$SCRIPT_DIR/results/$CASE_ID"
 BASE_PAGE_LAUNCHER="$WORK_DIR/base-page-launcher"
 ORACLE="$SCRIPT_DIR/generation_oracle.py"
 PROXY="$SCRIPT_DIR/tcp_proxy.py"
@@ -34,6 +44,14 @@ fail() {
 		find "$WORK_DIR" -type f -name '*.log' -print -exec sh -c 'echo "--- $1"; tail -n 120 "$1"' _ {} \; || true
 	fi
 	exit 1
+}
+
+skip() {
+	mkdir -p "$RESULT_DIR"
+	printf '{"route":"%s","case":"%s","status":"SKIP","reason":"%s"}\n' \
+		"$ROUTE" "$CASE_ID" "$1" > "$RESULT_DIR/summary.json"
+	printf 'SKIP route=%s case=%s reason=%s\n' "$ROUTE" "$CASE_ID" "$1"
+	exit 0
 }
 
 cleanup() {
@@ -147,6 +165,7 @@ run_remote_round() {
 	local source_parent=${4:-}
 	local target_parent=${5:-}
 	local label=$6
+	local mode=$7
 	local target_port proxy_port stats ready
 	local args=(--track-mem --page-server --address 127.0.0.1)
 
@@ -158,11 +177,12 @@ run_remote_round() {
 	start_page_server "$target_dir" "$target_port" "$target_parent"
 	start_proxy "$proxy_port" "$target_port" "$stats" "$ready"
 	args+=(--port "$proxy_port")
+	args+=("${MEMORY_OPTS[@]}")
 	if [ -n "$source_parent" ]; then
 		args+=(--prev-images-dir "../$(basename "$source_parent")")
 	fi
 	if [ "$operation" = pre-dump ]; then
-		"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" -D "$source_dir" -o dump.log -t "$PID" -v4 "${args[@]}" ||
+		"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$mode" -D "$source_dir" -o dump.log -t "$PID" -v4 "${args[@]}" ||
 			fail "$label source pre-dump failed"
 	else
 		"${CRIU_CMD[@]}" dump -D "$source_dir" -o dump.log -t "$PID" -v4 "${args[@]}" ||
@@ -224,21 +244,29 @@ rm -rf "$WORK_DIR" "$RESULT_DIR"
 mkdir -p "$WORK_DIR" "$RESULT_DIR"
 "${CC:-cc}" -Wall -Wextra -Werror "$SCRIPT_DIR/base_page_launcher.c" -o "$BASE_PAGE_LAUNCHER"
 
+if [ "$COMPRESSION" = lz4 ]; then
+	if ! "${CRIU_CMD[@]}" check --feature compress >"$WORK_DIR/compress-check.log" 2>&1; then
+		skip "compression feature unavailable"
+	fi
+fi
+
 SOURCE_PRE1="$WORK_DIR/source-pre1"
 SOURCE_PRE2="$WORK_DIR/source-pre2"
+SOURCE_PRE3="$WORK_DIR/source-pre3"
 TARGET_PRE1="$WORK_DIR/target-pre1"
 TARGET_PRE2="$WORK_DIR/target-pre2"
+TARGET_PRE3="$WORK_DIR/target-pre3"
 SOURCE_FINAL="$WORK_DIR/source-final"
 TARGET_FINAL="$WORK_DIR/target-final"
 
 start_workload
-run_remote_round pre-dump "$SOURCE_PRE1" "$TARGET_PRE1" "" "" pre1
+run_remote_round pre-dump "$SOURCE_PRE1" "$TARGET_PRE1" "" "" pre1 "${ROUND_MODES[0]}"
 PRE1_WIRE=$LAST_WIRE_UP
 PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
 [ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
 run_oracle mutate "$TARGET_PRE1" "$PID" "$ORACLE_STATE" || fail "first mutation failed"
 
-run_remote_round pre-dump "$SOURCE_PRE2" "$TARGET_PRE2" "$SOURCE_PRE1" "$TARGET_PRE1" pre2
+run_remote_round pre-dump "$SOURCE_PRE2" "$TARGET_PRE2" "$SOURCE_PRE1" "$TARGET_PRE1" pre2 "${ROUND_MODES[1]}"
 PRE2_WIRE=$LAST_WIRE_UP
 PRE2_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE2" 'pages-*.img')
 run_oracle check-image "$TARGET_PRE2" "$PID" "$ORACLE_STATE" || fail "second pre-dump generation placement is wrong"
@@ -246,9 +274,17 @@ run_oracle check-image "$TARGET_PRE2" "$PID" "$ORACLE_STATE" || fail "second pre
 [ $((PRE2_WIRE * 4)) -lt "$PRE1_WIRE" ] || fail "second pre-dump wire traffic is not incremental"
 run_oracle mutate "$TARGET_PRE2" "$PID" "$ORACLE_STATE" || fail "second mutation failed"
 
-SOURCE_PRE_PAGES=$(sum_glob_bytes "$SOURCE_PRE2" 'pages-*.img')
-SOURCE_PRE_PAGEMAPS=$(sum_glob_bytes "$SOURCE_PRE2" 'pagemap-*.img')
-SOURCE_REMOTE_META=$(sum_glob_bytes "$SOURCE_PRE2" 'remote-parent-*.img')
+run_remote_round pre-dump "$SOURCE_PRE3" "$TARGET_PRE3" "$SOURCE_PRE2" "$TARGET_PRE2" pre3 "${ROUND_MODES[2]}"
+PRE3_WIRE=$LAST_WIRE_UP
+PRE3_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE3" 'pages-*.img')
+run_oracle check-image "$TARGET_PRE3" "$PID" "$ORACLE_STATE" || fail "third pre-dump generation placement is wrong"
+[ "$PRE3_PAYLOAD" -gt 0 ] || fail "third pre-dump has no payload"
+[ $((PRE3_WIRE * 4)) -lt "$PRE1_WIRE" ] || fail "third pre-dump wire traffic is not incremental"
+run_oracle mutate "$TARGET_PRE3" "$PID" "$ORACLE_STATE" || fail "third mutation failed"
+
+SOURCE_PRE_PAGES=$(sum_glob_bytes "$SOURCE_PRE3" 'pages-*.img')
+SOURCE_PRE_PAGEMAPS=$(sum_glob_bytes "$SOURCE_PRE3" 'pagemap-*.img')
+SOURCE_REMOTE_META=$(sum_glob_bytes "$SOURCE_PRE3" 'remote-parent-*.img')
 [ "$SOURCE_PRE_PAGES" -eq 0 ] || fail "source retained pre-dump page payload"
 case "$ROUTE" in
 	final-page-server|local-no-parent)
@@ -256,12 +292,16 @@ case "$ROUTE" in
 		[ "$SOURCE_REMOTE_META" -eq 0 ] || fail "route unexpectedly retained side metadata"
 		;;
 	local-pagemap)
-		[ "$SOURCE_REMOTE_META" -gt 0 ] || fail "pagemap route produced no source metadata"
+		[ "$SOURCE_PRE_PAGEMAPS" -gt 0 ] || fail "standard-pagemap route produced no source pagemap"
+		[ "$SOURCE_REMOTE_META" -eq 0 ] || fail "standard-pagemap route retained custom coverage"
+		;;
+	custom-coverage)
+		[ "$SOURCE_REMOTE_META" -gt 0 ] || fail "custom coverage control produced no source metadata"
 		;;
 esac
 
 if [ "$ROUTE" = final-page-server ]; then
-	run_remote_round dump "$SOURCE_FINAL" "$TARGET_FINAL" "$SOURCE_PRE2" "$TARGET_PRE2" final
+	run_remote_round dump "$SOURCE_FINAL" "$TARGET_FINAL" "$SOURCE_PRE3" "$TARGET_PRE3" final "${ROUND_MODES[2]}"
 	FINAL_WIRE=$LAST_WIRE_UP
 	copy_non_memory_images "$SOURCE_FINAL" "$TARGET_FINAL"
 	[ -L "$TARGET_FINAL/parent" ] || fail "destination final image has no parent link"
@@ -270,9 +310,9 @@ if [ "$ROUTE" = final-page-server ]; then
 else
 	mkdir -p "$SOURCE_FINAL"
 	"${CRIU_CMD[@]}" dump -D "$SOURCE_FINAL" -o dump.log -t "$PID" -v4 --track-mem \
-		--prev-images-dir "../$(basename "$SOURCE_PRE2")" || fail "local final dump failed"
+		"${MEMORY_OPTS[@]}" --prev-images-dir "../$(basename "$SOURCE_PRE3")" || fail "local final dump failed"
 	FINAL_WIRE=0
-	assemble_local_final "$SOURCE_FINAL" "$TARGET_FINAL" "$TARGET_PRE2"
+	assemble_local_final "$SOURCE_FINAL" "$TARGET_FINAL" "$TARGET_PRE3"
 	FINAL_IMAGE="$SOURCE_FINAL"
 fi
 
@@ -284,23 +324,28 @@ FINAL_PAYLOAD=$(sum_glob_bytes "$FINAL_IMAGE" 'pages-*.img')
 "${CRIU_CMD[@]}" restore -D "$TARGET_FINAL" -o restore.log -v4 -d || fail "restore failed"
 stop_workload
 
-cat > "$RESULT_DIR/summary.json" <<EOF
+cat > "$RESULT_DIR/summary.json" <<EOF_JSON
 {
   "route": "$ROUTE",
-  "pre_dump_mode": "$PRE_DUMP_MODE",
+  "case": "$CASE_ID",
+  "status": "PASS",
+  "round_modes": ["${ROUND_MODES[0]}", "${ROUND_MODES[1]}", "${ROUND_MODES[2]}"],
+  "compression": "$COMPRESSION",
   "pre1_wire_source_to_server": $PRE1_WIRE,
   "pre2_wire_source_to_server": $PRE2_WIRE,
+  "pre3_wire_source_to_server": $PRE3_WIRE,
   "final_wire_source_to_server": $FINAL_WIRE,
   "pre1_page_payload": $PRE1_PAYLOAD,
   "pre2_page_payload": $PRE2_PAYLOAD,
+  "pre3_page_payload": $PRE3_PAYLOAD,
   "final_page_payload": $FINAL_PAYLOAD,
   "source_pre_pages": $SOURCE_PRE_PAGES,
   "source_pre_pagemaps": $SOURCE_PRE_PAGEMAPS,
   "source_remote_metadata": $SOURCE_REMOTE_META
 }
-EOF
+EOF_JSON
 cp "$WORK_DIR"/*-wire.json "$RESULT_DIR/" 2>/dev/null || true
-printf 'PASS route=%s mode=%s pre1-wire=%s pre2-wire=%s final-wire=%s final-pages=%s\n' \
-	"$ROUTE" "$PRE_DUMP_MODE" "$PRE1_WIRE" "$PRE2_WIRE" "$FINAL_WIRE" "$FINAL_PAYLOAD"
+printf 'PASS route=%s case=%s pre1-wire=%s pre2-wire=%s pre3-wire=%s final-wire=%s final-pages=%s\n' \
+	"$ROUTE" "$CASE_ID" "$PRE1_WIRE" "$PRE2_WIRE" "$PRE3_WIRE" "$FINAL_WIRE" "$FINAL_PAYLOAD"
 
 rm -rf "$WORK_DIR"
