@@ -1,0 +1,42 @@
+name: Remote parent experiment
+
+on:
+  push:
+    branches:
+      - 'exp/remote-parent-route-*'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Apply route implementation
+        run: |
+          set -euxo pipefail
+          patch=experiments/remote-parent/route.patch
+          test -s "$patch"
+          git apply --check "$patch"
+          git apply "$patch"
+          git diff --check
+      - name: Run targeted validation
+        run: |
+          set -euxo pipefail
+          printf '\nREMOTE_PARENT_EXPERIMENT=1\n' >> scripts/ci/docker.env
+          if [ '${{ matrix.compiler }}' = clang ]; then
+            sudo -E make -C scripts/ci alpine CLANG=1 ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+          else
+            sudo -E make -C scripts/ci alpine GCC=1 ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+          fi
+      - name: Upload experiment results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}
+          path: test/others/remote-parent-experiment/results
+          if-no-files-found: warn
