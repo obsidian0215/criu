@@ -26,8 +26,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          ci = Path('scripts/ci/run-ci-tests.sh')
-          text = ci.read_text()
+          path = Path('scripts/ci/run-ci-tests.sh')
+          text = path.read_text()
           marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
           early = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
           \ttime make -C test/others/remote-parent-experiment check
@@ -38,33 +38,7 @@ jobs:
           if early not in text:
               if marker not in text:
                   raise SystemExit('unable to locate unit-test marker')
-              ci.write_text(text.replace(marker, early + marker, 1))
-
-          route = Path('experiments/remote-parent/route').read_text().strip()
-          regression = Path('test/others/remote-parent-experiment/regression.sh')
-          text = regression.read_text()
-          old_routes = 'final-page-server|local-no-parent|local-pagemap)'
-          new_routes = 'final-page-server|local-no-parent|local-pagemap|custom-coverage)'
-          if old_routes in text:
-              text = text.replace(old_routes, new_routes, 1)
-
-          custom_clause = '''\tlocal-pagemap)
-          \t\t[ "$SOURCE_REMOTE_META" -gt 0 ] || fail "pagemap route produced no source metadata"
-          \t\t;;'''
-          if route == 'local-pagemap':
-              standard_clause = '''\tlocal-pagemap)
-          \t\t[ "$SOURCE_PRE_PAGEMAPS" -gt 0 ] || fail "standard-pagemap route produced no source pagemap"
-          \t\t[ "$SOURCE_REMOTE_META" -eq 0 ] || fail "standard-pagemap route retained custom coverage"
-          \t\t;;'''
-              if custom_clause not in text:
-                  raise SystemExit('unable to locate pagemap source-contract clause')
-              text = text.replace(custom_clause, standard_clause, 1)
-          elif route == 'custom-coverage':
-              control_clause = custom_clause.replace('\tlocal-pagemap)', '\tcustom-coverage)')
-              if custom_clause not in text:
-                  raise SystemExit('unable to locate custom coverage clause')
-              text = text.replace(custom_clause, control_clause, 1)
-          regression.write_text(text)
+              path.write_text(text.replace(marker, early + marker, 1))
           PY
           git diff --check
       - name: Run targeted validation
