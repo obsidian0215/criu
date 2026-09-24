@@ -1,0 +1,52 @@
+diff --git a/criu/page-xfer.c b/criu/page-xfer.c
+--- a/criu/page-xfer.c
++++ b/criu/page-xfer.c
+@@ -18,6 +18,7 @@
+ #include "servicefd.h"
+ #include "image.h"
+ #include "page-xfer.h"
++#include "bfd.h"
+ #include "page-pipe.h"
+ #include "util.h"
+ #include "protobuf.h"
+@@ -1952,7 +1953,11 @@ static int page_server_serve(int sk)
+ 		case PS_IOV_FORCE_CLOSE: {
+ 			int32_t status = 0;
+ 
+-			ret = 0;
++			if (receiving_pages) {
++				page_server_close();
++				status = bfd_flush_images();
++			}
++			ret = status;
+ 
+ 			/*
+ 			 * An answer must be sent back to inform another side,
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -1778,6 +1778,9 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
+ 	if (write_img_inventory(&he, parent_ie))
+ 		ret = -1;
+ 
++	if (bfd_flush_images())
++		ret = -1;
++
+ 	if (ret)
+ 		pr_err("Pre-dumping FAILED.\n");
+ 	else {
+diff --git a/scripts/ci/run-ci-tests.sh b/scripts/ci/run-ci-tests.sh
+--- a/scripts/ci/run-ci-tests.sh
++++ b/scripts/ci/run-ci-tests.sh
+@@ -154,6 +154,11 @@ if [ "$WIDTH" -gt 80 ]; then
+ # Just try to run it everywhere for now.
+ time make unittest
+ 
++if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
++	time make -C test/others/remote-parent-experiment check
++	exit 0
++fi
++
+ [ -n "$SKIP_CI_TEST" ] && exit 0
+ 
+ # Umount cpuset in cgroupv1 to make it move to cgroupv2
