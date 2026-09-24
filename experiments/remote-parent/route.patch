@@ -20,7 +20,7 @@ diff --git a/criu/include/page-xfer.h b/criu/include/page-xfer.h
  
  	/*
  	 * Pending pagemap entry for compressed writes.
-@@ -85,6 +86,16 @@ struct page_xfer {
+@@ -85,6 +86,17 @@ struct page_xfer {
  	} pending_pe;
  };
  
