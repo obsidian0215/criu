@@ -1,7 +1,7 @@
 diff --git a/criu/remote-parent.c b/criu/remote-parent.c
 --- a/criu/remote-parent.c
 +++ b/criu/remote-parent.c
-@@ -54,20 +54,19 @@ static int coverage_name(char *buf, size_t size, int fd_type, unsigned long img_
+@@ -54,19 +54,18 @@ static int coverage_name(char *buf, size_t size, int fd_type, unsigned long img_
  {
 -	const char *kind;
  	int ret;
@@ -23,6 +23,10 @@ diff --git a/criu/remote-parent.c b/criu/remote-parent.c
  	if (ret < 0 || (size_t)ret >= size) {
  		errno = ENAMETOOLONG;
  		return -1;
+ 	}
+ 
+ 	return 1;
+ }
 @@ -124,9 +123,23 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
  	base_fd = get_service_fd(IMG_FD_OFF);
  	writer->dirfd = fcntl(base_fd, F_DUPFD_CLOEXEC, 0);
