@@ -2,45 +2,24 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdint.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <sys/resource.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "cr_options.h"
+#include "image-desc.h"
 #include "image.h"
+#include "magic.h"
 #include "page-xfer.h"
+#include "protobuf.h"
 #include "remote-parent.h"
 #include "servicefd.h"
-
-struct coverage_header {
-	uint32_t magic;
-	uint32_t version;
-	uint32_t type;
-	uint32_t reserved;
-	uint64_t id;
-};
-
-struct coverage_range {
-	uint64_t start;
-	uint64_t count;
-};
-
-static void write_image(int dirfd, const void *ranges, size_t size, unsigned int version)
-{
-	struct coverage_header header = { 0x52504352, version, CR_FD_PAGEMAP, 0, 10 };
-	int fd;
-
-	fd = openat(dirfd, "remote-parent-pagemap-10.img", O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	assert(fd >= 0);
-	assert(write(fd, &header, sizeof(header)) == (ssize_t)sizeof(header));
-	assert(write(fd, ranges, size) == (ssize_t)size);
-	assert(!close(fd));
-}
+#include "images/pagemap.pb-c.h"
 
 static void check_empty(int dirfd)
 {
@@ -52,6 +31,65 @@ static void check_empty(int dirfd)
 	while ((entry = readdir(directory)))
 		assert(!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."));
 	assert(!closedir(directory));
+}
+
+static struct cr_img *create_image(int dirfd, const char *name)
+{
+	int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	struct cr_img *image;
+
+	assert(fd >= 0);
+	image = img_from_fd(fd);
+	assert(image);
+	return image;
+}
+
+static void write_test_pagemap(int dirfd, const char *name, int fd_type, u32 common_magic,
+			       u32 image_magic, u32 pages_id, PagemapEntry *entries, size_t nr_entries)
+{
+	PagemapHead head = PAGEMAP_HEAD__INIT;
+	struct cr_img *image = create_image(dirfd, name);
+	size_t i;
+
+	assert(!write_img(image, &common_magic));
+	assert(!write_img(image, &image_magic));
+	head.pages_id = pages_id;
+	assert(pb_write_one(image, &head, PB_PAGEMAP_HEAD) >= 0);
+	for (i = 0; i < nr_entries; i++)
+		assert(pb_write_one(image, &entries[i], PB_PAGEMAP) >= 0);
+	close_image(image);
+}
+
+static void assert_standard_pagemap(int dirfd, const char *name, int fd_type, const u32 *flags,
+				    const uint64_t *vaddrs, size_t nr_entries)
+{
+	PagemapHead *head = NULL;
+	PagemapEntry *entry = NULL;
+	struct cr_img *image;
+	u32 magic;
+	size_t i;
+	int fd;
+
+	fd = openat(dirfd, name, O_RDONLY | O_CLOEXEC);
+	assert(fd >= 0);
+	image = img_from_fd(fd);
+	assert(image);
+	assert(read_img(image, &magic) > 0 && magic == IMG_COMMON_MAGIC);
+	assert(read_img(image, &magic) > 0 && magic == imgset_template[fd_type].magic);
+	assert(pb_read_one(image, &head, PB_PAGEMAP_HEAD) >= 0);
+	assert(head->pages_id == 0);
+	pagemap_head__free_unpacked(head, NULL);
+
+	for (i = 0; i < nr_entries; i++) {
+		assert(pb_read_one_eof(image, &entry, PB_PAGEMAP) > 0);
+		assert(entry->vaddr == vaddrs[i]);
+		assert(entry->has_nr_pages && entry->nr_pages == 1);
+		assert(entry->has_flags && entry->flags == flags[i]);
+		pagemap_entry__free_unpacked(entry, NULL);
+		entry = NULL;
+	}
+	assert(pb_read_one_eof(image, &entry, PB_PAGEMAP) == 0);
+	close_image(image);
 }
 
 /* Exercise failures after a previous writer is already ready to commit. */
@@ -124,13 +162,61 @@ static void test_writer_open_failures(int dirfd)
 	check_empty(dirfd);
 }
 
+static void test_malformed_images(int dirfd)
+{
+	struct remote_parent_coverage *coverage = NULL;
+	PagemapEntry entries[2] = { PAGEMAP_ENTRY__INIT, PAGEMAP_ENTRY__INIT };
+	const char *name = "remote-parent-pagemap-10.img";
+
+	entries[0].vaddr = PAGE_SIZE;
+	entries[0].has_nr_pages = true;
+	entries[0].nr_pages = 1;
+	entries[0].has_flags = true;
+	entries[0].flags = PE_PRESENT;
+
+	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, 0, imgset_template[CR_FD_PAGEMAP].magic,
+			   0, entries, 1);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+
+	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, IMG_COMMON_MAGIC, 0, 0, entries, 1);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+
+	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
+			   imgset_template[CR_FD_PAGEMAP].magic, 1, entries, 1);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+
+	entries[0].nr_pages = 0;
+	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
+			   imgset_template[CR_FD_PAGEMAP].magic, 0, entries, 1);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+
+	entries[0].nr_pages = 1;
+	entries[0].vaddr = 2 * PAGE_SIZE;
+	entries[1] = entries[0];
+	entries[1].vaddr = PAGE_SIZE;
+	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
+			   imgset_template[CR_FD_PAGEMAP].magic, 0, entries, 2);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+
+	assert(!symlinkat("missing", dirfd, name));
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(!unlinkat(dirfd, name, 0));
+	check_empty(dirfd);
+}
+
 void test_remote_parent(void)
 {
 	char path[] = "/tmp/criu-remote-parent.XXXXXX";
 	struct remote_parent_writer *first, *second;
 	struct remote_parent_coverage *coverage = NULL;
-	struct coverage_range ranges[] = { { PAGE_SIZE, 2 }, { 4 * PAGE_SIZE, 1 } };
 	struct iovec iov = { .iov_base = (void *)PAGE_SIZE, .iov_len = PAGE_SIZE };
+	const u32 expected_flags[] = { PE_PRESENT, PE_PARENT, PE_PRESENT };
+	const uint64_t expected_vaddrs[] = { PAGE_SIZE, 2 * PAGE_SIZE, 4 * PAGE_SIZE };
 	int saved_mode = opts.mode;
 	char sentinel[4] = {};
 	int dirfd, fd, i;
@@ -153,6 +239,8 @@ void test_remote_parent(void)
 	remote_parent_writer_close(first);
 	assert(!remote_parent_coverage_exists(dirfd, CR_FD_PAGEMAP, 10));
 	assert(!remote_parent_finish(true));
+	assert_standard_pagemap(dirfd, "remote-parent-pagemap-10.img", CR_FD_PAGEMAP,
+				expected_flags, expected_vaddrs, 3);
 	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) == 1);
 	assert(remote_parent_coverage_contains(coverage, PAGE_SIZE, 2 * PAGE_SIZE));
 	assert(!remote_parent_coverage_contains(coverage, PAGE_SIZE, 3 * PAGE_SIZE));
@@ -166,6 +254,7 @@ void test_remote_parent(void)
 	assert(fd >= 0 && write(fd, "keep", 4) == 4);
 	assert(!close(fd));
 	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
+	iov.iov_base = (void *)PAGE_SIZE;
 	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
 	assert(!remote_parent_writer_open(CR_FD_SHMEM_PAGEMAP, 20, &second));
 	assert(!remote_parent_writer_record(second, &iov, PE_PRESENT));
@@ -191,30 +280,13 @@ void test_remote_parent(void)
 	assert(remote_parent_writer_record(first, &iov, PE_PRESENT) < 0);
 	assert(remote_parent_finish(true) < 0);
 	check_empty(dirfd);
+	iov.iov_len = PAGE_SIZE;
 
-	write_image(dirfd, ranges, sizeof(ranges), 1);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) == 1);
-	remote_parent_coverage_close(coverage);
-	write_image(dirfd, ranges, sizeof(ranges), 2);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
-	write_image(dirfd, ranges, sizeof(ranges) - 1, 1);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
-	ranges[0].count = 0;
-	write_image(dirfd, ranges, sizeof(ranges), 1);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
-	ranges[0].count = UINT64_MAX;
-	write_image(dirfd, ranges, sizeof(ranges), 1);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
-	assert(!unlinkat(dirfd, "remote-parent-pagemap-10.img", 0));
-	assert(!symlinkat("missing", dirfd, "remote-parent-pagemap-10.img"));
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
-	assert(!unlinkat(dirfd, "remote-parent-pagemap-10.img", 0));
-	check_empty(dirfd);
+	test_malformed_images(dirfd);
 
 	/* Shared-image coverage uses offsets, including offset zero. */
 	assert(!remote_parent_writer_open(CR_FD_SHMEM_PAGEMAP, 40, &first));
 	iov.iov_base = NULL;
-	iov.iov_len = PAGE_SIZE;
 	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
 	iov.iov_base = (void *)PAGE_SIZE;
 	assert(!remote_parent_writer_record(first, &iov, PE_PARENT));
