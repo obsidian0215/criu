@@ -11,8 +11,9 @@
 static unsigned char *tracked;
 static unsigned char *control;
 static size_t page_size;
-static unsigned char expected = 0x31;
+static unsigned char generation = 0x31;
 static const char *state_path;
+static const char *expected_path;
 static sigset_t waitset;
 
 static void die(const char *message)
@@ -32,6 +33,29 @@ static bool page_is(const unsigned char *page, unsigned char value)
 	return true;
 }
 
+static unsigned char read_expected(void)
+{
+	char buffer[32];
+	char *end;
+	long value;
+	int fd;
+	ssize_t length;
+
+	fd = open(expected_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		die("open expected");
+	length = read(fd, buffer, sizeof(buffer) - 1);
+	if (length <= 0)
+		die("read expected");
+	if (close(fd))
+		die("close expected");
+	buffer[length] = '\0';
+	value = strtol(buffer, &end, 16);
+	if (end == buffer || value < 0 || value > 0xff)
+		die("parse expected");
+	return (unsigned char)value;
+}
+
 static void write_state(const char *phase, const char *detail)
 {
 	char buffer[512];
@@ -39,8 +63,8 @@ static void write_state(const char *phase, const char *detail)
 	int length;
 
 	length = snprintf(buffer, sizeof(buffer),
-			  "%s pid=%d tracked=%p control=%p expected=%02x %s\n",
-			  phase, getpid(), tracked, control, expected,
+			  "%s pid=%d tracked=%p control=%p generation=%02x %s\n",
+			  phase, getpid(), tracked, control, generation,
 			  detail ? detail : "");
 	if (length < 0 || (size_t)length >= sizeof(buffer))
 		die("snprintf");
@@ -59,13 +83,14 @@ int main(int argc, char **argv)
 {
 	int signal_number;
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s STATE_FILE\n", argv[0]);
+	if (argc != 3) {
+		fprintf(stderr, "usage: %s STATE_FILE EXPECTED_FILE\n", argv[0]);
 		return 2;
 	}
 	if (setsid() < 0)
 		die("setsid");
 	state_path = argv[1];
+	expected_path = argv[2];
 	page_size = (size_t)sysconf(_SC_PAGESIZE);
 	if (!page_size)
 		return 3;
@@ -82,7 +107,7 @@ int main(int argc, char **argv)
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (tracked == MAP_FAILED || control == MAP_FAILED)
 		die("mmap");
-	memset(tracked, expected, page_size);
+	memset(tracked, generation, page_size);
 	memset(control, 0x72, page_size);
 	write_state("READY", "");
 
@@ -90,11 +115,12 @@ int main(int argc, char **argv)
 		if (sigwait(&waitset, &signal_number))
 			die("sigwait");
 		if (signal_number == SIGUSR1) {
-			expected = 0x62;
-			memset(tracked, expected, page_size);
+			generation = 0x62;
+			memset(tracked, generation, page_size);
 			memset(control, 0x83, page_size);
 			write_state("GEN2", "");
 		} else if (signal_number == SIGUSR2) {
+			unsigned char expected = read_expected();
 			bool ok = page_is(tracked, expected) &&
 				  page_is(control, expected == 0x62 ? 0x83 : 0x72);
 			write_state(ok ? "PASS" : "FAIL",
