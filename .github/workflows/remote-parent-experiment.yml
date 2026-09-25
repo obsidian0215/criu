@@ -32,7 +32,21 @@ jobs:
           declaration = '+static int check_parent_server_range(u64 dst_id, struct iovec *iov);\n'
           if text.count(declaration) != 1:
               raise SystemExit('unable to locate parent range declaration')
-          text = text.replace(declaration, declaration + '+static void tcp_nodelay(int sk, bool on);\n', 1)
+          text = text.replace(
+              declaration,
+              declaration
+              + '+static int open_parent(int dfd, int *pfd);\n'
+              + '+static void tcp_nodelay(int sk, bool on);\n',
+              1,
+          )
+          address_check = '+\t    pi->vaddr > ULONG_MAX || pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n'
+          if text.count(address_check) != 1:
+              raise SystemExit('unable to locate parent range address check')
+          text = text.replace(
+              address_check,
+              '+\t    pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n',
+              1,
+          )
           lines = text.splitlines()
           output = []
           index = 0
@@ -125,6 +139,13 @@ jobs:
               cat "$file"
             done
           ' sh {} + 2>/dev/null || true
+          echo '===== query logs ====='
+          sudo find "$root" -path '*/query-work-*/*' -type f \
+            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
           echo '===== lifecycle shm tree ====='
           sudo find "$root" -path '*/lifecycle-work-*/shm/*' \
             -printf '%M %u:%g %s %p -> %l\n' 2>/dev/null | sort || true
@@ -166,7 +187,7 @@ jobs:
           cd "$root"
           shopt -s nullglob
           paths=()
-          for candidate in results fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-*; do
+          for candidate in results query-work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-*; do
             [ -e "$candidate" ] && paths+=("$candidate")
           done
           if ((${#paths[@]})); then
