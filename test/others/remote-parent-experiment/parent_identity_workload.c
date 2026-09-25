@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,24 @@ static bool page_is(const unsigned char *page, unsigned char value)
 			return false;
 	}
 	return true;
+}
+
+static unsigned char *map_page(uintptr_t fixed)
+{
+	void *address = NULL;
+	int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+	if (getenv("PARENT_IDENTITY_FIXED")) {
+#ifdef MAP_FIXED_NOREPLACE
+		address = (void *)fixed;
+		flags |= MAP_FIXED_NOREPLACE;
+#else
+		errno = ENOTSUP;
+		return MAP_FAILED;
+#endif
+	}
+
+	return mmap(address, page_size, PROT_READ | PROT_WRITE, flags, -1, 0);
 }
 
 static unsigned char read_expected(void)
@@ -101,10 +121,8 @@ int main(int argc, char **argv)
 	if (sigprocmask(SIG_BLOCK, &waitset, NULL))
 		die("sigprocmask");
 
-	tracked = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	control = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	tracked = map_page(UINT64_C(0x500000000000));
+	control = map_page(UINT64_C(0x500000010000));
 	if (tracked == MAP_FAILED || control == MAP_FAILED)
 		die("mmap");
 	memset(tracked, generation, page_size);

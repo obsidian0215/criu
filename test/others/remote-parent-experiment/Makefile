@@ -1,6 +1,6 @@
-.PHONY: check check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts clean
+.PHONY: check check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse clean
 
-check: clean check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts
+check: clean check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse
 
 check-splice:
 	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./regression.sh
@@ -26,5 +26,8 @@ check-boundaries:
 check-contracts:
 	bash ./parent-contract-regression.sh
 
+check-pid-reuse:
+	bash ./pid-reuse-regression.sh
+
 clean:
-	rm -rf work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* results
+	rm -rf work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* results
