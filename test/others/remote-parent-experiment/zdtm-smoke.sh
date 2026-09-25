@@ -90,6 +90,15 @@ record() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RESULT_DIR/results.tsv"
 }
 
+start_workload() {
+	local test=$1
+	if [ "$test" = shm ]; then
+		unshare --ipc --fork "$BASE_PAGE_LAUNCHER" make "$test.pid"
+	else
+		"$BASE_PAGE_LAUNCHER" make "$test.pid"
+	fi
+}
+
 run_test() {
 	local test=$1
 	local base="$WORK_ROOT/$test"
@@ -107,7 +116,11 @@ run_test() {
 		record "$test" SKIP "workload unavailable"
 		return
 	fi
-	if ! (cd "$ZDTM_DIR" && "$BASE_PAGE_LAUNCHER" make "$test.pid") >"$base/start.log" 2>&1; then
+	if ! (cd "$ZDTM_DIR" && start_workload "$test") >"$base/start.log" 2>&1; then
+		if [ "$test" = shm ]; then
+			record "$test" FAIL "IPC namespace workload start failed"
+			return 1
+		fi
 		record "$test" SKIP "workload start unsupported"
 		return
 	fi
@@ -116,6 +129,10 @@ run_test() {
 		record "$test" SKIP "workload exited during startup"
 		PID=""
 		return
+	fi
+	if [ "$test" = shm ] && [ "$(readlink "/proc/$PID/ns/ipc")" = "$(readlink /proc/self/ns/ipc)" ]; then
+		record "$test" FAIL "workload did not enter an isolated IPC namespace"
+		return 1
 	fi
 	remote_round pre-dump "$source1" "$target1" || { record "$test" FAIL "first remote pre-dump"; return 1; }
 	remote_round pre-dump "$source2" "$target2" "$source1" "$target1" || { record "$test" FAIL "second remote pre-dump"; return 1; }
