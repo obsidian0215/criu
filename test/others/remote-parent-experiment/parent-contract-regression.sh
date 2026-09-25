@@ -13,6 +13,7 @@ RESULTS="$RESULT_DIR/results.tsv"
 PID=""
 PAGE_SERVER_PID=""
 STATE_FILE=""
+EXPECTED_FILE=""
 SERVER_PORT=""
 FINAL_IMAGE=""
 ORACLE_RESULT=""
@@ -38,7 +39,7 @@ trap cleanup_processes EXIT
 
 failure_logs() {
 	local base=${1:-$WORK_ROOT}
-	find "$base" -type f \( -name '*.log' -o -name '*.state' \) -print -exec sh -c '
+	find "$base" -type f \( -name '*.log' -o -name '*.state' -o -name '*.hex' \) -print -exec sh -c '
 		for file do
 			echo "===== $file ====="
 			tail -n 120 "$file"
@@ -128,7 +129,9 @@ wait_oracle() {
 start_workload() {
 	local base=$1
 	STATE_FILE="$base/workload.state"
-	"$WORKLOAD" "$STATE_FILE" >"$base/workload.log" 2>&1 &
+	EXPECTED_FILE="$base/expected.hex"
+	printf '31\n' > "$EXPECTED_FILE"
+	"$WORKLOAD" "$STATE_FILE" "$EXPECTED_FILE" >"$base/workload.log" 2>&1 &
 	PID=$!
 	wait_phase READY || fail "workload did not become ready in $base"
 	[ "$(field pid)" = "$PID" ] || fail "workload PID mismatch in $base"
@@ -304,6 +307,7 @@ run_generation_skew() {
 	remote_predump "$source_pre1" "$target_pre1"
 	kill -USR1 "$PID" || fail "unable to create second memory generation"
 	wait_phase GEN2 || fail "workload did not create second generation"
+	printf '62\n' > "$EXPECTED_FILE"
 	remote_predump "$source_pre2" "$target_pre2" "$source_pre1" "$target_pre1"
 	probe_tracked "$target_pre2" "$root_pid" "$tracked" present >/dev/null ||
 		fail "second pre-dump did not capture changed tracked page"
