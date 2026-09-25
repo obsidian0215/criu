@@ -18,12 +18,16 @@ case "$ROUTE" in
 	*) echo "invalid route: $ROUTE" >&2; exit 2 ;;
 esac
 
-cleanup_case() {
+stop_server() {
 	if [ -n "$PAGE_SERVER_PID" ] && kill -0 "$PAGE_SERVER_PID" 2>/dev/null; then
 		kill -KILL "$PAGE_SERVER_PID" 2>/dev/null || true
 		wait "$PAGE_SERVER_PID" 2>/dev/null || true
 	fi
 	PAGE_SERVER_PID=""
+}
+
+cleanup_case() {
+	stop_server
 	if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
 		kill -KILL "$PID" 2>/dev/null || true
 	fi
@@ -90,6 +94,15 @@ record() {
 	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RESULT_DIR/results.tsv"
 }
 
+start_workload() {
+	local test=$1
+	if [ "$test" = shm ]; then
+		unshare --ipc --fork "$BASE_PAGE_LAUNCHER" make "$test.pid"
+	else
+		"$BASE_PAGE_LAUNCHER" make "$test.pid"
+	fi
+}
+
 run_test() {
 	local test=$1
 	local base="$WORK_ROOT/$test"
@@ -107,7 +120,11 @@ run_test() {
 		record "$test" SKIP "workload unavailable"
 		return
 	fi
-	if ! (cd "$ZDTM_DIR" && "$BASE_PAGE_LAUNCHER" make "$test.pid") >"$base/start.log" 2>&1; then
+	if ! (cd "$ZDTM_DIR" && start_workload "$test") >"$base/start.log" 2>&1; then
+		if [ "$test" = shm ]; then
+			record "$test" FAIL "IPC namespace workload start failed"
+			return 1
+		fi
 		record "$test" SKIP "workload start unsupported"
 		return
 	fi
@@ -115,6 +132,33 @@ run_test() {
 	if ! kill -0 "$PID" 2>/dev/null; then
 		record "$test" SKIP "workload exited during startup"
 		PID=""
+		return
+	fi
+	if [ "$test" = shm ] && [ "$(readlink "/proc/$PID/ns/ipc")" = "$(readlink /proc/self/ns/ipc)" ]; then
+		record "$test" FAIL "workload did not enter an isolated IPC namespace"
+		return 1
+	fi
+	if [ "$test" = vfork00 ]; then
+		if remote_round pre-dump "$source1" "$target1"; then
+			record "$test" FAIL "blocked vfork unexpectedly pre-dumped"
+			return 1
+		fi
+		stop_server
+		if ! grep -q "Unseizable non-zombie" "$source1/dump.log"; then
+			record "$test" FAIL "blocked vfork failed for an unexpected reason"
+			return 1
+		fi
+		if ! kill -0 "$PID" 2>/dev/null; then
+			record "$test" FAIL "blocked vfork workload died after rejection"
+			PID=""
+			return 1
+		fi
+		if ! (cd "$ZDTM_DIR" && make "$test.stop" && grep PASS "$test.out") >"$base/stop.log" 2>&1; then
+			record "$test" FAIL "blocked vfork rejection damaged workload"
+			return 1
+		fi
+		PID=""
+		record "$test" PASS "blocked vfork safely rejected"
 		return
 	fi
 	remote_round pre-dump "$source1" "$target1" || { record "$test" FAIL "first remote pre-dump"; return 1; }
