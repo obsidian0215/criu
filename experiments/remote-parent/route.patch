@@ -27,7 +27,7 @@ diff --git a/criu/remote-parent.c b/criu/remote-parent.c
  
  	return 1;
  }
-@@ -124,9 +123,23 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
+@@ -124,9 +123,24 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
  	base_fd = get_service_fd(IMG_FD_OFF);
  	writer->dirfd = fcntl(base_fd, F_DUPFD_CLOEXEC, 0);
  	if (writer->dirfd < 0) {
