@@ -1,6 +1,6 @@
-.PHONY: check check-splice check-read check-mixed check-lz4 check-faults check-lifecycle clean
+.PHONY: check check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries clean
 
-check: clean check-splice check-read check-mixed check-lz4 check-faults check-lifecycle
+check: clean check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries
 
 check-splice:
 	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./regression.sh
@@ -20,5 +20,8 @@ check-faults:
 check-lifecycle:
 	bash ./zdtm-smoke.sh
 
+check-boundaries:
+	bash ./parentless-regression.sh
+
 clean:
-	rm -rf work-* fault-work-* lifecycle-work-* results
+	rm -rf work-* fault-work-* lifecycle-work-* boundary-work-* results
