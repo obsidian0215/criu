@@ -50,9 +50,9 @@ static void write_state(const char *phase, const char *detail)
 	int length;
 
 	length = snprintf(buffer, sizeof(buffer),
-			  "%s pid=%d child=%d hidden=%p stable=%p remapped=%p new=%p %s\n",
-			  phase, getpid(), child_pid, hidden, stable, remapped,
-			  new_mapping, detail ? detail : "");
+			  "%s pid=%d sid=%d child=%d hidden=%p stable=%p remapped=%p new=%p %s\n",
+			  phase, getpid(), getsid(0), child_pid, hidden, stable,
+			  remapped, new_mapping, detail ? detail : "");
 	if (length < 0 || (size_t)length >= sizeof(buffer))
 		die("snprintf");
 	fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -157,6 +157,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s STATE_FILE\n", argv[0]);
 		return 2;
 	}
+	if (setsid() < 0)
+		die("setsid");
 	state_path = argv[1];
 	page_size = (size_t)sysconf(_SC_PAGESIZE);
 	if (!page_size)
