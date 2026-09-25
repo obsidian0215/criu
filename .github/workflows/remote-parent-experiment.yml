@@ -29,10 +29,10 @@ jobs:
           path = Path(sys.argv[1])
           text = path.read_text()
           text = text.replace('page_xfer_has_parent', 'page_xfer_parent_available')
-          declaration = 'static int check_parent_server_range(u64 dst_id, struct iovec *iov);\n'
+          declaration = '+static int check_parent_server_range(u64 dst_id, struct iovec *iov);\n'
           if text.count(declaration) != 1:
               raise SystemExit('unable to locate parent range declaration')
-          text = text.replace(declaration, declaration + 'static void tcp_nodelay(int sk, bool on);\n', 1)
+          text = text.replace(declaration, declaration + '+static void tcp_nodelay(int sk, bool on);\n', 1)
           lines = text.splitlines()
           output = []
           index = 0
