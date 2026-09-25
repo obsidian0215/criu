@@ -34,9 +34,7 @@ jobs:
               raise SystemExit('unable to locate parent range declaration')
           text = text.replace(
               declaration,
-              declaration
-              + '+static int open_parent(int dfd, int *pfd);\n'
-              + '+static void tcp_nodelay(int sk, bool on);\n',
+              declaration + '+static void tcp_nodelay(int sk, bool on);\n',
               1,
           )
           address_check = '+\t    pi->vaddr > ULONG_MAX || pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n'
