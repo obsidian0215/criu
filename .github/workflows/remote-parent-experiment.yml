@@ -35,10 +35,13 @@ jobs:
           fi
 
           '''
-          if early not in text:
-              if marker not in text:
-                  raise SystemExit('unable to locate unit-test marker')
-              path.write_text(text.replace(marker, early + marker, 1))
+          text = text.replace(early, '')
+          if text.count(marker) != 1:
+              raise SystemExit('unable to locate unique unit-test marker')
+          text = text.replace(marker, early + marker, 1)
+          if text.count(early) != 1:
+              raise SystemExit('unable to install unique experiment entry point')
+          path.write_text(text)
           PY
           git diff --check
       - name: Run targeted validation
