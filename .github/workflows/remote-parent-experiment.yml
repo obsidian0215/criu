@@ -64,7 +64,10 @@ jobs:
               raise SystemExit('unable to install compression-aware first-payload assertion')
           regression_path.write_text(regression_text)
           PY
-          bash -n test/others/remote-parent-experiment/regression.sh
+          for script in test/others/remote-parent-experiment/*.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile test/others/remote-parent-experiment/*.py
           git diff --check
       - name: Run targeted validation
         run: |
@@ -80,5 +83,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}
-          path: test/others/remote-parent-experiment/results
+          path: |
+            test/others/remote-parent-experiment/results
+            test/others/remote-parent-experiment/fault-work-*
+            test/others/remote-parent-experiment/lifecycle-work-*
           if-no-files-found: warn
