@@ -78,13 +78,53 @@ jobs:
           else
             sudo -E make -C scripts/ci alpine GCC=1 ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
           fi
-      - name: Upload experiment results
+      - name: Print failure diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
+          echo '===== result summaries ====='
+          sudo find "$root/results" -maxdepth 3 -type f -print -exec sh -c '
+            for file do
+              echo "===== $file ====="
+              cat "$file"
+            done
+          ' sh {} + 2>/dev/null || true
+          echo '===== lifecycle shm tree ====='
+          sudo find "$root" -path '*/lifecycle-work-*/shm/*' \
+            -printf '%M %u:%g %s %p -> %l\n' 2>/dev/null | sort || true
+          echo '===== lifecycle shm logs ====='
+          sudo find "$root" -path '*/lifecycle-work-*/shm/*' -type f \
+            \( -name '*.log' -o -name '*.out' -o -name '*.txt' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
+      - name: Package experiment diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
+          archive="$RUNNER_TEMP/remote-parent-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
+          cd "$root"
+          shopt -s nullglob
+          paths=(results fault-work-* lifecycle-work-*)
+          if ((${#paths[@]})); then
+            sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
+              sudo tar --null -czf "$archive" --files-from=-
+          else
+            tar -czf "$archive" --files-from=/dev/null
+          fi
+          sudo chown "$(id -u):$(id -g)" "$archive"
+          chmod a+r "$archive"
+          test -r "$archive"
+          printf 'DIAGNOSTIC_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+      - name: Upload experiment diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}
-          path: |
-            test/others/remote-parent-experiment/results
-            test/others/remote-parent-experiment/fault-work-*
-            test/others/remote-parent-experiment/lifecycle-work-*
-          if-no-files-found: warn
+          path: ${{ env.DIAGNOSTIC_ARCHIVE }}
+          if-no-files-found: error
