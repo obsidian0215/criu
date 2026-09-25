@@ -154,7 +154,8 @@ run_case() {
 	wait_server
 	grep -q TEST_FAULT "$base/server.log" "$base/source.log" ||
 		fail "$label injection did not execute"
-	if compgen -G "$source/.remote-parent-*.tmp.*" >/dev/null; then
+	if compgen -G "$source/.remote-parent-*.tmp.*" >/dev/null ||
+	   compgen -G "$source/.pagemap-*.img.tmp.*" >/dev/null; then
 		fail "$label left temporary parent metadata"
 	fi
 	kill -0 "$PID" 2>/dev/null || fail "$label did not resume workload"
