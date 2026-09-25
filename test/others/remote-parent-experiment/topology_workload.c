@@ -31,6 +31,7 @@ static unsigned char *reserved;
 static unsigned char *original_region;
 static size_t region_size;
 static uint64_t seed;
+static bool region_zeroed;
 static pid_t child_pid = -1;
 static uintptr_t child_address;
 static size_t child_size;
@@ -72,6 +73,21 @@ static bool verify_region(const unsigned char *base, size_t size, uint64_t value
 		const uint64_t *last = (const uint64_t *)(base + (page + 1) * page_size - sizeof(value));
 
 		if (*first != value || *last != ~value)
+			return false;
+	}
+	return true;
+}
+
+static bool verify_zero_region(const unsigned char *base, size_t size)
+{
+	size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+	size_t pages = size / page_size;
+
+	for (size_t page = 0; page < pages; page++) {
+		const uint64_t *first = (const uint64_t *)(base + page * page_size);
+		const uint64_t *last = (const uint64_t *)(base + (page + 1) * page_size - sizeof(*last));
+
+		if (*first || *last)
 			return false;
 	}
 	return true;
@@ -119,9 +135,10 @@ static void publish_state(const char *phase)
 	int ret = snprintf(text, sizeof(text),
 		"pid=%d\nphase=%s\nmode=%s\naddress=%" PRIuPTR "\n"
 		"original_address=%" PRIuPTR "\nreserved_address=%" PRIuPTR "\n"
-		"size=%zu\nchild=%d\nchild_address=%" PRIuPTR "\nchild_size=%zu\n",
+		"size=%zu\nzeroed=%d\nchild=%d\nchild_address=%" PRIuPTR "\nchild_size=%zu\n",
 		getpid(), phase, mode, (uintptr_t)region, (uintptr_t)original_region,
-		(uintptr_t)reserved, region_size, child_pid, child_address, child_size);
+		(uintptr_t)reserved, region_size, region_zeroed, child_pid, child_address,
+		child_size);
 
 	if (ret < 0 || (size_t)ret >= sizeof(text)) {
 		errno = EOVERFLOW;
@@ -230,7 +247,10 @@ static void create_child(void)
 static void relocate_region(void)
 {
 	unsigned char *target = reserved;
+	volatile unsigned char *touch;
+	unsigned char checksum = 0;
 	void *moved;
+	size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
 
 	if (munmap(reserved, region_size))
 		die("munmap reserved target");
@@ -244,12 +264,30 @@ static void relocate_region(void)
 		errno = EILSEQ;
 		die("verify relocated region");
 	}
+
+	/*
+	 * MADV_DONTNEED discards the moved anonymous pages. Read-faulting them
+	 * back produces clean zero pages, so a final incremental dump cannot
+	 * rely on soft-dirty alone to prove that the old parent covers the new
+	 * virtual address range.
+	 */
+	if (madvise(region, region_size, MADV_DONTNEED))
+		die("madvise relocated region");
+	touch = region;
+	for (size_t offset = 0; offset < region_size; offset += page_size)
+		checksum |= touch[offset];
+	if (checksum || !verify_zero_region(region, region_size)) {
+		errno = EILSEQ;
+		die("verify discarded region");
+	}
+	region_zeroed = true;
 	publish_state("mutated");
 }
 
 static void finish_parent(void)
 {
-	bool good = verify_region(region, region_size, seed);
+	bool good = region_zeroed ? verify_zero_region(region, region_size) :
+					  verify_region(region, region_size, seed);
 
 	if (child_pid > 0) {
 		int status = 0;

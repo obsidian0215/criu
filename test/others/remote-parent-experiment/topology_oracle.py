@@ -7,6 +7,9 @@ from pathlib import Path
 import struct
 import sys
 
+TOP = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(TOP / 'lib'))
+
 PE_PARENT = 1
 PE_PRESENT = 4
 
