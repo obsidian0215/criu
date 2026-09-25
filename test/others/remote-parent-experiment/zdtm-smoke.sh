@@ -91,9 +91,14 @@ record() {
 }
 
 run_test() {
-	local test=$1 base="$WORK_ROOT/$test"
-	local source1="$base/source1" source2="$base/source2" sourcef="$base/source-final"
-	local target1="$base/target1" target2="$base/target2" targetf="$base/target-final"
+	local test=$1
+	local base="$WORK_ROOT/$test"
+	local source1="$base/source1"
+	local source2="$base/source2"
+	local sourcef="$base/source-final"
+	local target1="$base/target1"
+	local target2="$base/target2"
+	local targetf="$base/target-final"
 	cleanup_case
 	rm -rf "$base"
 	mkdir -p "$base"
