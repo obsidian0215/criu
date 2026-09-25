@@ -183,6 +183,7 @@ probe() {
 run_inner() {
 	local source_pre="$WORK_ROOT/source-pre"
 	local target_pre="$WORK_ROOT/target-pre"
+	local reset_pre="$WORK_ROOT/reset-pre"
 	local source_final="$WORK_ROOT/source-final"
 	local target_final="$WORK_ROOT/target-final"
 	local tracked control final_class phase
@@ -214,7 +215,12 @@ run_inner() {
 	start_generation 31 1
 	[ "$(field tracked)" = "$tracked" ] || fail "reused process did not map tracked page at the same address"
 	[ "$(field control)" = "$control" ] || fail "reused process did not map control page at the same address"
-	printf '4\n' > "/proc/$PID/clear_refs" || skip "soft-dirty reset is unavailable"
+	mkdir -p "$reset_pre"
+	if ! "${CRIU_CMD[@]}" pre-dump --pre-dump-mode splice -D "$reset_pre" -o dump.log \
+		-t "$PID" -v4 --track-mem; then
+		fail "throwaway pre-dump could not reset reused-task dirty tracking"
+	fi
+	kill -0 "$PID" 2>/dev/null || fail "throwaway pre-dump stopped the reused task"
 
 	mkdir -p "$source_final" "$target_final"
 	if [ "$ROUTE" = final-page-server ]; then
