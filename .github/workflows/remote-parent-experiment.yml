@@ -101,6 +101,13 @@ jobs:
               echo "===== $file ====="
               sudo tail -n 500 "$file" || true
             done
+          echo '===== relocation logs ====='
+          sudo find "$root" -path '*/relocation-work-*/*' -type f \
+            \( -name '*.log' -o -name '*.json' -o -name '*.state' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
       - name: Package experiment diagnostics
         if: always()
         shell: bash
@@ -110,7 +117,7 @@ jobs:
           archive="$RUNNER_TEMP/remote-parent-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
           cd "$root"
           shopt -s nullglob
-          paths=(results fault-work-* lifecycle-work-*)
+          paths=(results fault-work-* lifecycle-work-* relocation-work-*)
           if ((${#paths[@]})); then
             sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
               sudo tar --null -czf "$archive" --files-from=-
