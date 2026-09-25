@@ -38,12 +38,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail_harness() {
-	printf 'HARNESS-FAIL: %s\n' "$*" >&2
-	write_summary HARNESS_FAIL "$*"
-	exit 1
-}
-
 json_escape() {
 	python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
 }
@@ -63,6 +57,39 @@ write_summary() {
 }
 EOF_JSON
 	printf '%s\t%s\t%s\t%s\n' "$ROUTE" "$status" "$FINAL_CLASS" "$detail" > "$RESULT_DIR/result.tsv"
+}
+
+failure_logs() {
+	local file
+	for file in \
+		"$WORK_DIR/source-final/dump.log" \
+		"$WORK_DIR/target-final/page-server.log" \
+		"$WORK_DIR/target-final/server-command.log"; do
+		[ -f "$file" ] || continue
+		echo "===== $file =====" >&2
+		tail -n 120 "$file" >&2 || true
+	done
+}
+
+fail_harness() {
+	printf 'HARNESS-FAIL: %s\n' "$*" >&2
+	failure_logs
+	write_summary HARNESS_FAIL "$*"
+	exit 1
+}
+
+expected_parent_rejection() {
+	local file
+	for file in \
+		"$WORK_DIR/source-final/dump.log" \
+		"$WORK_DIR/target-final/page-server.log" \
+		"$WORK_DIR/target-final/server-command.log"; do
+		[ -f "$file" ] || continue
+		if grep -Eq 'Hole [^ ]+/[0-9a-fA-F]+ not found in parent' "$file"; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 free_port() {
@@ -208,13 +235,15 @@ case "$ROUTE" in
 esac
 
 if [ "$FINAL_OK" -ne 1 ]; then
-	if kill -0 "$PID" 2>/dev/null; then
-		write_summary SAFE_REJECT "final dump rejected a parent hole absent from the remote pre-dump and resumed the workload"
+	if kill -0 "$PID" 2>/dev/null && expected_parent_rejection; then
+		write_summary SAFE_REJECT "final dump rejected a page range absent from the remote parent and resumed the workload"
 		printf 'BOUNDARY SAFE_REJECT route=%s\n' "$ROUTE"
 		exit 0
 	fi
-	write_summary HARNESS_FAIL "final dump failed and workload was not resumed"
-	exit 1
+	if ! kill -0 "$PID" 2>/dev/null; then
+		fail_harness "final dump failed and workload was not resumed"
+	fi
+	fail_harness "final dump failed for a reason other than an expected parent-range rejection"
 fi
 PID=""
 FINAL_CLASS=$(PYTHONPATH="$TOP/lib${PYTHONPATH:+:$PYTHONPATH}" python3 "$PROBE" "$FINAL_IMAGE" "$(field pid)" "$HIDDEN") ||
