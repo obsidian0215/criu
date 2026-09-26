@@ -43,4 +43,6 @@ message inventory_entry {
 	optional uint32			compress = 15;
 	/* Block size in bytes when compress = 1. Informational. */
 	optional uint32			compress_block_size = 16;
+	/* A completed page-server pre-dump can be used as a remote parent. */
+	optional bool			pages_on_page_server = 17;
 }
