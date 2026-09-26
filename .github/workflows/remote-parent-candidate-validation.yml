@@ -29,12 +29,7 @@ jobs:
           p = Path('scripts/ci/run-ci-tests.sh')
           s = p.read_text()
           marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
-          hook = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
-\ttime make -C test/others/remote-parent-experiment check
-\texit 0
-fi
-
-'''
+          hook = 'if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then\\n\\ttime make -C test/others/remote-parent-experiment check\\n\\texit 0\\nfi\\n\\n'
           if s.count(marker) != 1:
               raise SystemExit('unable to locate unique unit-test marker')
           if hook not in s:
