@@ -52,6 +52,7 @@ def relay_server(target, source, close_seen, stop, counts):
             if not data:
                 break
             if close_seen.is_set():
+                counts['close_response_dropped'] = True
                 break
             source.sendall(data)
             total += len(data)
@@ -72,7 +73,11 @@ def main():
     parser.add_argument('--ready', type=Path, required=True)
     args = parser.parse_args()
 
-    counts = {'source_to_server': 0, 'server_to_source': 0}
+    counts = {
+        'source_to_server': 0,
+        'server_to_source': 0,
+        'close_response_dropped': False,
+    }
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(('127.0.0.1', args.listen_port))
