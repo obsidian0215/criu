@@ -7,7 +7,9 @@ import threading
 from pathlib import Path
 
 FRAME_SIZE = 32
+PARENT_RANGE_SIZE = 16
 PS_CMD_MASK = (1 << 16) - 1
+PS_IOV_PARENT_RANGES = 9
 PS_IOV_CLOSE = 0x1023
 PS_IOV_FORCE_CLOSE = 0x1024
 
@@ -22,6 +24,7 @@ def shutdown(sock):
 def relay_source(source, target, close_seen, stop, counts):
     total = 0
     pending = bytearray()
+    payload_remaining = 0
     try:
         while not stop.is_set():
             data = source.recv(65536)
@@ -30,11 +33,27 @@ def relay_source(source, target, close_seen, stop, counts):
             target.sendall(data)
             total += len(data)
             pending.extend(data)
-            while len(pending) >= FRAME_SIZE:
+
+            while pending:
+                if payload_remaining:
+                    consumed = min(payload_remaining, len(pending))
+                    del pending[:consumed]
+                    payload_remaining -= consumed
+                    if payload_remaining:
+                        break
+                    continue
+
+                if len(pending) < FRAME_SIZE:
+                    break
+
                 frame = bytes(pending[:FRAME_SIZE])
                 del pending[:FRAME_SIZE]
                 command = struct.unpack_from('=I', frame)[0] & PS_CMD_MASK
-                if command in (PS_IOV_CLOSE, PS_IOV_FORCE_CLOSE):
+
+                if command == PS_IOV_PARENT_RANGES:
+                    nr_ranges = struct.unpack_from('=Q', frame, 8)[0]
+                    payload_remaining = nr_ranges * PARENT_RANGE_SIZE
+                elif command in (PS_IOV_CLOSE, PS_IOV_FORCE_CLOSE):
                     close_seen.set()
     except OSError:
         pass
