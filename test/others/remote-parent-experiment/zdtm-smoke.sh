@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 TOP=$(cd "$SCRIPT_DIR/../../.." && pwd)
 ROUTE=$(cat "$TOP/experiments/remote-parent/route")
 CRIU_CMD=("$TOP/criu/criu" --no-default-config)
+QUERY_FINAL="$SCRIPT_DIR/query-final-dump.sh"
 ZDTM_DIR="$TOP/test/zdtm/static"
 WORK_ROOT="$SCRIPT_DIR/lifecycle-work-$ROUTE"
 RESULT_DIR="$SCRIPT_DIR/results/lifecycle"
@@ -112,6 +113,7 @@ run_test() {
 	local target1="$base/target1"
 	local target2="$base/target2"
 	local targetf="$base/target-final"
+	local queryf="$base/query-final"
 	cleanup_case
 	rm -rf "$base"
 	mkdir -p "$base"
@@ -166,6 +168,14 @@ run_test() {
 	if [ "$ROUTE" = final-page-server ]; then
 		remote_round dump "$sourcef" "$targetf" "$source2" "$target2" || { record "$test" FAIL "remote final dump"; return 1; }
 		copy_non_memory "$sourcef" "$targetf"
+	elif [ "$ROUTE" = local-no-parent ]; then
+		if ! bash "$QUERY_FINAL" "$PID" "$sourcef" "$source2" "$queryf" "$target2"; then
+			record "$test" FAIL "query-backed local final dump"
+			return 1
+		fi
+		cp -a "$sourcef/." "$targetf/"
+		rm -f "$targetf/parent"
+		ln -s ../target2 "$targetf/parent"
 	else
 		mkdir -p "$sourcef" "$targetf"
 		"${CRIU_CMD[@]}" dump -D "$sourcef" -o dump.log -t "$PID" -v4 --track-mem \
@@ -193,7 +203,7 @@ printf 'test\tstatus\tdetail\n' > "$RESULT_DIR/results.tsv"
 for test in cow00 maps00 shm vfork00; do
 	run_test "$test"
 done
-record pid-reuse SKIP "deterministic PID reuse not established in this runner"
+record pid-reuse SKIP "covered by the dedicated deterministic pid-reuse test"
 
 python3 - "$ROUTE" "$RESULT_DIR/results.tsv" "$RESULT_DIR/summary.json" <<'PY'
 import csv, json, sys
