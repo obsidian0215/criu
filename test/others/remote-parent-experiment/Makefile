@@ -6,16 +6,16 @@ check-query:
 	bash ./remote-parent-query-regression.sh
 
 check-splice:
-	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./regression.sh
+	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
 
 check-read:
-	PRE_DUMP_SEQUENCE=read REMOTE_PARENT_COMPRESSION=plain bash ./regression.sh
+	PRE_DUMP_SEQUENCE=read REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
 
 check-mixed:
-	PRE_DUMP_SEQUENCE=mixed REMOTE_PARENT_COMPRESSION=plain bash ./regression.sh
+	PRE_DUMP_SEQUENCE=mixed REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
 
 check-lz4:
-	PRE_DUMP_SEQUENCE=mixed REMOTE_PARENT_COMPRESSION=lz4 bash ./regression.sh
+	PRE_DUMP_SEQUENCE=mixed REMOTE_PARENT_COMPRESSION=lz4 bash ./query-matrix-regression.sh
 
 check-faults:
 	bash ./fault-regression.sh
@@ -36,4 +36,4 @@ check-relocation:
 	bash ./relocation-regression.sh || python3 ./accept-zero-relocation.py results/relocation/summary.json
 
 clean:
-	rm -rf work-* query-work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
+	rm -rf work-* query-work-* query-matrix-work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
