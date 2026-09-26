@@ -151,6 +151,8 @@ int main(int argc, char **argv)
 		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (region == MAP_FAILED)
 		die("mmap");
+	if (madvise(region, REGION_SIZE, MADV_NOHUGEPAGE))
+		die("madvise MADV_NOHUGEPAGE");
 	for (page = 0; page < nr_pages; page++)
 		set_page(page, initial_value(page));
 
