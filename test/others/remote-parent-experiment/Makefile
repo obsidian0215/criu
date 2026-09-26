@@ -1,6 +1,6 @@
-.PHONY: check check-query check-missing-range check-disconnects check-close-ack check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation clean
+.PHONY: check check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation clean
 
-check: clean check-query check-missing-range check-disconnects check-close-ack check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation
+check: clean check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation
 
 check-query:
 	bash ./remote-parent-query-regression.sh
@@ -13,6 +13,9 @@ check-disconnects:
 
 check-close-ack:
 	bash ./query-close-ack-regression.sh
+
+check-scaling:
+	REMOTE_PARENT_QUERY_EXPECTATION=per-range bash ./query-scaling-regression.sh
 
 check-splice:
 	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
@@ -48,4 +51,4 @@ check-relocation:
 	bash ./query-relocation-regression.sh
 
 clean:
-	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* local-parent-contract-work* query-missing-range-work* query-disconnect-work* query-close-ack-work* query-relocation-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
+	rm -rf work-* query-work-* query-matrix-work-* query-scaling-work* query-contract-work* local-parent-contract-work* query-missing-range-work* query-disconnect-work* query-close-ack-work* query-relocation-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
