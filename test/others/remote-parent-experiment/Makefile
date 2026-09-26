@@ -1,6 +1,6 @@
-.PHONY: check check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation clean
+.PHONY: check check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation clean
 
-check: clean check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation
+check: clean check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation
 
 check-query:
 	bash ./remote-parent-query-regression.sh
@@ -35,6 +35,9 @@ check-boundaries:
 check-contracts:
 	bash ./query-parent-contract-regression.sh
 
+check-local-contract:
+	bash ./local-parent-contract-baseline.sh
+
 check-pid-reuse:
 	bash ./pid-reuse-regression.sh
 
@@ -42,4 +45,4 @@ check-relocation:
 	bash ./query-relocation-regression.sh
 
 clean:
-	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* query-missing-range-work* query-disconnect-work* query-relocation-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
+	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* local-parent-contract-work* query-missing-range-work* query-disconnect-work* query-relocation-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
