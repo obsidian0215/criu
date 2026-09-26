@@ -1,0 +1,202 @@
+name: Remote parent experiment
+
+on:
+  push:
+    branches:
+      - 'exp/remote-parent-route-*'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Apply route implementation and strict test fixes
+        run: |
+          set -euxo pipefail
+          patch=experiments/remote-parent/route.patch
+          test -s "$patch"
+          python3 - "$patch" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          text = text.replace('page_xfer_has_parent',
+                              'page_xfer_parent_available')
+          declaration = ('+static int check_parent_server_range('
+                         'u64 dst_id, struct iovec *iov);\n')
+          if text.count(declaration) != 1:
+              raise SystemExit('unable to locate parent range declaration')
+          text = text.replace(
+              declaration,
+              declaration + '+static void tcp_nodelay(int sk, bool on);\n',
+              1,
+          )
+          address_check = ('+\t    pi->vaddr > ULONG_MAX || '
+                           'pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n')
+          if text.count(address_check) != 1:
+              raise SystemExit('unable to locate parent range address check')
+          text = text.replace(
+              address_check,
+              '+\t    pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n',
+              1,
+          )
+          lines = text.splitlines()
+          output = []
+          index = 0
+          header = re.compile(
+              r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$')
+          while index < len(lines):
+              line = lines[index]
+              match = header.match(line)
+              if not match:
+                  output.append(line)
+                  index += 1
+                  continue
+              body = []
+              index += 1
+              while (index < len(lines)
+                     and not lines[index].startswith('@@ ')
+                     and not lines[index].startswith('diff --git ')):
+                  body.append(lines[index])
+                  index += 1
+              old_count = sum(
+                  item.startswith((' ', '-'))
+                  for item in body
+                  if not item.startswith('\\ No newline')
+              )
+              new_count = sum(
+                  item.startswith((' ', '+'))
+                  for item in body
+                  if not item.startswith('\\ No newline')
+              )
+              output.append(
+                  f'@@ -{match.group(1)},{old_count} '
+                  f'+{match.group(2)},{new_count} @@{match.group(3)}'
+              )
+              output.extend(body)
+          path.write_text('\n'.join(output) + '\n')
+          PY
+          git apply --check "$patch"
+          git apply "$patch"
+          for followup in experiments/remote-parent/route-*.patch; do
+            test -s "$followup"
+            git apply --check "$followup"
+            git apply "$followup"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+
+          ci_path = Path('scripts/ci/run-ci-tests.sh')
+          ci_text = ci_path.read_text()
+          marker = ('# Unit tests at this point do not require any kernel '
+                    'or hardware capabilities.\n')
+          early = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
+          \ttime make -C test/others/remote-parent-experiment check
+          \texit 0
+          fi
+
+          '''
+          ci_text = ci_text.replace(early, '')
+          if ci_text.count(marker) != 1:
+              raise SystemExit('unable to locate unique unit-test marker')
+          ci_text = ci_text.replace(marker, early + marker, 1)
+          if ci_text.count(early) != 1:
+              raise SystemExit('unable to install unique experiment entry point')
+          ci_path.write_text(ci_text)
+
+          regression_path = Path(
+              'test/others/remote-parent-experiment/regression.sh')
+          regression_text = regression_path.read_text()
+          old = '''PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
+          [ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
+          '''
+          new = '''PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
+          if [ "$COMPRESSION" = plain ]; then
+          \t[ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
+          else
+          \t[ "$PRE1_PAYLOAD" -gt 0 ] || fail "first compressed pre-dump has no payload"
+          \tgrep -q "page-xfer: Adding compressed" "$TARGET_PRE1/page-server.log" ||
+          \t\tfail "first pre-dump did not record compressed page ranges"
+          fi
+          '''
+          if regression_text.count(old) != 1:
+              raise SystemExit('unable to locate unique payload assertion')
+          regression_text = regression_text.replace(old, new, 1)
+          regression_path.write_text(regression_text)
+          PY
+          for script in test/others/remote-parent-experiment/*.sh; do
+            bash -n "$script"
+          done
+          python3 -m py_compile test/others/remote-parent-experiment/*.py
+          git diff --check
+      - name: Run targeted validation
+        run: |
+          set -euxo pipefail
+          printf '\nREMOTE_PARENT_EXPERIMENT=1\n' >> scripts/ci/docker.env
+          if [ '${{ matrix.compiler }}' = clang ]; then
+            sudo -E make -C scripts/ci alpine CLANG=1 \
+              ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+          else
+            sudo -E make -C scripts/ci alpine GCC=1 \
+              ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+          fi
+      - name: Print failure diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
+          echo '===== result summaries ====='
+          sudo find "$root/results" -maxdepth 4 -type f -print -exec sh -c '
+            for file do
+              echo "===== $file ====="
+              cat "$file"
+            done
+          ' sh {} + 2>/dev/null || true
+          echo '===== retained work logs ====='
+          sudo find "$root" -maxdepth 6 -type f \
+            \( -path '*work*' -o -path '*/results/*' \) \
+            \( -name '*.log' -o -name '*.out' -o -name '*.state' \
+               -o -name '*.json' -o -name '*.hex' -o -name '*.tsv' \) \
+            -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
+      - name: Package experiment diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
+          archive="$RUNNER_TEMP/remote-parent-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
+          cd "$root"
+          mapfile -d '' paths < <(
+            find . -maxdepth 1 -type d \
+              \( -name 'results' -o -name '*work*' \) -print0
+          )
+          if ((${#paths[@]})); then
+            sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
+              sudo tar --null -czf "$archive" --files-from=-
+          else
+            tar -czf "$archive" --files-from=/dev/null
+          fi
+          sudo chown "$(id -u):$(id -g)" "$archive"
+          chmod a+r "$archive"
+          test -r "$archive"
+          printf 'DIAGNOSTIC_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+      - name: Upload experiment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}
+          path: ${{ env.DIAGNOSTIC_ARCHIVE }}
+          if-no-files-found: error

@@ -1,0 +1,410 @@
+diff --git a/images/inventory.proto b/images/inventory.proto
+--- a/images/inventory.proto
++++ b/images/inventory.proto
+@@ -45,5 +45,7 @@ message inventory_entry {
+ 	 */
+ 	optional uint32			compress = 15;
+ 	/* Block size in bytes when compress = 1. Informational. */
+ 	optional uint32			compress_block_size = 16;
++	/* A completed page-server pre-dump can be used as a remote parent. */
++	optional bool			pages_on_page_server = 17;
+ }
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -153,5 +153,6 @@ struct cr_options {
+ 	char *libdir;
+ 	int use_page_server;
++	int parent_page_server;
+ 	unsigned short port;
+ 	char *addr;
+ 	int ps_socket;
+diff --git a/criu/config.c b/criu/config.c
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -704,6 +704,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT(OPT_SHELL_JOB, &opts.shell_job),
+ 		BOOL_OPT(OPT_FILE_LOCKS, &opts.handle_file_locks),
+ 		BOOL_OPT("page-server", &opts.use_page_server),
++		BOOL_OPT("page-server-parent", &opts.parent_page_server),
+ 		{ "address", required_argument, 0, 1051 },
+ 		{ "port", required_argument, 0, 1052 },
+ 		{ "prev-images-dir", required_argument, 0, 1053 },
+diff --git a/criu/include/page-xfer.h b/criu/include/page-xfer.h
+--- a/criu/include/page-xfer.h
++++ b/criu/include/page-xfer.h
+@@ -64,4 +64,7 @@ struct page_xfer {
+ 	};
+ 
+ 	struct page_read *parent;
++	bool has_parent;
++	bool remote_parent;
++	u64 parent_dst_id;
+ 
+@@ -85,5 +88,11 @@ struct page_xfer {
+ 	} pending_pe;
+ };
+ 
++static inline bool page_xfer_has_parent(const struct page_xfer *xfer)
++{
++	return xfer->has_parent;
++}
++
++extern void page_xfer_use_remote_parent(struct page_xfer *xfer, int fd_type, unsigned long id);
+ extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
+ struct page_pipe;
+ extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
+diff --git a/criu/page-xfer.c b/criu/page-xfer.c
+--- a/criu/page-xfer.c
++++ b/criu/page-xfer.c
+@@ -18,6 +18,7 @@
+ #include "servicefd.h"
+ #include "image.h"
+ #include "page-xfer.h"
++#include "bfd.h"
+ #include "page-pipe.h"
+ #include "util.h"
+ #include "protobuf.h"
+@@ -45,5 +46,6 @@ struct page_server_iov {
+ #define PS_IOV_ADD_F  6
+ #define PS_IOV_GET    7
+ #define PS_IOV_ADD_F_COMPRESSED 8
++#define PS_IOV_PARENT_RANGE     9
+ 
+ #define PS_IOV_CLOSE	   0x1023
+@@ -361,5 +363,8 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
+ 	xfer->close = close_server_xfer;
+ 	xfer->dst_id = encode_pm(fd_type, img_id);
+ 	xfer->parent = NULL;
++	xfer->has_parent = false;
++	xfer->remote_parent = false;
++	xfer->parent_dst_id = 0;
+ 
+ 	pi.dst_id = xfer->dst_id;
+@@ -377,5 +382,5 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
+ 	}
+ 
+ 	if (has_parent)
+-		xfer->parent = (void *)1; /* This is required for generate_iovs() */
++		xfer->has_parent = true;
+ 
+@@ -405,4 +410,5 @@ static int clear_o_direct(int fd)
+ }
+ 
+ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov);
++static int check_parent_server_range(u64 dst_id, struct iovec *iov);
+ 
+@@ -457,12 +463,11 @@ static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *io
+ 	}
+ 
+ 	/* Non-present pages (holes, parent refs): write immediately */
+-	if (flags & PE_PARENT) {
+-		if (xfer->parent != NULL) {
+-			ret = check_pagehole_in_parent(xfer->parent, iov);
+-			if (ret) {
+-				pr_err("Hole %p - %p not found in parent\n",
+-				       iov->iov_base, iov->iov_base + iov->iov_len);
+-				return -1;
+-			}
++	if (flags & PE_PARENT) {
++		ret = xfer->parent ? check_pagehole_in_parent(xfer->parent, iov) :
++		      xfer->remote_parent ? check_parent_server_range(xfer->parent_dst_id, iov) : -1;
++		if (ret) {
++			pr_err("Hole %p - %p not found in parent\n",
++			       iov->iov_base, iov->iov_base + iov->iov_len);
++			return -1;
+ 		}
+ 	}
+@@ -792,5 +795,27 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
+ 	}
+ }
+ 
++static int check_parent_local_range(int fd_type, unsigned long img_id, struct iovec *iov)
++{
++	struct page_read pr;
++	int pfd, pr_flags, ret;
++
++	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
++		return -1;
++	if (pfd < 0)
++		return 0;
++
++	pr_flags = fd_type == CR_FD_PAGEMAP ? PR_TASK : PR_SHMEM;
++	ret = open_page_read_at(pfd, img_id, &pr, pr_flags);
++	close(pfd);
++	if (ret <= 0)
++		return ret;
++
++	page_read_disable_dedup(&pr);
++	ret = check_pagehole_in_parent(&pr, iov) ? 0 : 1;
++	pr.close(&pr);
++	return ret;
++}
++
+ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+ {
+@@ -815,12 +841,11 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
+ 			}
+ 		}
+ 	} else if (flags & PE_PARENT) {
+-		if (xfer->parent != NULL) {
+-			ret = check_pagehole_in_parent(xfer->parent, iov);
+-			if (ret) {
+-				pr_err("Hole %p - %p not found in parent\n",
+-				       iov->iov_base, iov->iov_base + iov->iov_len);
+-				return -1;
+-			}
++		ret = xfer->parent ? check_pagehole_in_parent(xfer->parent, iov) :
++		      xfer->remote_parent ? check_parent_server_range(xfer->parent_dst_id, iov) : -1;
++		if (ret) {
++			pr_err("Hole %p - %p not found in parent\n",
++			       iov->iov_base, iov->iov_base + iov->iov_len);
++			return -1;
+ 		}
+ 	}
+@@ -849,5 +872,8 @@ static void close_page_xfer(struct page_xfer *xfer)
+ 		xfree(xfer->parent);
+ 		xfer->parent = NULL;
+ 	}
++	xfer->has_parent = false;
++	xfer->remote_parent = false;
++	xfer->parent_dst_id = 0;
+ 	xfree(xfer->pending_pe.b_layout.sizes);
+ 	xfer->pending_pe.b_layout.sizes = NULL;
+@@ -883,5 +909,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
+ 	 *    to exist in parent (either pagemap or hole)
+ 	 */
+ 	xfer->parent = NULL;
++	xfer->has_parent = false;
++	xfer->remote_parent = false;
++	xfer->parent_dst_id = 0;
+ 	if (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP) {
+ 		int ret;
+@@ -902,11 +931,18 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
+ 		}
+ 
+ 		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
+-		if (ret <= 0) {
+-			pr_perror("No parent image found, though parent directory is set");
++		if (ret < 0) {
++			pr_err("Unable to read parent image %lu\n", img_id);
+ 			xfree(xfer->parent);
+ 			xfer->parent = NULL;
+ 			close(pfd);
++			goto err_pi;
++		}
++		if (!ret) {
++			xfree(xfer->parent);
++			xfer->parent = NULL;
++			close(pfd);
+ 			goto out;
+ 		}
++		xfer->has_parent = true;
+ 		close(pfd);
+ 	}
+@@ -966,5 +1002,14 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+ 	return 0;
+ }
+ 
++void page_xfer_use_remote_parent(struct page_xfer *xfer, int fd_type, unsigned long img_id)
++{
++	if (xfer->parent)
++		return;
++	xfer->has_parent = true;
++	xfer->remote_parent = true;
++	xfer->parent_dst_id = encode_pm(fd_type, img_id);
++}
++
+ static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)
+ {
+@@ -1500,5 +1544,52 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
+ 	return (ret == 0);
+ }
+ 
++static int page_server_check_parent_range(int sk, struct page_server_iov *pi)
++{
++	struct iovec iov;
++	unsigned long id;
++	int covered, type;
++
++	type = decode_pm(pi->dst_id, &id);
++	if (type == -1) {
++		pr_err("Unknown pagemap type received\n");
++		return -1;
++	}
++	if (!pi->nr_pages || (pi->vaddr & (PAGE_SIZE - 1)) ||
++	    pi->vaddr > ULONG_MAX || pi->nr_pages > SIZE_MAX / PAGE_SIZE ||
++	    pi->nr_pages > (ULONG_MAX - (unsigned long)pi->vaddr) / PAGE_SIZE) {
++		pr_err("Invalid parent range %#" PRIx64 "+%" PRIu64 " pages\n",
++		       pi->vaddr, pi->nr_pages);
++		return -1;
++	}
++
++	psi2iovec(pi, &iov);
++	covered = check_parent_local_range(type, id, &iov);
++	if (send_full(sk, &covered, sizeof(covered), "page-server parent range response"))
++		return -1;
++	return 0;
++}
++
++static int check_parent_server_range(u64 dst_id, struct iovec *iov)
++{
++	struct page_server_iov pi = {
++		.cmd = PS_IOV_PARENT_RANGE,
++		.nr_pages = iov->iov_len / PAGE_SIZE,
++		.vaddr = encode_pointer(iov->iov_base),
++		.dst_id = dst_id,
++	};
++	int covered;
++
++	if (send_psi(page_server_sk, &pi))
++		return -1;
++	tcp_nodelay(page_server_sk, true);
++	if (recv_full(page_server_sk, &covered, sizeof(covered),
++		      "page-server parent range response"))
++		return -1;
++	if (covered < 0)
++		return -1;
++	return covered ? 0 : -1;
++}
++
+ /* page server */
+ static int page_server_check_parent(int sk, struct page_server_iov *pi)
+ {
+@@ -1548,5 +1647,5 @@ int check_parent_page_xfer(int fd_type, unsigned long img_id)
+ {
+-	if (opts.use_page_server)
++	if (opts.use_page_server || opts.parent_page_server)
+ 		return check_parent_server_xfer(fd_type, img_id);
+ 	else
+ 		return check_parent_local_xfer(fd_type, img_id);
+@@ -1582,6 +1681,6 @@ static int page_server_open(int sk, struct page_server_iov *pi)
+ 	cxfer.dst_id = pi->dst_id;
+ 
+ 	if (sk >= 0) {
+-		char has_parent = !!cxfer.loc_xfer.parent;
++		char has_parent = page_xfer_has_parent(&cxfer.loc_xfer);
+ 		if (send_full(sk, &has_parent, sizeof(has_parent), "page-server open response")) {
+ 			page_server_close();
+@@ -1929,5 +2028,8 @@ static int page_server_serve(int sk)
+ 		case PS_IOV_PARENT:
+ 			ret = page_server_check_parent(sk, &pi);
+ 			break;
++		case PS_IOV_PARENT_RANGE:
++			ret = page_server_check_parent_range(sk, &pi);
++			break;
+ 		case PS_IOV_ADD_F_COMPRESSED: {
+ 			u32 flags = decode_ps_flags(pi.cmd);
+@@ -1952,5 +2054,9 @@ static int page_server_serve(int sk)
+ 		case PS_IOV_FORCE_CLOSE: {
+ 			int32_t status = 0;
+ 
+-			ret = 0;
++			if (receiving_pages) {
++				page_server_close();
++				status = bfd_flush_images();
++			}
++			ret = status;
+ 
+ 			/*
+@@ -2324,4 +2430,4 @@ static int connect_to_page_server(void)
+ {
+-	if (!opts.use_page_server)
++	if (!opts.use_page_server && !opts.parent_page_server)
+ 		return 0;
+ 
+@@ -2358,5 +2464,5 @@ int disconnect_from_page_server(void)
+ 	int32_t status = -1;
+ 	int ret = -1;
+ 
+-	if (!opts.use_page_server)
++	if (!opts.use_page_server && !opts.parent_page_server)
+ 		return 0;
+ 
+ 	if (page_server_sk == -1)
+diff --git a/criu/mem.c b/criu/mem.c
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -559,12 +559,15 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 	pmc_t pmc = PMC_INIT;
+ 	struct page_pipe *pp;
+ 	struct vma_area *vma_area;
+-	struct page_xfer xfer = { .parent = NULL };
++	struct page_xfer xfer = { 0 };
+ 	int ret, exit_code = -1;
+ 	unsigned cpp_flags = 0;
+ 	unsigned long pmc_size;
+ 	int possible_pid_reuse = 0;
+ 	bool has_parent;
++	bool remote_parent;
+ 	int parent_predump_mode = -1;
++	remote_parent = mdc->parent_ie && mdc->parent_ie->has_pages_on_page_server &&
++			mdc->parent_ie->pages_on_page_server;
+ 
+ 	pr_info("\n");
+@@ -604,14 +607,19 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 			goto out_pp;
+ 
+ 		xfer.transfer_lazy = !mdc->lazy;
++		if (!opts.use_page_server && opts.parent_page_server && remote_parent) {
++			ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
++			if (ret < 0)
++				goto out_xfer;
++			if (ret)
++				page_xfer_use_remote_parent(&xfer, CR_FD_PAGEMAP, vpid(item));
++		}
+ 	} else {
+ 		ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
+ 		if (ret < 0)
+ 			goto out_pp;
+-
+-		if (ret)
+-			xfer.parent = NULL + 1;
++		xfer.has_parent = ret;
+ 	}
+ 
+-	if (xfer.parent) {
++	if (page_xfer_has_parent(&xfer)) {
+ 		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
+ 		if (possible_pid_reuse == -1)
+@@ -624,6 +633,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 	 * Step 1 -- generate the pagemap
+ 	 */
+ 	args->off = 0;
+-	has_parent = !!xfer.parent && !possible_pid_reuse;
++	has_parent = page_xfer_has_parent(&xfer) && !possible_pid_reuse;
+ 	if (mdc->parent_ie)
+ 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -1775,7 +1775,15 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
+ 	if (bfd_flush_images())
+ 		ret = -1;
+ 
++	if (!ret && opts.use_page_server) {
++		he.has_pages_on_page_server = true;
++		he.pages_on_page_server = true;
++	}
++
+ 	if (write_img_inventory(&he, parent_ie))
+ 		ret = -1;
+ 
++	if (bfd_flush_images())
++		ret = -1;
++
+ 	if (ret)
+ 		pr_err("Pre-dumping FAILED.\n");
+diff --git a/scripts/ci/run-ci-tests.sh b/scripts/ci/run-ci-tests.sh
+--- a/scripts/ci/run-ci-tests.sh
++++ b/scripts/ci/run-ci-tests.sh
+@@ -154,4 +154,9 @@ if [ "$WIDTH" -gt 80 ]; then
+ # Just try to run it everywhere for now.
+ time make unittest
+ 
++if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
++	time make -C test/others/remote-parent-experiment check
++	exit 0
++fi
++
+ [ -n "$SKIP_CI_TEST" ] && exit 0
