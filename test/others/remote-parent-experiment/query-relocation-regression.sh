@@ -9,6 +9,7 @@ WORK_DIR="$SCRIPT_DIR/query-relocation-work"
 RESULT_DIR="$SCRIPT_DIR/results/query-relocation"
 HELPER="$WORK_DIR/topology-workload"
 ORACLE="$SCRIPT_DIR/topology_oracle.py"
+PAGE_SIZE=$(getconf PAGESIZE)
 PID=""
 LAUNCHER_PID=""
 PAGE_SERVER_PID=""
@@ -114,6 +115,14 @@ restore_and_verify() {
 	grep -qx PASS "$base/result"
 }
 
+assemble_final() {
+	local source=$1 target=$2 parent=${3:-}
+	mkdir -p "$target"
+	cp -a "$source/." "$target/"
+	rm -f "$target/parent"
+	[ -z "$parent" ] || ln -s "../$(basename "$parent")" "$target/parent"
+}
+
 rm -rf "$WORK_DIR" "$RESULT_DIR"
 mkdir -p "$WORK_DIR" "$RESULT_DIR"
 "${CC:-cc}" -O2 -Wall -Wextra -Werror "$SCRIPT_DIR/topology_workload.c" -o "$HELPER"
@@ -128,10 +137,12 @@ LAUNCHER_PID=$!
 PID=$LAUNCHER_PID
 wait_state "$STATE" ready || fail "workload did not become ready"
 [ "$(cat "$PIDFILE")" = "$PID" ] || fail "workload pidfile mismatch"
+ROOT_PID=$PID
 
 SOURCE_PRE="$BASE/source-pre"
 TARGET_PRE="$BASE/target-pre"
 SOURCE_FINAL="$BASE/source-final"
+TARGET_FINAL="$BASE/target-final"
 QUERY_DIR="$BASE/query-final"
 SOURCE_RETRY="$BASE/source-full-retry"
 TARGET_RETRY="$BASE/target-full-retry"
@@ -147,7 +158,9 @@ wait_state "$STATE" mutated || fail "workload did not relocate its mapping"
 ADDRESS=$(state_value "$STATE" address)
 ORIGINAL=$(state_value "$STATE" original_address)
 SIZE=$(state_value "$STATE" size)
+ZEROED=$(state_value "$STATE" zeroed)
 [ "$ADDRESS" != "$ORIGINAL" ] || fail "mremap did not move the mapping"
+[ "$ZEROED" -eq 1 ] || fail "relocated workload did not publish a zero-filled range"
 python3 "$ORACLE" proc-stats "$PID" "$ADDRESS" "$SIZE" >"$RESULT_DIR/proc-after-relocate.json"
 python3 "$ORACLE" image-stats "$TARGET_PRE" "$PID" "$ADDRESS" "$SIZE" >"$RESULT_DIR/parent-at-relocated-address.json"
 SOFTDIRTY=$(json_value "$RESULT_DIR/proc-after-relocate.json" softdirty_pages)
@@ -159,24 +172,55 @@ set +e
 bash "$QUERY_FINAL" "$PID" "$SOURCE_FINAL" "$SOURCE_PRE" "$QUERY_DIR" "$TARGET_PRE" --shell-job
 status=$?
 set -e
-[ "$status" -ne 0 ] || fail "query-backed final accepted an uncovered relocated range"
+if [ "$status" -eq 0 ]; then
+	PID=""
+	if [ -n "$LAUNCHER_PID" ]; then
+		wait "$LAUNCHER_PID" 2>/dev/null || true
+		LAUNCHER_PID=""
+	fi
+	python3 "$ORACLE" image-stats "$SOURCE_FINAL" "$ROOT_PID" "$ADDRESS" "$SIZE" \
+		>"$RESULT_DIR/final-at-relocated-address.json"
+	FINAL_PRESENT=$(json_value "$RESULT_DIR/final-at-relocated-address.json" present_pages)
+	FINAL_PARENT=$(json_value "$RESULT_DIR/final-at-relocated-address.json" parent_pages)
+	FINAL_UNCOVERED=$(json_value "$RESULT_DIR/final-at-relocated-address.json" uncovered_pages)
+	TOTAL_PAGES=$((SIZE / PAGE_SIZE))
+	[ "$FINAL_PRESENT" -eq 0 ] || fail "zero-filled relocated pages were copied unexpectedly"
+	[ "$FINAL_PARENT" -eq 0 ] || fail "zero-filled relocated pages referenced an uncovered parent"
+	[ "$FINAL_UNCOVERED" -eq "$TOTAL_PAGES" ] || fail "unexpected relocated range classification"
+	assemble_final "$SOURCE_FINAL" "$TARGET_FINAL" "$TARGET_PRE"
+	restore_and_verify "$TARGET_FINAL" "$BASE" || fail "safe zero omission did not restore"
+	cat >"$RESULT_DIR/summary.json" <<EOF_JSON
+{
+  "route": "local-no-parent",
+  "case": "relocated-clean-range",
+  "status": "PASS",
+  "outcome": "safe-zero-omission",
+  "softdirty_pages": $SOFTDIRTY,
+  "parent_covered_pages": $PARENT_COVERED,
+  "final_present_pages": $FINAL_PRESENT,
+  "final_parent_pages": $FINAL_PARENT,
+  "final_uncovered_pages": $FINAL_UNCOVERED
+}
+EOF_JSON
+	printf 'QUERY-RELOCATION PASS outcome=safe-zero-omission\n'
+	rm -rf "$WORK_DIR"
+	exit 0
+fi
+
 kill -0 "$PID" 2>/dev/null || fail "rejected final dump did not resume the workload"
 grep -Eiq 'not found in parent|Missing .*parent pagemap' \
 	"$SOURCE_FINAL/dump.log" "$QUERY_DIR/page-server.log" 2>/dev/null ||
 	fail "relocated range rejection was not reported"
-
 mkdir -p "$SOURCE_RETRY" "$TARGET_RETRY"
 "${CRIU_CMD[@]}" dump -D "$SOURCE_RETRY" -o dump.log -t "$PID" -v4 \
 	--track-mem --shell-job || fail "full retry after rejection failed"
 PID=""
-cp -a "$SOURCE_RETRY/." "$TARGET_RETRY/"
-rm -f "$TARGET_RETRY/parent"
+assemble_final "$SOURCE_RETRY" "$TARGET_RETRY"
 if [ -n "$LAUNCHER_PID" ]; then
 	wait "$LAUNCHER_PID" 2>/dev/null || true
 	LAUNCHER_PID=""
 fi
 restore_and_verify "$TARGET_RETRY" "$BASE" || fail "full retry did not restore relocated data"
-
 cat >"$RESULT_DIR/summary.json" <<EOF_JSON
 {
   "route": "local-no-parent",
@@ -187,5 +231,5 @@ cat >"$RESULT_DIR/summary.json" <<EOF_JSON
   "parent_covered_pages": $PARENT_COVERED
 }
 EOF_JSON
-printf 'QUERY-RELOCATION PASS\n'
+printf 'QUERY-RELOCATION PASS outcome=safe-reject-and-full-retry\n'
 rm -rf "$WORK_DIR"
