@@ -1,0 +1,9 @@
+diff --git a/test/others/remote-parent-experiment/query-disconnect-regression.sh b/test/others/remote-parent-experiment/query-disconnect-regression.sh
+--- a/test/others/remote-parent-experiment/query-disconnect-regression.sh
++++ b/test/others/remote-parent-experiment/query-disconnect-regression.sh
+@@ -185,5 +185,5 @@ printf 'case\tstatus\tsource_to_server\tserver_to_source\n' >"$RESULTS"
+ run_case before-parent-response 0
+-run_case after-parent-and-range-response 8
++run_case after-parent-before-range-response 4
+ python3 - "$RESULTS" "$RESULT_DIR/summary.json" <<'PY'
+ import csv
