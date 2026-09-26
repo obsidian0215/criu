@@ -175,6 +175,7 @@ struct cr_options {
 	int plugin_options_max;
 	char *libdir;
 	int use_page_server;
+	int parent_page_server;
 	unsigned short port;
 	char *addr;
 	int ps_socket;
