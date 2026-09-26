@@ -27,7 +27,7 @@ check-boundaries:
 	bash ./parentless-regression.sh
 
 check-contracts:
-	bash ./parent-contract-regression.sh
+	bash ./query-parent-contract-regression.sh
 
 check-pid-reuse:
 	bash ./pid-reuse-regression.sh
@@ -36,4 +36,4 @@ check-relocation:
 	bash ./relocation-regression.sh || python3 ./accept-zero-relocation.py results/relocation/summary.json
 
 clean:
-	rm -rf work-* query-work-* query-matrix-work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
+	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
