@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 TOP=$(cd "$SCRIPT_DIR/../../.." && pwd)
 ROUTE=$(cat "$TOP/experiments/remote-parent/route")
 CRIU_CMD=("$TOP/criu/criu" --no-default-config)
+QUERY_FINAL="$SCRIPT_DIR/query-final-dump.sh"
 WORK_DIR="$SCRIPT_DIR/boundary-work-$ROUTE"
 RESULT_DIR="$SCRIPT_DIR/results/parentless-boundary"
 WORKLOAD="$WORK_DIR/parentless-workload"
@@ -63,6 +64,8 @@ failure_logs() {
 	local file
 	for file in \
 		"$WORK_DIR/source-final/dump.log" \
+		"$WORK_DIR/query-final/page-server.log" \
+		"$WORK_DIR/query-final/server-command.log" \
 		"$WORK_DIR/target-final/page-server.log" \
 		"$WORK_DIR/target-final/server-command.log"; do
 		[ -f "$file" ] || continue
@@ -82,10 +85,12 @@ expected_parent_rejection() {
 	local file
 	for file in \
 		"$WORK_DIR/source-final/dump.log" \
+		"$WORK_DIR/query-final/page-server.log" \
+		"$WORK_DIR/query-final/server-command.log" \
 		"$WORK_DIR/target-final/page-server.log" \
 		"$WORK_DIR/target-final/server-command.log"; do
 		[ -f "$file" ] || continue
-		if grep -Eq 'Hole [^ ]+/[0-9a-fA-F]+ not found in parent' "$file"; then
+		if grep -Eq 'Hole .* not found in parent|Missing [0-9a-f]+ in parent pagemap' "$file"; then
 			return 0
 		fi
 	done
@@ -186,6 +191,7 @@ SOURCE_PRE="$WORK_DIR/source-pre"
 TARGET_PRE="$WORK_DIR/target-pre"
 SOURCE_FINAL="$WORK_DIR/source-final"
 TARGET_FINAL="$WORK_DIR/target-final"
+QUERY_FINAL_DIR="$WORK_DIR/query-final"
 mkdir -p "$SOURCE_PRE" "$TARGET_PRE" "$SOURCE_FINAL" "$TARGET_FINAL"
 
 start_server "$TARGET_PRE"
@@ -222,6 +228,13 @@ case "$ROUTE" in
 		if [ "$FINAL_OK" -eq 1 ]; then
 			copy_non_memory "$SOURCE_FINAL" "$TARGET_FINAL"
 			FINAL_IMAGE="$TARGET_FINAL"
+		fi
+		;;
+	local-no-parent)
+		if bash "$QUERY_FINAL" "$PID" "$SOURCE_FINAL" "$SOURCE_PRE" "$QUERY_FINAL_DIR" "$TARGET_PRE"; then
+			FINAL_OK=1
+			assemble_local_final "$SOURCE_FINAL" "$TARGET_FINAL" "$TARGET_PRE"
+			FINAL_IMAGE="$SOURCE_FINAL"
 		fi
 		;;
 	*)
