@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 TOP=$(cd "$SCRIPT_DIR/../../.." && pwd)
 ROUTE=$(cat "$TOP/experiments/remote-parent/route")
 CRIU_CMD=("$TOP/criu/criu" --no-default-config)
+QUERY_FINAL="$SCRIPT_DIR/query-final-dump.sh"
 WORK_ROOT="$SCRIPT_DIR/pid-reuse-work-$ROUTE"
 RESULT_DIR="$SCRIPT_DIR/results/pid-reuse"
 WORKLOAD="$WORK_ROOT/parent-identity-workload"
@@ -186,6 +187,7 @@ run_inner() {
 	local reset_pre="$WORK_ROOT/reset-pre"
 	local source_final="$WORK_ROOT/source-final"
 	local target_final="$WORK_ROOT/target-final"
+	local query_final="$WORK_ROOT/query-final"
 	local tracked control final_class phase
 
 	[ "$$" -eq 1 ] || skip "PID namespace init is not the test driver"
@@ -238,6 +240,13 @@ run_inner() {
 		finish_server || fail "final page server failed"
 		copy_non_memory "$source_final" "$target_final"
 		FINAL_IMAGE="$target_final"
+	elif [ "$ROUTE" = local-no-parent ]; then
+		if ! bash "$QUERY_FINAL" "$PID" "$source_final" "$source_pre" "$query_final" "$target_pre"; then
+			fail "query-backed final dump rejected the reused pid"
+		fi
+		PID=""
+		assemble_local_final "$source_final" "$target_final" "$target_pre"
+		FINAL_IMAGE="$source_final"
 	else
 		if ! "${CRIU_CMD[@]}" dump -D "$source_final" -o dump.log -t "$PID" -v4 --track-mem \
 			--prev-images-dir "../$(basename "$source_pre")"; then
