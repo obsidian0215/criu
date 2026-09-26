@@ -29,7 +29,14 @@ jobs:
           p = Path('scripts/ci/run-ci-tests.sh')
           s = p.read_text()
           marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
-          hook = 'if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then\\n\\ttime make -C test/others/remote-parent-experiment check\\n\\texit 0\\nfi\\n\\n'
+          hook = '\n'.join([
+              'if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then',
+              '\ttime make -C test/others/remote-parent-experiment check',
+              '\texit 0',
+              'fi',
+              '',
+              '',
+          ])
           if s.count(marker) != 1:
               raise SystemExit('unable to locate unique unit-test marker')
           if hook not in s:
@@ -39,6 +46,7 @@ jobs:
           p.write_text(s)
           PY
           git diff --check
+          bash -n scripts/ci/run-ci-tests.sh
       - name: Run targeted validation
         run: |
           set -euxo pipefail
