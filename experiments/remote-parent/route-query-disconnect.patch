@@ -1,6 +1,6 @@
 diff --git a/test/others/remote-parent-experiment/query-disconnect-regression.sh b/test/others/remote-parent-experiment/query-disconnect-regression.sh
 --- a/test/others/remote-parent-experiment/query-disconnect-regression.sh
 +++ b/test/others/remote-parent-experiment/query-disconnect-regression.sh
-@@ -187 +187 @@
+@@ -198 +198 @@
 -run_case after-parent-and-range-response 8
 +run_case after-parent-before-range-response 4
