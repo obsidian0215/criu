@@ -195,7 +195,7 @@ mkdir -p "$WORK_ROOT" "$RESULT_DIR"
 "${CC:-cc}" -O2 -Wall -Wextra -Werror "$SCRIPT_DIR/parent_identity_workload.c" -o "$WORKLOAD"
 printf 'case\tstatus\tsource_to_server\tserver_to_source\n' >"$RESULTS"
 run_case before-parent-response 0
-run_case after-parent-and-range-response 8
+run_case after-parent-before-range-response 4
 python3 - "$RESULTS" "$RESULT_DIR/summary.json" <<'PY'
 import csv
 import json
