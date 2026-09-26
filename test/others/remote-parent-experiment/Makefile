@@ -1,12 +1,15 @@
-.PHONY: check check-query check-missing-range check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation clean
+.PHONY: check check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation clean
 
-check: clean check-query check-missing-range check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation
+check: clean check-query check-missing-range check-disconnects check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-pid-reuse check-relocation
 
 check-query:
 	bash ./remote-parent-query-regression.sh
 
 check-missing-range:
 	bash ./query-missing-range-regression.sh
+
+check-disconnects:
+	bash ./query-disconnect-regression.sh
 
 check-splice:
 	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
@@ -39,4 +42,4 @@ check-relocation:
 	bash ./relocation-regression.sh || python3 ./accept-zero-relocation.py results/relocation/summary.json
 
 clean:
-	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* query-missing-range-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
+	rm -rf work-* query-work-* query-matrix-work-* query-contract-work* query-missing-range-work* query-disconnect-work* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
