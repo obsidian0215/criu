@@ -28,8 +28,10 @@ jobs:
 
           path = Path(sys.argv[1])
           text = path.read_text()
-          text = text.replace('page_xfer_has_parent', 'page_xfer_parent_available')
-          declaration = '+static int check_parent_server_range(u64 dst_id, struct iovec *iov);\n'
+          text = text.replace('page_xfer_has_parent',
+                              'page_xfer_parent_available')
+          declaration = ('+static int check_parent_server_range('
+                         'u64 dst_id, struct iovec *iov);\n')
           if text.count(declaration) != 1:
               raise SystemExit('unable to locate parent range declaration')
           text = text.replace(
@@ -37,7 +39,8 @@ jobs:
               declaration + '+static void tcp_nodelay(int sk, bool on);\n',
               1,
           )
-          address_check = '+\t    pi->vaddr > ULONG_MAX || pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n'
+          address_check = ('+\t    pi->vaddr > ULONG_MAX || '
+                           'pi->nr_pages > SIZE_MAX / PAGE_SIZE ||\n')
           if text.count(address_check) != 1:
               raise SystemExit('unable to locate parent range address check')
           text = text.replace(
@@ -48,7 +51,8 @@ jobs:
           lines = text.splitlines()
           output = []
           index = 0
-          header = re.compile(r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$')
+          header = re.compile(
+              r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$')
           while index < len(lines):
               line = lines[index]
               match = header.match(line)
@@ -58,23 +62,42 @@ jobs:
                   continue
               body = []
               index += 1
-              while index < len(lines) and not lines[index].startswith('@@ ') and not lines[index].startswith('diff --git '):
+              while (index < len(lines)
+                     and not lines[index].startswith('@@ ')
+                     and not lines[index].startswith('diff --git ')):
                   body.append(lines[index])
                   index += 1
-              old_count = sum(item.startswith((' ', '-')) for item in body if not item.startswith('\\ No newline'))
-              new_count = sum(item.startswith((' ', '+')) for item in body if not item.startswith('\\ No newline'))
-              output.append(f'@@ -{match.group(1)},{old_count} +{match.group(2)},{new_count} @@{match.group(3)}')
+              old_count = sum(
+                  item.startswith((' ', '-'))
+                  for item in body
+                  if not item.startswith('\\ No newline')
+              )
+              new_count = sum(
+                  item.startswith((' ', '+'))
+                  for item in body
+                  if not item.startswith('\\ No newline')
+              )
+              output.append(
+                  f'@@ -{match.group(1)},{old_count} '
+                  f'+{match.group(2)},{new_count} @@{match.group(3)}'
+              )
               output.extend(body)
           path.write_text('\n'.join(output) + '\n')
           PY
           git apply --check "$patch"
           git apply "$patch"
+          for followup in experiments/remote-parent/route-*.patch; do
+            test -s "$followup"
+            git apply --check "$followup"
+            git apply "$followup"
+          done
           python3 - <<'PY'
           from pathlib import Path
 
           ci_path = Path('scripts/ci/run-ci-tests.sh')
           ci_text = ci_path.read_text()
-          marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
+          marker = ('# Unit tests at this point do not require any kernel '
+                    'or hardware capabilities.\n')
           early = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
           \ttime make -C test/others/remote-parent-experiment check
           \texit 0
@@ -89,7 +112,8 @@ jobs:
               raise SystemExit('unable to install unique experiment entry point')
           ci_path.write_text(ci_text)
 
-          regression_path = Path('test/others/remote-parent-experiment/regression.sh')
+          regression_path = Path(
+              'test/others/remote-parent-experiment/regression.sh')
           regression_text = regression_path.read_text()
           old = '''PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
           [ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
@@ -104,10 +128,8 @@ jobs:
           fi
           '''
           if regression_text.count(old) != 1:
-              raise SystemExit('unable to locate unique first-payload assertion')
+              raise SystemExit('unable to locate unique payload assertion')
           regression_text = regression_text.replace(old, new, 1)
-          if regression_text.count(new) != 1:
-              raise SystemExit('unable to install compression-aware first-payload assertion')
           regression_path.write_text(regression_text)
           PY
           for script in test/others/remote-parent-experiment/*.sh; do
@@ -120,9 +142,11 @@ jobs:
           set -euxo pipefail
           printf '\nREMOTE_PARENT_EXPERIMENT=1\n' >> scripts/ci/docker.env
           if [ '${{ matrix.compiler }}' = clang ]; then
-            sudo -E make -C scripts/ci alpine CLANG=1 ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+            sudo -E make -C scripts/ci alpine CLANG=1 \
+              ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
           else
-            sudo -E make -C scripts/ci alpine GCC=1 ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
+            sudo -E make -C scripts/ci alpine GCC=1 \
+              ZDTM_SHARD_INDEX=4 ZDTM_SHARD_COUNT=4
           fi
       - name: Print failure diagnostics
         if: always()
@@ -131,46 +155,18 @@ jobs:
           set +e
           root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
           echo '===== result summaries ====='
-          sudo find "$root/results" -maxdepth 3 -type f -print -exec sh -c '
+          sudo find "$root/results" -maxdepth 4 -type f -print -exec sh -c '
             for file do
               echo "===== $file ====="
               cat "$file"
             done
           ' sh {} + 2>/dev/null || true
-          echo '===== query logs ====='
-          sudo find "$root" -path '*/query-work-*/*' -type f \
-            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
-            while IFS= read -r -d '' file; do
-              echo "===== $file ====="
-              sudo tail -n 500 "$file" || true
-            done
-          echo '===== lifecycle shm tree ====='
-          sudo find "$root" -path '*/lifecycle-work-*/shm/*' \
-            -printf '%M %u:%g %s %p -> %l\n' 2>/dev/null | sort || true
-          echo '===== lifecycle shm logs ====='
-          sudo find "$root" -path '*/lifecycle-work-*/shm/*' -type f \
-            \( -name '*.log' -o -name '*.out' -o -name '*.txt' \) -print0 2>/dev/null |
-            while IFS= read -r -d '' file; do
-              echo "===== $file ====="
-              sudo tail -n 500 "$file" || true
-            done
-          echo '===== parentless boundary logs ====='
-          sudo find "$root" -path '*/boundary-work-*/*' -type f \
-            \( -name '*.log' -o -name '*.state' -o -name '*.json' \) -print0 2>/dev/null |
-            while IFS= read -r -d '' file; do
-              echo "===== $file ====="
-              sudo tail -n 500 "$file" || true
-            done
-          echo '===== parent contract logs ====='
-          sudo find "$root" -path '*/contract-work-*/*' -type f \
-            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
-            while IFS= read -r -d '' file; do
-              echo "===== $file ====="
-              sudo tail -n 500 "$file" || true
-            done
-          echo '===== pid reuse logs ====='
-          sudo find "$root" -path '*/pid-reuse-work-*/*' -type f \
-            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
+          echo '===== retained work logs ====='
+          sudo find "$root" -maxdepth 6 -type f \
+            \( -path '*work*' -o -path '*/results/*' \) \
+            \( -name '*.log' -o -name '*.out' -o -name '*.state' \
+               -o -name '*.json' -o -name '*.hex' -o -name '*.tsv' \) \
+            -print0 2>/dev/null |
             while IFS= read -r -d '' file; do
               echo "===== $file ====="
               sudo tail -n 500 "$file" || true
@@ -183,11 +179,10 @@ jobs:
           root="$GITHUB_WORKSPACE/test/others/remote-parent-experiment"
           archive="$RUNNER_TEMP/remote-parent-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
           cd "$root"
-          shopt -s nullglob
-          paths=()
-          for candidate in results query-work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-*; do
-            [ -e "$candidate" ] && paths+=("$candidate")
-          done
+          mapfile -d '' paths < <(
+            find . -maxdepth 1 -type d \
+              \( -name 'results' -o -name '*work*' \) -print0
+          )
           if ((${#paths[@]})); then
             sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
               sudo tar --null -czf "$archive" --files-from=-
