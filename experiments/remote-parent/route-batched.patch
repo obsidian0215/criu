@@ -1,0 +1,309 @@
+diff --git a/criu/include/page-xfer.h b/criu/include/page-xfer.h
+--- a/criu/include/page-xfer.h
++++ b/criu/include/page-xfer.h
+@@ -66,6 +66,7 @@ struct page_xfer {
+ 	struct page_read *parent;
+ 	bool has_parent;
+ 	bool remote_parent;
++	bool remote_parent_ranges_validated;
+ 	u64 parent_dst_id;
+ 
+ 	/*
+diff --git a/criu/page-xfer.c b/criu/page-xfer.c
+--- a/criu/page-xfer.c
++++ b/criu/page-xfer.c
+@@ -39,6 +39,11 @@ struct page_server_iov {
+ 	u64 dst_id;
+ };
+ 
++struct page_server_parent_range {
++	u64 vaddr;
++	u64 nr_pages;
++};
++
+ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
+ {
+ 	iov->iov_base = decode_pointer(ps->vaddr);
+@@ -46,7 +51,9 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
+ #define PS_IOV_ADD_F  6
+ #define PS_IOV_GET    7
+ #define PS_IOV_ADD_F_COMPRESSED 8
+-#define PS_IOV_PARENT_RANGE     9
++#define PS_IOV_PARENT_RANGES    9
++
++#define PS_PARENT_RANGES_MAX (1U << 20)
+ 
+ #define PS_IOV_CLOSE	   0x1023
+ #define PS_IOV_FORCE_CLOSE 0x1024
+@@ -366,6 +373,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
+ 	xfer->parent = NULL;
+ 	xfer->has_parent = false;
+ 	xfer->remote_parent = false;
++	xfer->remote_parent_ranges_validated = false;
+ 	xfer->parent_dst_id = 0;
+ 
+ 	pi.dst_id = xfer->dst_id;
+@@ -410,7 +418,7 @@ static int clear_o_direct(int fd)
+ }
+ 
+ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov);
+-static int check_parent_server_range(u64 dst_id, struct iovec *iov);
++static int check_parent_server_ranges(struct page_xfer *xfer, struct page_pipe *pp);
+ static void tcp_nodelay(int sk, bool on);
+ 
+ static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+@@ -464,7 +472,7 @@ static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *io
+ 	/* Non-present pages (holes, parent refs): write immediately */
+ 	if (flags & PE_PARENT) {
+ 		ret = xfer->parent ? check_pagehole_in_parent(xfer->parent, iov) :
+-		      xfer->remote_parent ? check_parent_server_range(xfer->parent_dst_id, iov) : -1;
++		      xfer->remote_parent && xfer->remote_parent_ranges_validated ? 0 : -1;
+ 		if (ret) {
+ 			pr_err("Hole %p - %p not found in parent\n",
+ 			       iov->iov_base, iov->iov_base + iov->iov_len);
+@@ -796,26 +804,23 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
+ 	}
+ }
+ 
+-static int check_parent_local_range(int fd_type, unsigned long img_id, struct iovec *iov)
++static int open_parent_local_reader(int fd_type, unsigned long img_id, struct page_read *pr)
+ {
+-	struct page_read pr;
+ 	int pfd, pr_flags, ret;
+ 
+ 	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+ 		return -1;
+ 	if (pfd < 0)
+ 		return 0;
+ 
+ 	pr_flags = fd_type == CR_FD_PAGEMAP ? PR_TASK : PR_SHMEM;
+-	ret = open_page_read_at(pfd, img_id, &pr, pr_flags);
++	ret = open_page_read_at(pfd, img_id, pr, pr_flags);
+ 	close(pfd);
+ 	if (ret <= 0)
+ 		return ret;
+ 
+-	page_read_disable_dedup(&pr);
+-	ret = check_pagehole_in_parent(&pr, iov) ? 0 : 1;
+-	pr.close(&pr);
+-	return ret;
++	page_read_disable_dedup(pr);
++	return 1;
+ }
+ 
+ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+@@ -842,7 +850,7 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
+ 		}
+ 	} else if (flags & PE_PARENT) {
+ 		ret = xfer->parent ? check_pagehole_in_parent(xfer->parent, iov) :
+-		      xfer->remote_parent ? check_parent_server_range(xfer->parent_dst_id, iov) : -1;
++		      xfer->remote_parent && xfer->remote_parent_ranges_validated ? 0 : -1;
+ 		if (ret) {
+ 			pr_err("Hole %p - %p not found in parent\n",
+ 			       iov->iov_base, iov->iov_base + iov->iov_len);
+@@ -874,6 +882,7 @@ static void close_page_xfer(struct page_xfer *xfer)
+ 	}
+ 	xfer->has_parent = false;
+ 	xfer->remote_parent = false;
++	xfer->remote_parent_ranges_validated = false;
+ 	xfer->parent_dst_id = 0;
+ 	xfree(xfer->pending_pe.b_layout.sizes);
+ 	xfer->pending_pe.b_layout.sizes = NULL;
+@@ -911,6 +920,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
+ 	xfer->parent = NULL;
+ 	xfer->has_parent = false;
+ 	xfer->remote_parent = false;
++	xfer->remote_parent_ranges_validated = false;
+ 	xfer->parent_dst_id = 0;
+ 	if (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP) {
+ 		int ret;
+@@ -1007,6 +1017,7 @@ void page_xfer_use_remote_parent(struct page_xfer *xfer, int fd_type, unsigned l
+ 		return;
+ 	xfer->has_parent = true;
+ 	xfer->remote_parent = true;
++	xfer->remote_parent_ranges_validated = false;
+ 	xfer->parent_dst_id = encode_pm(fd_type, img_id);
+ }
+ 
+@@ -1399,7 +1410,13 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
+ 	unsigned int cur_hole = 0;
+-	int ret;
++	int ret = 0;
+ 
+ 	pr_debug("Transferring pages:\n");
++	if (xfer->remote_parent) {
++		ret = check_parent_server_ranges(xfer, pp);
++		if (ret)
++			return ret;
++		xfer->remote_parent_ranges_validated = true;
++	}
+ 
+ 	list_for_each_entry(ppb, &pp->bufs, l) {
+ 		unsigned int i;
+@@ -1413,7 +1431,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
+ 
+ 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
+ 			if (ret)
+-				return ret;
++				goto out;
+ 
+ 			BUG_ON(iov.iov_base < (void *)xfer->offset);
+ 			iov.iov_base -= xfer->offset;
+@@ -1424,13 +1442,20 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
+ 			xfer->force_raw = ppb->flags & PPB_FORCE_RAW;
+ 
+-			if (xfer->write_pagemap(xfer, &iov, flags))
+-				return -1;
+-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+-				return -1;
++			if (xfer->write_pagemap(xfer, &iov, flags)) {
++				ret = -1;
++				goto out;
++			}
++			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len)) {
++				ret = -1;
++				goto out;
++			}
+ 		}
+ 	}
+ 
+-	return dump_holes(xfer, pp, &cur_hole, NULL);
++	ret = dump_holes(xfer, pp, &cur_hole, NULL);
++out:
++	xfer->remote_parent_ranges_validated = false;
++	return ret;
+ }
+ 
+ /*
+@@ -1544,47 +1569,102 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
+ 	return (ret == 0);
+ }
+ 
+-static int page_server_check_parent_range(int sk, struct page_server_iov *pi)
++static int page_server_check_parent_ranges(int sk, struct page_server_iov *pi)
+ {
++	struct page_server_parent_range range;
++	struct page_read pr;
+ 	struct iovec iov;
+ 	unsigned long id;
+-	int covered, type;
++	u64 i;
++	int opened, covered = 1, type;
+ 
+ 	type = decode_pm(pi->dst_id, &id);
+ 	if (type == -1) {
+ 		pr_err("Unknown pagemap type received\n");
+ 		return -1;
+ 	}
+-	if (!pi->nr_pages || (pi->vaddr & (PAGE_SIZE - 1)) ||
+-	    pi->nr_pages > SIZE_MAX / PAGE_SIZE ||
+-	    pi->nr_pages > (ULONG_MAX - (unsigned long)pi->vaddr) / PAGE_SIZE) {
+-		pr_err("Invalid parent range %#" PRIx64 "+%" PRIu64 " pages\n",
+-		       pi->vaddr, pi->nr_pages);
++	if (!pi->nr_pages || pi->nr_pages > PS_PARENT_RANGES_MAX) {
++		pr_err("Invalid parent range count %" PRIu64 "\n", pi->nr_pages);
+ 		return -1;
+ 	}
+ 
+-	psi2iovec(pi, &iov);
+-	covered = check_parent_local_range(type, id, &iov);
+-	if (send_full(sk, &covered, sizeof(covered), "page-server parent range response"))
+-		return -1;
+-	return 0;
++	opened = open_parent_local_reader(type, id, &pr);
++	if (opened < 0)
++		return -1;
++	if (!opened)
++		covered = 0;
++
++	for (i = 0; i < pi->nr_pages; i++) {
++		if (recv_full(sk, &range, sizeof(range), "page-server parent range"))
++			goto err;
++		if (!range.nr_pages || (range.vaddr & (PAGE_SIZE - 1)) ||
++		    range.nr_pages > SIZE_MAX / PAGE_SIZE ||
++		    range.nr_pages > (ULONG_MAX - (unsigned long)range.vaddr) / PAGE_SIZE) {
++			pr_err("Invalid parent range %#" PRIx64 "+%" PRIu64 " pages\n",
++			       range.vaddr, range.nr_pages);
++			goto err;
++		}
++		if (!covered)
++			continue;
++		iov.iov_base = decode_pointer(range.vaddr);
++		iov.iov_len = range.nr_pages * PAGE_SIZE;
++		if (check_pagehole_in_parent(&pr, &iov))
++			covered = 0;
++	}
++
++	if (opened)
++		pr.close(&pr);
++	if (send_full(sk, &covered, sizeof(covered),
++		      "page-server parent ranges response"))
++		return -1;
++	return 0;
++err:
++	if (opened)
++		pr.close(&pr);
++	return -1;
+ }
+ 
+-static int check_parent_server_range(u64 dst_id, struct iovec *iov)
++static int check_parent_server_ranges(struct page_xfer *xfer, struct page_pipe *pp)
+ {
++	struct page_server_parent_range range;
+ 	struct page_server_iov pi = {
+-		.cmd = PS_IOV_PARENT_RANGE,
+-		.nr_pages = iov->iov_len / PAGE_SIZE,
+-		.vaddr = encode_pointer(iov->iov_base),
+-		.dst_id = dst_id,
++		.cmd = PS_IOV_PARENT_RANGES,
++		.dst_id = xfer->parent_dst_id,
+ 	};
++	u64 nr_ranges = 0;
++	unsigned int i;
+ 	int covered;
+ 
++	for (i = 0; i < pp->free_hole; i++)
++		if (pp->hole_flags[i] == PP_HOLE_PARENT)
++			nr_ranges++;
++	if (!nr_ranges)
++		return 0;
++	if (nr_ranges > PS_PARENT_RANGES_MAX) {
++		pr_err("Too many parent ranges: %" PRIu64 "\n", nr_ranges);
++		return -1;
++	}
++	pi.nr_pages = nr_ranges;
+ 	if (send_psi(page_server_sk, &pi))
+ 		return -1;
++
++	for (i = 0; i < pp->free_hole; i++) {
++		struct iovec *hole;
++
++		if (pp->hole_flags[i] != PP_HOLE_PARENT)
++			continue;
++		hole = &pp->holes[i];
++		BUG_ON(hole->iov_base < (void *)xfer->offset);
++		range.vaddr = encode_pointer(hole->iov_base - xfer->offset);
++		range.nr_pages = hole->iov_len / PAGE_SIZE;
++		if (send_full(page_server_sk, &range, sizeof(range),
++			      "page-server parent range"))
++			return -1;
++	}
++
+ 	tcp_nodelay(page_server_sk, true);
+ 	if (recv_full(page_server_sk, &covered, sizeof(covered),
+-		      "page-server parent range response"))
++		      "page-server parent ranges response"))
+ 		return -1;
+ 	if (covered < 0)
+ 		return -1;
+@@ -2028,8 +2106,8 @@ static int page_server_serve(int sk)
+ 		case PS_IOV_PARENT:
+ 			ret = page_server_check_parent(sk, &pi);
+ 			break;
+-		case PS_IOV_PARENT_RANGE:
+-			ret = page_server_check_parent_range(sk, &pi);
++		case PS_IOV_PARENT_RANGES:
++			ret = page_server_check_parent_ranges(sk, &pi);
+ 			break;
+ 		case PS_IOV_ADD_F_COMPRESSED: {
+ 			u32 flags = decode_ps_flags(pi.cmd);

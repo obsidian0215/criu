@@ -15,7 +15,7 @@ check-close-ack:
 	bash ./query-close-ack-regression.sh
 
 check-scaling:
-	REMOTE_PARENT_QUERY_EXPECTATION=per-range bash ./query-scaling-regression.sh
+	REMOTE_PARENT_QUERY_EXPECTATION=batched bash ./query-scaling-regression.sh
 
 check-splice:
 	PRE_DUMP_SEQUENCE=splice REMOTE_PARENT_COMPRESSION=plain bash ./query-matrix-regression.sh
