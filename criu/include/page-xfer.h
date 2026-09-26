@@ -58,6 +58,10 @@ struct page_xfer {
 	};
 
 	struct page_read *parent;
+	bool has_parent;
+	bool remote_parent;
+	bool remote_parent_ranges_validated;
+	u64 parent_dst_id;
 
 	/*
 	 * Pending pagemap entry for compressed writes.
@@ -81,6 +85,12 @@ struct page_xfer {
 	} pending_pe;
 };
 
+static inline bool page_xfer_parent_available(const struct page_xfer *xfer)
+{
+	return xfer->has_parent;
+}
+
+extern void page_xfer_use_remote_parent(struct page_xfer *xfer, int fd_type, unsigned long id);
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
