@@ -1,0 +1,18 @@
+diff --git a/criu/page-xfer.c b/criu/page-xfer.c
+--- a/criu/page-xfer.c
++++ b/criu/page-xfer.c
+@@ -2482,8 +2482,13 @@ int disconnect_from_page_server(void)
+ 	if (send_psi(page_server_sk, &pi))
+ 		goto out;
+ 
+-	if (recv_full(page_server_sk, &status, sizeof(status), "page-server final status")) {
+-		goto out;
++	if (recv_full(page_server_sk, &status, sizeof(status), "page-server final status")) {
++		if (!opts.parent_page_server)
++			goto out;
++
++		pr_warn("The parent query server closed without a final reply\n");
++		status = 0;
+ 	}
+ 
+ 	ret = 0;
