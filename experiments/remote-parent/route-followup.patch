@@ -1,7 +1,7 @@
 diff --git a/criu/page-xfer.c b/criu/page-xfer.c
 --- a/criu/page-xfer.c
 +++ b/criu/page-xfer.c
-@@ -2482,8 +2482,13 @@ int disconnect_from_page_server(void)
+@@ -2482,8 +2482,12 @@ int disconnect_from_page_server(void)
  	if (send_psi(page_server_sk, &pi))
  		goto out;
  
