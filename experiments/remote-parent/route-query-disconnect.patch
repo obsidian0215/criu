@@ -1,6 +1,8 @@
 diff --git a/test/others/remote-parent-experiment/query-disconnect-regression.sh b/test/others/remote-parent-experiment/query-disconnect-regression.sh
 --- a/test/others/remote-parent-experiment/query-disconnect-regression.sh
 +++ b/test/others/remote-parent-experiment/query-disconnect-regression.sh
-@@ -198 +198 @@
+@@ -197,3 +197,3 @@
+ run_case before-parent-response 0
 -run_case after-parent-and-range-response 8
 +run_case after-parent-before-range-response 4
+ python3 - "$RESULTS" "$RESULT_DIR/summary.json" <<'PY'
