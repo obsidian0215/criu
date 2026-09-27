@@ -13,6 +13,7 @@ import sys
 
 PE_PARENT = 1
 PE_PRESENT = 4
+MUTATION_XORS = (0x55, 0xAA, 0x3C)
 
 
 def entries(directory, pid):
@@ -67,13 +68,13 @@ def mutate(directory, pid, state_path):
                               'expected': original, 'generation': 0})
             state = {'page_size': size, 'mutations': 0, 'pages': pages}
         index = state['mutations']
-        if index not in (0, 1):
-            raise RuntimeError('Only two mutation generations are supported')
+        if index not in range(len(MUTATION_XORS)):
+            raise RuntimeError('Only three mutation generations are supported')
         page = state['pages'][index]
         expected = bytes.fromhex(page['expected'])
         if read_exact(fd, page['address'], len(expected)) != expected:
             raise RuntimeError('Workload changed a page reserved for the oracle')
-        changed = bytes(value ^ (0x55 if index == 0 else 0xAA) for value in expected)
+        changed = bytes(value ^ MUTATION_XORS[index] for value in expected)
         write_exact(fd, page['address'], changed)
         page['expected'] = changed.hex()
         page['generation'] = index + 1
@@ -84,7 +85,7 @@ def mutate(directory, pid, state_path):
 
 def check_entries(image_entries, state):
     # Only the latest mutation belongs in the current image; the previous
-    # generation and untouched control must resolve through its parent.
+    # generations and untouched controls must resolve through its parent.
     latest = state['mutations'] - 1
     size = state['page_size']
     for index, page in enumerate(state['pages']):

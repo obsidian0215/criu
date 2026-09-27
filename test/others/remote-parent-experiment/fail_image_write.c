@@ -41,6 +41,13 @@ static bool is_custom_parent(const char *base)
 	       strstr(base, ".img") != NULL;
 }
 
+static bool is_transactional_parent(const char *base)
+{
+	return (!strncmp(base, ".pagemap-", 9) ||
+		!strncmp(base, ".remote-parent-", 15)) &&
+	       strstr(base, ".img.tmp.") != NULL;
+}
+
 static bool selected_image(int fd)
 {
 	const char *mode = getenv("CRIU_TEST_FAIL_IMAGE");
@@ -61,7 +68,8 @@ static bool selected_image(int fd)
 	if (!strcmp(mode, "remote-parent"))
 		return is_custom_parent(base);
 	if (!strcmp(mode, "source-parent"))
-		return is_standard_pagemap(base) || is_custom_parent(base);
+		return is_standard_pagemap(base) || is_custom_parent(base) ||
+		       is_transactional_parent(base);
 	return false;
 }
 

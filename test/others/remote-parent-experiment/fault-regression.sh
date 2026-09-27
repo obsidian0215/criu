@@ -92,7 +92,10 @@ sum_pages() {
 }
 
 assert_failed_parent_safe() {
-	local source=$1 base=$2 final="$base/final-after-failure" payload
+	local source=$1
+	local base=$2
+	local final="$base/final-after-failure"
+	local payload
 	mkdir -p "$final"
 	if "${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
 		--prev-images-dir "../$(basename "$source")"; then
@@ -108,9 +111,16 @@ assert_failed_parent_safe() {
 }
 
 run_case() {
-	local label=$1 server_image=${2:-} disconnect=${3:-} source_image=${4:-}
-	local base="$WORK_DIR/$label" source="$base/source" target="$base/target"
-	local port trust server_env=() source_env=()
+	local label=$1
+	local server_image=${2:-}
+	local disconnect=${3:-}
+	local source_image=${4:-}
+	local base="$WORK_DIR/$label"
+	local source="$base/source"
+	local target="$base/target"
+	local port trust
+	local server_env=()
+	local source_env=()
 	mkdir -p "$source" "$target"
 	start_workload
 	port=$(free_port)
@@ -144,7 +154,8 @@ run_case() {
 	wait_server
 	grep -q TEST_FAULT "$base/server.log" "$base/source.log" ||
 		fail "$label injection did not execute"
-	if compgen -G "$source/.remote-parent-*.tmp.*" >/dev/null; then
+	if compgen -G "$source/.remote-parent-*.tmp.*" >/dev/null ||
+	   compgen -G "$source/.pagemap-*.img.tmp.*" >/dev/null; then
 		fail "$label left temporary parent metadata"
 	fi
 	kill -0 "$PID" 2>/dev/null || fail "$label did not resume workload"
