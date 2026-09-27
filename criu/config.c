@@ -1196,6 +1196,21 @@ bad_arg:
 
 int check_options(void)
 {
+	if (opts.parent_page_server) {
+		if (opts.use_page_server) {
+			pr_err("--page-server and --page-server-parent cannot be used together\n");
+			return 1;
+		}
+		if (opts.mode != CR_DUMP) {
+			pr_err("--page-server-parent is only supported with dump\n");
+			return 1;
+		}
+		if (!opts.img_parent) {
+			pr_err("--page-server-parent requires --prev-images-dir\n");
+			return 1;
+		}
+	}
+
 	/*
 	 * --compress-acceleration (CLI) or compress_acceleration (RPC) on
 	 * their own imply block compression. Resolve that here rather

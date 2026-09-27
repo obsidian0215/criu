@@ -1775,11 +1775,7 @@ err:
 	if (bfd_flush_images())
 		ret = -1;
 
-
 	if (write_img_inventory(&he, parent_ie))
-		ret = -1;
-
-	if (bfd_flush_images())
 		ret = -1;
 
 	if (ret)

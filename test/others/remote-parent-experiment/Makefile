@@ -1,6 +1,9 @@
-.PHONY: check check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation clean
+.PHONY: check check-cli check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation clean
 
-check: clean check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation
+check: clean check-cli check-query check-missing-range check-disconnects check-close-ack check-scaling check-splice check-read check-mixed check-lz4 check-faults check-lifecycle check-boundaries check-contracts check-local-contract check-pid-reuse check-relocation
+
+check-cli:
+	bash ./query-cli-regression.sh
 
 check-query:
 	bash ./remote-parent-query-regression.sh
