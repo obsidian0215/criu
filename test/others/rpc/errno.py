@@ -122,6 +122,24 @@ class test:
 
         print('Success')
 
+    def parent_page_server_requires_parent(self):
+        print('Try parent page-server without parent images')
+
+        req = self.get_base_req()
+        req.type = rpc.DUMP
+        req.opts.leave_running = True
+        req.opts.network_lock = rpc.SKIP
+        req.opts.parent_ps.address = "127.0.0.1"
+        req.opts.parent_ps.port = 1
+
+        self.send_req(req)
+        resp = self.recv_resp()
+
+        self.check_resp(resp, rpc.DUMP, errno.EBADRQC,
+                        "--page-server-parent requires --prev-images-dir")
+
+        print('Success')
+
     def bad_request(self):
         print('Try to send criu invalid request type')
 
@@ -154,6 +172,7 @@ class test:
         self.no_process()
         self.process_exists()
         self.bad_options()
+        self.parent_page_server_requires_parent()
         self.bad_request()
         self.child_first_err()
 

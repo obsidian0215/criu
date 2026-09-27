@@ -569,6 +569,30 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 	}
 
+	if (req->ps && req->parent_ps) {
+		pr_err("ps and parent_ps cannot be used together\n");
+		goto err;
+	}
+
+	if (req->parent_ps) {
+		opts.port = (short)req->parent_ps->port;
+
+		if (req->parent_ps->address) {
+			SET_CHAR_OPTS(addr, req->parent_ps->address);
+		} else {
+			xfree(opts.addr);
+			opts.addr = NULL;
+		}
+
+		if (req->parent_ps->has_fd) {
+			pr_err("parent_ps does not support an inherited page-server fd\n");
+			goto err;
+		}
+
+		if (!opts.lazy_pages)
+			opts.parent_page_server = true;
+	}
+
 	if (req->ps) {
 		opts.port = (short)req->ps->port;
 

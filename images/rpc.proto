@@ -169,6 +169,8 @@ message criu_opts {
 	optional uint32			decompress_threads	= 76 [default = 1];
 	/* Plugin-owned namespaced options in PLUGIN.NAME[=VALUE] form. */
 	repeated string			plugin_options		= 77;
+	/* Page server used only to validate a remote parent during local dump. */
+	optional criu_page_server_info	parent_ps	= 78;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
