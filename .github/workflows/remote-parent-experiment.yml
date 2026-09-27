@@ -16,54 +16,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Apply route implementation and strict test fixes
+      - name: Apply route implementation
         run: |
           set -euxo pipefail
           patch=experiments/remote-parent/route.patch
           test -s "$patch"
           git apply --check "$patch"
           git apply "$patch"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          ci_path = Path('scripts/ci/run-ci-tests.sh')
-          ci_text = ci_path.read_text()
-          marker = '# Unit tests at this point do not require any kernel or hardware capabilities.\n'
-          early = '''if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
-          \ttime make -C test/others/remote-parent-experiment check
-          \texit 0
-          fi
-
-          '''
-          ci_text = ci_text.replace(early, '')
-          if ci_text.count(marker) != 1:
-              raise SystemExit('unable to locate unique unit-test marker')
-          ci_text = ci_text.replace(marker, early + marker, 1)
-          if ci_text.count(early) != 1:
-              raise SystemExit('unable to install unique experiment entry point')
-          ci_path.write_text(ci_text)
-
-          regression_path = Path('test/others/remote-parent-experiment/regression.sh')
-          regression_text = regression_path.read_text()
-          old = '''PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
-          [ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
-          '''
-          new = '''PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
-          if [ "$COMPRESSION" = plain ]; then
-          \t[ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
-          else
-          \t[ "$PRE1_PAYLOAD" -gt 0 ] || fail "first compressed pre-dump has no payload"
-          \tgrep -q "page-xfer: Adding compressed" "$TARGET_PRE1/page-server.log" ||
-          \t\tfail "first pre-dump did not record compressed page ranges"
-          fi
-          '''
-          if regression_text.count(old) != 1:
-              raise SystemExit('unable to locate unique first-payload assertion')
-          regression_text = regression_text.replace(old, new, 1)
-          if regression_text.count(new) != 1:
-              raise SystemExit('unable to install compression-aware first-payload assertion')
-          regression_path.write_text(regression_text)
-          PY
           for script in test/others/remote-parent-experiment/*.sh; do
             bash -n "$script"
           done
@@ -101,6 +60,27 @@ jobs:
               echo "===== $file ====="
               sudo tail -n 500 "$file" || true
             done
+          echo '===== parentless boundary logs ====='
+          sudo find "$root" -path '*/boundary-work-*/*' -type f \
+            \( -name '*.log' -o -name '*.state' -o -name '*.json' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
+          echo '===== parent contract logs ====='
+          sudo find "$root" -path '*/contract-work-*/*' -type f \
+            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
+          echo '===== pid reuse logs ====='
+          sudo find "$root" -path '*/pid-reuse-work-*/*' -type f \
+            \( -name '*.log' -o -name '*.state' -o -name '*.json' -o -name '*.hex' \) -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
+              echo "===== $file ====="
+              sudo tail -n 500 "$file" || true
+            done
       - name: Package experiment diagnostics
         if: always()
         shell: bash
@@ -110,7 +90,7 @@ jobs:
           archive="$RUNNER_TEMP/remote-parent-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
           cd "$root"
           shopt -s nullglob
-          paths=(results fault-work-* lifecycle-work-*)
+          paths=(results fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-*)
           if ((${#paths[@]})); then
             sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
               sudo tar --null -czf "$archive" --files-from=-

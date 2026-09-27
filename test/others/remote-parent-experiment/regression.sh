@@ -263,7 +263,13 @@ start_workload
 run_remote_round pre-dump "$SOURCE_PRE1" "$TARGET_PRE1" "" "" pre1 "${ROUND_MODES[0]}"
 PRE1_WIRE=$LAST_WIRE_UP
 PRE1_PAYLOAD=$(sum_glob_bytes "$TARGET_PRE1" 'pages-*.img')
-[ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
+if [ "$COMPRESSION" = plain ]; then
+	[ "$PRE1_PAYLOAD" -gt $((8 * 1024 * 1024)) ] || fail "first pre-dump payload is too small"
+else
+	[ "$PRE1_PAYLOAD" -gt 0 ] || fail "first compressed pre-dump has no payload"
+	grep -q "page-xfer: Adding compressed" "$TARGET_PRE1/page-server.log" ||
+		fail "first pre-dump did not record compressed page ranges"
+fi
 run_oracle mutate "$TARGET_PRE1" "$PID" "$ORACLE_STATE" || fail "first mutation failed"
 
 run_remote_round pre-dump "$SOURCE_PRE2" "$TARGET_PRE2" "$SOURCE_PRE1" "$TARGET_PRE1" pre2 "${ROUND_MODES[1]}"

@@ -363,8 +363,28 @@ import sys
 route, source, target = sys.argv[1:]
 with open(source) as stream:
     rows = list(csv.DictReader(stream, delimiter='\t'))
-json.dump({'route': route, 'status': 'PASS', 'cases': rows}, open(target, 'w'), indent=2)
+by_case = {row['case']: row['outcome'] for row in rows}
+json.dump({
+    'route': route,
+    'harness_status': 'PASS',
+    'parent_loss': by_case.get('parent-loss'),
+    'generation_mismatch': by_case.get('generation-skew'),
+    'cases': rows,
+}, open(target, 'w'), indent=2)
 open(target, 'a').write('\n')
 PY
+if [ "$ROUTE" = final-page-server ]; then
+	PARENT_LOSS=$(awk -F '\t' '$1 == "parent-loss" {print $2}' "$RESULTS")
+	GENERATION_SKEW=$(awk -F '\t' '$1 == "generation-skew" {print $2}' "$RESULTS")
+	case "$PARENT_LOSS" in
+		SAFE_REJECT|SAFE_FULL) ;;
+		*) fail "final page-server did not handle parent loss before restore ($PARENT_LOSS)" ;;
+	esac
+	case "$GENERATION_SKEW" in
+		SAFE_REJECT|SAFE_FULL) ;;
+		*) fail "final page-server accepted an unbound parent generation ($GENERATION_SKEW)" ;;
+	esac
+fi
+
 printf 'PARENT-CONTRACT PASS route=%s\n' "$ROUTE"
 rm -rf "$WORK_ROOT"

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
+output = Path(sys.argv[2]) if len(sys.argv) > 2 else path.with_name('normalized-summary.json')
 result = json.loads(path.read_text())
 if result.get('status') == 'PASS':
     raise SystemExit(0)
@@ -28,5 +29,5 @@ result['detail'] = (
     'them and the restored workload oracle verified the zero-filled mapping'
 )
 result.pop('restore', None)
-path.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
 print(f"RELOCATION-REGRESSION PASS route={result['route']} outcome=safe-zero-omission")
