@@ -2,7 +2,7 @@
 
 This test covers [issue #2503](https://github.com/checkpoint-restore/criu/issues/2503): one or more page-server pre-dumps followed by a local final dump.
 
-A remote pre-dump writes page payload to the page-server image chain and keeps compact source-side metadata in `remote-parent-*.img`. These files use the normal CRIU pagemap encoding, but do not contain or refer to local page payload. A later local dump accepts a parent reference only when the corresponding range is present there. The assembled destination chain must restore successfully.
+A remote pre-dump writes page payload to the page-server image chain and keeps a standard CRIU pagemap on the source. The source pagemap records parent coverage but has no local pages image. A later local dump accepts a parent reference only when the corresponding range is present in that pagemap. The assembled destination chain must restore successfully.
 
 ## Run
 

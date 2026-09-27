@@ -59,25 +59,39 @@ sum_pages_bytes() {
 	printf '%d\n' "$total"
 }
 
-sum_coverage_bytes() {
+sum_parent_pagemap_bytes() {
 	local directory="$1"
 	local total=0
 	local file
 
-	for file in "$directory"/remote-parent-*.img; do
+	for file in "$directory"/pagemap-*.img; do
 		[ -e "$file" ] || continue
 		total=$((total + $(wc -c < "$file")))
 	done
 	printf '%d\n' "$total"
 }
 
-assert_coverage_committed() {
+count_pages_images() {
+	local directory="$1"
+	local count=0
+	local file
+
+	for file in "$directory"/pages-*.img; do
+		[ -e "$file" ] || continue
+		count=$((count + 1))
+	done
+	printf '%d\n' "$count"
+}
+
+assert_parent_pagemap_committed() {
 	local directory="$1"
 
-	compgen -G "$directory/remote-parent-*.img" >/dev/null ||
-		fail "remote-parent coverage is missing"
-	if compgen -G "$directory/.remote-parent-*.tmp.*" >/dev/null; then
-		fail "temporary remote-parent coverage was not removed"
+	compgen -G "$directory/pagemap-*.img" >/dev/null ||
+		fail "source parent pagemap is missing"
+	[ "$(count_pages_images "$directory")" -eq 0 ] ||
+		fail "source retained a pages image"
+	if compgen -G "$directory/.pagemap-*.img.tmp.*" >/dev/null; then
+		fail "temporary source parent pagemap was not removed"
 	fi
 }
 
@@ -231,7 +245,7 @@ run_remote_parent_regression() {
 	finish_page_server "page server failed while receiving pre-dump"
 
 	source_pre_bytes=$(sum_pages_bytes "$source_pre")
-	coverage_bytes=$(sum_coverage_bytes "$source_pre")
+	coverage_bytes=$(sum_parent_pagemap_bytes "$source_pre")
 	remote_pre_bytes=$(sum_pages_bytes "$target_pre")
 	echo "source-side pre-dump page bytes: $source_pre_bytes"
 	echo "source-side coverage bytes:      $coverage_bytes"
@@ -241,7 +255,7 @@ run_remote_parent_regression() {
 		fail "pre-dump retained memory payload on the source"
 	[ "$remote_pre_bytes" -gt $((8 * 1024 * 1024)) ] ||
 		fail "page server did not receive the expected payload"
-	assert_coverage_committed "$source_pre"
+	assert_parent_pagemap_committed "$source_pre"
 	if [ "$coverage_bytes" -le 0 ] || [ $((coverage_bytes * 64)) -ge "$remote_pre_bytes" ]; then
 		fail "source-side coverage is not compact"
 	fi
@@ -252,8 +266,8 @@ run_remote_parent_regression() {
 	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
 		--prev-images-dir ../source-pre ||
 		fail "remote-parent final local dump failed"
-	grep -q "Using remote parent coverage" "$final/dump.log" ||
-		fail "final dump did not select remote-parent coverage"
+	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+		fail "final dump did not select the source parent pagemap"
 
 	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
 		fail "final image has incorrect generation placement"
@@ -307,13 +321,13 @@ run_remote_parent_multiround_regression() {
 	finish_page_server "first-round page server failed"
 
 	source_pre1_bytes=$(sum_pages_bytes "$source_pre1")
-	coverage_pre1_bytes=$(sum_coverage_bytes "$source_pre1")
+	coverage_pre1_bytes=$(sum_parent_pagemap_bytes "$source_pre1")
 	target_pre1_bytes=$(sum_pages_bytes "$target_pre1")
 	[ "$source_pre1_bytes" -eq 0 ] ||
 		fail "first pre-dump retained memory payload on the source"
 	[ "$target_pre1_bytes" -gt $((8 * 1024 * 1024)) ] ||
 		fail "first page-server pre-dump is unexpectedly small"
-	assert_coverage_committed "$source_pre1"
+	assert_parent_pagemap_committed "$source_pre1"
 
 	dirty_page_generation "$target_pre1" "$base/toggle-address" ||
 		fail "could not dirty a page before the second pre-dump"
@@ -329,7 +343,7 @@ run_remote_parent_multiround_regression() {
 		fail "second round has incorrect generation placement"
 
 	source_pre2_bytes=$(sum_pages_bytes "$source_pre2")
-	coverage_pre2_bytes=$(sum_coverage_bytes "$source_pre2")
+	coverage_pre2_bytes=$(sum_parent_pagemap_bytes "$source_pre2")
 	target_pre2_bytes=$(sum_pages_bytes "$target_pre2")
 	echo "multiround source pre1 pages:    $source_pre1_bytes"
 	echo "multiround source pre1 coverage: $coverage_pre1_bytes"
@@ -344,7 +358,7 @@ run_remote_parent_multiround_regression() {
 		fail "second page-server pre-dump contains no dirty-page payload"
 	[ $((target_pre2_bytes * 4)) -lt "$target_pre1_bytes" ] ||
 		fail "second page-server pre-dump is not incremental"
-	assert_coverage_committed "$source_pre2"
+	assert_parent_pagemap_committed "$source_pre2"
 	if [ "$coverage_pre2_bytes" -le 0 ] || [ $((coverage_pre2_bytes * 64)) -ge "$target_pre1_bytes" ]; then
 		fail "second source-side coverage is not compact"
 	fi
@@ -357,8 +371,8 @@ run_remote_parent_multiround_regression() {
 	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
 		--prev-images-dir ../source-pre2 ||
 		fail "multiround final local dump failed"
-	grep -q "Using remote parent coverage" "$final/dump.log" ||
-		fail "multiround final dump did not select remote coverage"
+	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+		fail "multiround final dump did not select the source parent pagemap"
 
 	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
 		fail "final image has incorrect generation placement"
@@ -385,12 +399,12 @@ run_remote_parent_multiround_regression() {
 	MULTIROUND_FINAL_BYTES="$final_bytes"
 }
 
-assert_no_coverage() {
+assert_no_parent_pagemap() {
 	local directory="$1"
 
-	if compgen -G "$directory/remote-parent-*.img" >/dev/null ||
-	   compgen -G "$directory/.remote-parent-*.tmp.*" >/dev/null; then
-		fail "failed round left published or temporary coverage"
+	if compgen -G "$directory/pagemap-*.img" >/dev/null ||
+	   compgen -G "$directory/.pagemap-*.img.tmp.*" >/dev/null; then
+		fail "failed round left a published or temporary parent pagemap"
 	fi
 }
 
@@ -431,10 +445,10 @@ run_image_write_failure() {
 		grep -q TEST_FAULT "$base/source-stderr.log" ||
 			fail "source inventory fault injection did not execute"
 	fi
-	assert_no_coverage "$source_pre"
+	assert_no_parent_pagemap "$source_pre"
 	kill -0 "$PID" 2>/dev/null || fail "failed pre-dump did not resume its workload"
 	stop_test "$side write failure preserves workload"
-	echo "FAILURE-REGRESSION PASS: $side write failure did not publish coverage"
+	echo "FAILURE-REGRESSION PASS: $side write failure did not publish a parent pagemap"
 }
 
 run_disconnect_failure() {
@@ -460,10 +474,10 @@ run_disconnect_failure() {
 	PAGE_SERVER_PID=""
 	grep -q 'TEST_FAULT: page server disconnected' "$base/server-stderr.log" ||
 		fail "disconnect injection did not execute"
-	assert_no_coverage "$source_pre"
+	assert_no_parent_pagemap "$source_pre"
 	kill -0 "$PID" 2>/dev/null || fail "disconnect did not resume workload"
 	stop_test "$when disconnect preserves workload"
-	echo "FAILURE-REGRESSION PASS: disconnect-$when did not publish coverage"
+	echo "FAILURE-REGRESSION PASS: disconnect-$when did not publish a parent pagemap"
 }
 
 rm -rf "$WORK_DIR"
