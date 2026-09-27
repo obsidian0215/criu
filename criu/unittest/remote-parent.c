@@ -229,6 +229,7 @@ void test_remote_parent(void)
 	struct iovec iov = { .iov_base = (void *)PAGE_SIZE, .iov_len = PAGE_SIZE };
 	const u32 expected_flags[] = { PE_PRESENT, PE_PARENT, PE_PRESENT };
 	const uint64_t expected_vaddrs[] = { PAGE_SIZE, 2 * PAGE_SIZE, 4 * PAGE_SIZE };
+	PagemapEntry payload_entry = PAGEMAP_ENTRY__INIT;
 	int saved_mode = opts.mode;
 	char sentinel[4] = {};
 	int dirfd, fd, i;
@@ -263,13 +264,13 @@ void test_remote_parent(void)
 	check_empty(dirfd);
 
 	/* A payload-bearing pagemap in the same directory belongs to the page server. */
-	entries[0].vaddr = PAGE_SIZE;
-	entries[0].has_nr_pages = true;
-	entries[0].nr_pages = 1;
-	entries[0].has_flags = true;
-	entries[0].flags = PE_PRESENT;
+	payload_entry.vaddr = PAGE_SIZE;
+	payload_entry.has_nr_pages = true;
+	payload_entry.nr_pages = 1;
+	payload_entry.has_flags = true;
+	payload_entry.flags = PE_PRESENT;
 	write_test_pagemap(dirfd, "pagemap-10.img", CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
-			   imgset_template[CR_FD_PAGEMAP].magic, 42, entries, 1);
+			   imgset_template[CR_FD_PAGEMAP].magic, 42, &payload_entry, 1);
 	fd = openat(dirfd, "pages-42.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(fd >= 0);
 	assert(!close(fd));

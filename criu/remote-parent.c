@@ -260,8 +260,12 @@ static int existing_payload_pagemap(struct remote_parent_writer *writer)
 	if (!head->pages_id)
 		goto out;
 
-	if (snprintf(pages_name, sizeof(pages_name), "pages-%u.img", head->pages_id) >= sizeof(pages_name))
-		goto out;
+	{
+		int len = snprintf(pages_name, sizeof(pages_name), "pages-%u.img", head->pages_id);
+
+		if (len < 0 || (size_t)len >= sizeof(pages_name))
+			goto out;
+	}
 	if (!fstatat(writer->dirfd, pages_name, &st, AT_SYMLINK_NOFOLLOW) && S_ISREG(st.st_mode))
 		ret = 1;
 out:
