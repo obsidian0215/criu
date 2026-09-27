@@ -86,6 +86,18 @@ sum_glob_bytes() {
 	printf '%d\n' "$total"
 }
 
+count_glob_files() {
+	local directory=$1
+	local pattern=$2
+	local count=0
+	local file
+	for file in "$directory"/$pattern; do
+		[ -e "$file" ] || continue
+		count=$((count + 1))
+	done
+	printf '%d\n' "$count"
+}
+
 free_port() {
 	python3 - <<'PY'
 import socket
@@ -289,9 +301,11 @@ run_oracle check-image "$TARGET_PRE3" "$PID" "$ORACLE_STATE" || fail "third pre-
 run_oracle mutate "$TARGET_PRE3" "$PID" "$ORACLE_STATE" || fail "third mutation failed"
 
 SOURCE_PRE_PAGES=$(sum_glob_bytes "$SOURCE_PRE3" 'pages-*.img')
+SOURCE_PRE_PAGE_FILES=$(count_glob_files "$SOURCE_PRE3" 'pages-*.img')
 SOURCE_PRE_PAGEMAPS=$(sum_glob_bytes "$SOURCE_PRE3" 'pagemap-*.img')
 SOURCE_REMOTE_META=$(sum_glob_bytes "$SOURCE_PRE3" 'remote-parent-*.img')
 [ "$SOURCE_PRE_PAGES" -eq 0 ] || fail "source retained pre-dump page payload"
+[ "$SOURCE_PRE_PAGE_FILES" -eq 0 ] || fail "source retained pre-dump pages image"
 case "$ROUTE" in
 	final-page-server|local-no-parent)
 		[ "$SOURCE_PRE_PAGEMAPS" -eq 0 ] || fail "route unexpectedly retained source pagemaps"
@@ -346,6 +360,7 @@ cat > "$RESULT_DIR/summary.json" <<EOF_JSON
   "pre3_page_payload": $PRE3_PAYLOAD,
   "final_page_payload": $FINAL_PAYLOAD,
   "source_pre_pages": $SOURCE_PRE_PAGES,
+  "source_pre_page_files": $SOURCE_PRE_PAGE_FILES,
   "source_pre_pagemaps": $SOURCE_PRE_PAGEMAPS,
   "source_remote_metadata": $SOURCE_REMOTE_META
 }
