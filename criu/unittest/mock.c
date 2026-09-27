@@ -10,6 +10,7 @@
 
 #include "servicefd.h"
 #include "compel/infect-util.h"
+#include "images/inventory.pb-c.h"
 
 static int image_dir_fd = -1;
 
@@ -132,12 +133,6 @@ int run_scripts(enum script_actions act)
 	return -1;
 }
 
-typedef struct VmaEntry VmaEntry;
-struct VmaEntry {};
-void vma_entry__init(VmaEntry *message)
-{
-}
-
 int clone_noasan(int (*fn)(void *), int flags, void *arg)
 {
 	return -1;
@@ -162,4 +157,59 @@ char compel_run_id[RUN_ID_HASH_LENGTH];
 int pread_full(int fd, void *buf, size_t count, off_t offset)
 {
 	return -1;
+}
+
+/*
+ * These helpers are linked by the image and protobuf code used by the
+ * remote-parent unit tests. The tests do not exercise their subsystems.
+ */
+int parse_uptime(uint64_t *upt)
+{
+	return -1;
+}
+
+Lsmtype host_lsm_type(void)
+{
+	return LSMTYPE__NO_LSM;
+}
+
+struct pstree_item;
+int get_task_ids(struct pstree_item *item)
+{
+	return -1;
+}
+
+struct parasite_dump_cgroup_args;
+int dump_thread_cgroup(const struct pstree_item *item, uint32_t *cg_set,
+		       struct parasite_dump_cgroup_args *args, int id)
+{
+	return -1;
+}
+
+int img_streamer_open(char *filename, int flags)
+{
+	return -1;
+}
+
+int img_streamer_init(const char *image_dir, int mode)
+{
+	return -1;
+}
+
+void img_streamer_finish(void)
+{
+}
+
+unsigned long root_ns_mask;
+
+typedef int (*uns_call_t)(void *arg, int fd, pid_t pid);
+int __userns_call(const char *func_name, uns_call_t call, int flags, void *arg,
+		  size_t arg_size, int fd)
+{
+	return -1;
+}
+
+void shfree_last(void *ptr)
+{
+	free(ptr);
 }
