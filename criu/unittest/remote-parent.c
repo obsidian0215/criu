@@ -101,7 +101,8 @@ static void test_writer_open_failures(int dirfd)
 	struct rlimit saved_limit, limit;
 	struct sigaction saved_action, action = { .sa_handler = SIG_IGN };
 	unsigned long sequence = 0;
-	char name[128], sentinel[4];
+	char name[128] = {}, sentinel[4];
+	char *image_id, *suffix;
 	DIR *directory;
 	int fd, ret;
 
@@ -111,15 +112,25 @@ static void test_writer_open_failures(int dirfd)
 	directory = fdopendir(openat(dirfd, ".", O_RDONLY | O_DIRECTORY));
 	assert(directory);
 	while ((entry = readdir(directory))) {
-		if (strncmp(entry->d_name, ".remote-parent-pagemap-30.img.tmp.", 32))
+		if (!strstr(entry->d_name, "pagemap-30.img.tmp."))
 			continue;
-		sequence = strtoul(strrchr(entry->d_name, '.') + 1, NULL, 10);
+		assert(strlen(entry->d_name) < sizeof(name));
+		strcpy(name, entry->d_name);
+		suffix = strrchr(name, '.');
+		assert(suffix);
+		sequence = strtoul(suffix + 1, NULL, 10);
 	}
 	assert(!closedir(directory));
 	assert(sequence);
-	ret = snprintf(name, sizeof(name), ".remote-parent-pagemap-31.img.tmp.%d.%lu",
-		       getpid(), sequence + 1);
-	assert(ret > 0 && (size_t)ret < sizeof(name));
+
+	image_id = strstr(name, "pagemap-30.img.tmp.");
+	assert(image_id);
+	image_id += strlen("pagemap-");
+	image_id[1] = '1';
+	suffix = strrchr(name, '.');
+	assert(suffix);
+	ret = snprintf(suffix + 1, sizeof(name) - (size_t)(suffix + 1 - name), "%lu", sequence + 1);
+	assert(ret > 0 && (size_t)ret < sizeof(name) - (size_t)(suffix + 1 - name));
 	fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(fd >= 0 && write(fd, "keep", 4) == 4);
 	assert(!close(fd));
