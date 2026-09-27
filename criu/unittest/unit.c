@@ -18,6 +18,7 @@
 #include "pagemap.h"
 #include "cr_options.h"
 #include "plugin.h"
+#include "protobuf-desc.h"
 
 int parse_statement(int i, char *line, char **configuration);
 void test_remote_parent(void);
@@ -548,6 +549,7 @@ int main(int argc, char *argv[], char *envp[])
 
 	configuration = malloc(10 * sizeof(char *));
 	log_init(NULL);
+	cr_pb_init();
 
 	test_bfd();
 	test_bwrite();
