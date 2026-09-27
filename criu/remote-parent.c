@@ -38,6 +38,7 @@ struct remote_parent_coverage {
 struct remote_parent_writer {
 	struct cr_img *image;
 	int dirfd;
+	int fd_type;
 	char tmp_name[96];
 	char final_name[80];
 	bool published;
@@ -103,6 +104,7 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
 		return -1;
 	}
 	writer->dirfd = -1;
+	writer->fd_type = fd_type;
 
 	ret = coverage_name(writer->final_name, sizeof(writer->final_name), fd_type, img_id);
 	if (ret < 0)
@@ -229,6 +231,46 @@ static int unlink_coverage(int dirfd, const char *name)
 	return -1;
 }
 
+static int existing_payload_pagemap(struct remote_parent_writer *writer)
+{
+	PagemapHead *head = NULL;
+	struct cr_img *image = NULL;
+	struct stat st;
+	char pages_name[64];
+	u32 magic;
+	int fd = -1;
+	int ret = 0;
+
+	fd = openat(writer->dirfd, writer->final_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+
+	image = img_from_fd(fd);
+	if (!image) {
+		close(fd);
+		return -1;
+	}
+
+	if (read_img(image, &magic) <= 0 || magic != IMG_COMMON_MAGIC)
+		goto out;
+	if (read_img(image, &magic) <= 0 || magic != imgset_template[writer->fd_type].magic)
+		goto out;
+	if (pb_read_one(image, &head, PB_PAGEMAP_HEAD) < 0)
+		goto out;
+	if (!head->pages_id)
+		goto out;
+
+	if (snprintf(pages_name, sizeof(pages_name), "pages-%u.img", head->pages_id) >= sizeof(pages_name))
+		goto out;
+	if (!fstatat(writer->dirfd, pages_name, &st, AT_SYMLINK_NOFOLLOW) && S_ISREG(st.st_mode))
+		ret = 1;
+out:
+	if (head)
+		pagemap_head__free_unpacked(head, NULL);
+	close_image(image);
+	return ret;
+}
+
 static int writer_cleanup_all(bool remove_published)
 {
 	struct remote_parent_writer *writer = pending_writers;
@@ -276,8 +318,25 @@ int remote_parent_finish(bool commit)
 
 	for (writer = pending_writers; writer; writer = writer->next) {
 		if (linkat(writer->dirfd, writer->tmp_name, writer->dirfd, writer->final_name, 0)) {
-			pr_perror("Unable to commit remote-parent pagemap %s", writer->final_name);
-			goto rollback;
+			int existing;
+
+			if (errno != EEXIST)
+				goto commit_error;
+			existing = existing_payload_pagemap(writer);
+			if (existing < 0)
+				goto rollback;
+			if (!existing)
+				goto commit_error;
+
+			/*
+			 * A page server using the same image directory already owns the
+			 * standard pagemap. Its payload-bearing image is authoritative;
+			 * the source-side coverage copy is redundant.
+			 */
+			if (unlink_coverage(writer->dirfd, writer->tmp_name))
+				goto rollback;
+			writer->tmp_created = false;
+			continue;
 		}
 		writer->published = true;
 		if (unlink_coverage(writer->dirfd, writer->tmp_name))
@@ -285,8 +344,11 @@ int remote_parent_finish(bool commit)
 		writer->tmp_created = false;
 	}
 
+
 	return writer_cleanup_all(false);
 
+commit_error:
+	pr_perror("Unable to commit remote-parent pagemap %s", writer->final_name);
 rollback:
 	writer_cleanup_all(true);
 	return -1;

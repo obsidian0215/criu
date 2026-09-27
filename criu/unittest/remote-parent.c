@@ -262,6 +262,27 @@ void test_remote_parent(void)
 	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
 	check_empty(dirfd);
 
+	/* A payload-bearing pagemap in the same directory belongs to the page server. */
+	entries[0].vaddr = PAGE_SIZE;
+	entries[0].has_nr_pages = true;
+	entries[0].nr_pages = 1;
+	entries[0].has_flags = true;
+	entries[0].flags = PE_PRESENT;
+	write_test_pagemap(dirfd, "pagemap-10.img", CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
+			   imgset_template[CR_FD_PAGEMAP].magic, 42, entries, 1);
+	fd = openat(dirfd, "pages-42.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	assert(fd >= 0);
+	assert(!close(fd));
+	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
+	iov.iov_base = (void *)PAGE_SIZE;
+	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
+	assert(!remote_parent_finish(true));
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) == 0);
+	assert(!coverage);
+	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
+	assert(!unlinkat(dirfd, "pages-42.img", 0));
+	check_empty(dirfd);
+
 	fd = openat(dirfd, "pagemap-10.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(fd >= 0 && write(fd, "keep", 4) == 4);
 	assert(!close(fd));
