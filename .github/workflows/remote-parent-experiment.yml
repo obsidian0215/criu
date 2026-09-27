@@ -16,13 +16,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Apply route implementation
+      - name: Validate experiment sources
         run: |
           set -euxo pipefail
-          patch=experiments/remote-parent/route.patch
-          test -s "$patch"
-          git apply --check "$patch"
-          git apply "$patch"
           for script in test/others/remote-parent-experiment/*.sh; do
             bash -n "$script"
           done

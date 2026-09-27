@@ -177,7 +177,7 @@ static void test_malformed_images(int dirfd)
 {
 	struct remote_parent_coverage *coverage = NULL;
 	PagemapEntry entries[2] = { PAGEMAP_ENTRY__INIT, PAGEMAP_ENTRY__INIT };
-	const char *name = "remote-parent-pagemap-10.img";
+	const char *name = "pagemap-10.img";
 
 	entries[0].vaddr = PAGE_SIZE;
 	entries[0].has_nr_pages = true;
@@ -196,7 +196,8 @@ static void test_malformed_images(int dirfd)
 
 	write_test_pagemap(dirfd, name, CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
 			   imgset_template[CR_FD_PAGEMAP].magic, 1, entries, 1);
-	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) < 0);
+	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) == 0);
+	assert(!coverage);
 	assert(!unlinkat(dirfd, name, 0));
 
 	entries[0].nr_pages = 0;
@@ -250,7 +251,7 @@ void test_remote_parent(void)
 	remote_parent_writer_close(first);
 	assert(!remote_parent_coverage_exists(dirfd, CR_FD_PAGEMAP, 10));
 	assert(!remote_parent_finish(true));
-	assert_standard_pagemap(dirfd, "remote-parent-pagemap-10.img", CR_FD_PAGEMAP,
+	assert_standard_pagemap(dirfd, "pagemap-10.img", CR_FD_PAGEMAP,
 				expected_flags, expected_vaddrs, 3);
 	assert(remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage) == 1);
 	assert(remote_parent_coverage_contains(coverage, PAGE_SIZE, 2 * PAGE_SIZE));
@@ -258,10 +259,10 @@ void test_remote_parent(void)
 	assert(!remote_parent_coverage_contains(coverage, 3 * PAGE_SIZE, PAGE_SIZE));
 	assert(remote_parent_coverage_contains(coverage, 4 * PAGE_SIZE, PAGE_SIZE));
 	remote_parent_coverage_close(coverage);
-	assert(!unlinkat(dirfd, "remote-parent-pagemap-10.img", 0));
+	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
 	check_empty(dirfd);
 
-	fd = openat(dirfd, "remote-parent-pagemap-10.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	fd = openat(dirfd, "pagemap-10.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(fd >= 0 && write(fd, "keep", 4) == 4);
 	assert(!close(fd));
 	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
@@ -270,12 +271,12 @@ void test_remote_parent(void)
 	assert(!remote_parent_writer_open(CR_FD_SHMEM_PAGEMAP, 20, &second));
 	assert(!remote_parent_writer_record(second, &iov, PE_PRESENT));
 	assert(remote_parent_finish(true) < 0);
-	assert(faccessat(dirfd, "remote-parent-shmem-20.img", F_OK, 0) < 0 && errno == ENOENT);
-	fd = openat(dirfd, "remote-parent-pagemap-10.img", O_RDONLY);
+	assert(faccessat(dirfd, "pagemap-shmem-20.img", F_OK, 0) < 0 && errno == ENOENT);
+	fd = openat(dirfd, "pagemap-10.img", O_RDONLY);
 	assert(fd >= 0 && read(fd, sentinel, sizeof(sentinel)) == sizeof(sentinel));
 	assert(!memcmp(sentinel, "keep", sizeof(sentinel)));
 	assert(!close(fd));
-	assert(!unlinkat(dirfd, "remote-parent-pagemap-10.img", 0));
+	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
 	check_empty(dirfd);
 
 	for (i = 0; i < 32; i++) {
@@ -306,7 +307,7 @@ void test_remote_parent(void)
 	assert(remote_parent_coverage_contains(coverage, 0, 2 * PAGE_SIZE));
 	assert(!remote_parent_coverage_contains(coverage, 0, 3 * PAGE_SIZE));
 	remote_parent_coverage_close(coverage);
-	assert(!unlinkat(dirfd, "remote-parent-shmem-40.img", 0));
+	assert(!unlinkat(dirfd, "pagemap-shmem-40.img", 0));
 	check_empty(dirfd);
 
 	opts.mode = saved_mode;

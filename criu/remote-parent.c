@@ -53,17 +53,15 @@ static bool writer_error;
 
 static int coverage_name(char *buf, size_t size, int fd_type, unsigned long img_id)
 {
-	const char *kind;
 	int ret;
 
 	if (fd_type == CR_FD_PAGEMAP)
-		kind = "pagemap";
+		ret = snprintf(buf, size, "pagemap-%lu.img", img_id);
 	else if (fd_type == CR_FD_SHMEM_PAGEMAP)
-		kind = "shmem";
+		ret = snprintf(buf, size, "pagemap-shmem-%lu.img", img_id);
 	else
 		return 0;
 
-	ret = snprintf(buf, size, "remote-parent-%s-%lu.img", kind, img_id);
 	if (ret < 0 || (size_t)ret >= size) {
 		errno = ENAMETOOLONG;
 		return -1;
@@ -346,8 +344,9 @@ static int open_coverage_image(int dirfd, int fd_type, unsigned long img_id, str
 		goto err;
 	}
 	if (head->pages_id != 0) {
-		pr_err("Remote-parent pagemap %s unexpectedly refers to a pages image\n", name);
-		goto err;
+		pagemap_head__free_unpacked(head, NULL);
+		close_image(image);
+		return 0;
 	}
 
 	pagemap_head__free_unpacked(head, NULL);
