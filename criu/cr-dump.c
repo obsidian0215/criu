@@ -1775,10 +1775,6 @@ err:
 	if (bfd_flush_images())
 		ret = -1;
 
-	if (!ret && opts.use_page_server) {
-		he.has_pages_on_page_server = true;
-		he.pages_on_page_server = true;
-	}
 
 	if (write_img_inventory(&he, parent_ie))
 		ret = -1;

@@ -565,10 +565,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	unsigned long pmc_size;
 	int possible_pid_reuse = 0;
 	bool has_parent;
-	bool remote_parent;
 	int parent_predump_mode = -1;
-	remote_parent = mdc->parent_ie && mdc->parent_ie->has_pages_on_page_server &&
-			mdc->parent_ie->pages_on_page_server;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -608,7 +605,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			goto out_pp;
 
 		xfer.transfer_lazy = !mdc->lazy;
-		if (!opts.use_page_server && opts.parent_page_server && remote_parent) {
+		if (!opts.use_page_server && opts.parent_page_server) {
 			ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
 			if (ret < 0)
 				goto out_xfer;
