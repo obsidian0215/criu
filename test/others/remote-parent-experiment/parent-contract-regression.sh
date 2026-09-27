@@ -373,5 +373,18 @@ json.dump({
 }, open(target, 'w'), indent=2)
 open(target, 'a').write('\n')
 PY
+if [ "$ROUTE" = final-page-server ]; then
+	PARENT_LOSS=$(awk -F '\t' '$1 == "parent-loss" {print $2}' "$RESULTS")
+	GENERATION_SKEW=$(awk -F '\t' '$1 == "generation-skew" {print $2}' "$RESULTS")
+	case "$PARENT_LOSS" in
+		SAFE_REJECT|SAFE_FULL) ;;
+		*) fail "final page-server did not handle parent loss before restore ($PARENT_LOSS)" ;;
+	esac
+	case "$GENERATION_SKEW" in
+		SAFE_REJECT|SAFE_FULL) ;;
+		*) fail "final page-server accepted an unbound parent generation ($GENERATION_SKEW)" ;;
+	esac
+fi
+
 printf 'PARENT-CONTRACT PASS route=%s\n' "$ROUTE"
 rm -rf "$WORK_ROOT"
