@@ -1348,6 +1348,32 @@ int criu_set_page_server_address_port(const char *address, int port)
 	return criu_local_set_page_server_address_port(global_opts, address, port);
 }
 
+int criu_local_set_parent_page_server_address_port(criu_opts *opts, const char *address, int port)
+{
+	CriuPageServerInfo *ps;
+
+	ps = malloc(sizeof(*ps));
+	if (!ps)
+		return -ENOMEM;
+
+	criu_page_server_info__init(ps);
+	ps->address = strdup(address);
+	if (!ps->address) {
+		free(ps);
+		return -ENOMEM;
+	}
+
+	ps->has_port = true;
+	ps->port = port;
+	opts->rpc->parent_ps = ps;
+	return 0;
+}
+
+int criu_set_parent_page_server_address_port(const char *address, int port)
+{
+	return criu_local_set_parent_page_server_address_port(global_opts, address, port);
+}
+
 void criu_local_set_mntns_compat_mode(criu_opts *opts, bool val)
 {
 	opts->rpc->has_mntns_compat_mode = true;
