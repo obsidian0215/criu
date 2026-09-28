@@ -3,7 +3,7 @@ name: Remote parent experiment
 on:
   push:
     branches:
-      - 'feature/remote-parent-page-server-route1-submit'
+      - 'feature/remote-parent-page-server-route1'
   workflow_dispatch:
 
 jobs:
