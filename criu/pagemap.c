@@ -18,6 +18,7 @@
 #include "page-xfer.h"
 #include "pagemap-block.h"
 #include "compression.h"
+#include "util.h"
 
 #include "fault-injection.h"
 #include "xmalloc.h"
@@ -1939,6 +1940,10 @@ static void close_page_read(struct page_read *pr)
 
 	if (pr->pmi)
 		close_image(pr->pmi);
+	xfree(pr->memory_generation_id);
+	xfree(pr->parent_memory_generation_id);
+	pr->memory_generation_id = NULL;
+	pr->parent_memory_generation_id = NULL;
 	if (pr->pi)
 		close_image(pr->pi);
 	if (pr->pmes) {
@@ -2553,6 +2558,79 @@ int probe_pages_o_direct(int fd)
 	return 0;
 }
 
+static int copy_memory_generation(const char *source, char **target, const char *description)
+{
+	*target = NULL;
+	if (!source)
+		return 0;
+	if (!source[0] || strnlen(source, RUN_ID_HASH_LENGTH) == RUN_ID_HASH_LENGTH) {
+		pr_err("Invalid %s in pagemap header\n", description);
+		return -1;
+	}
+	*target = xstrdup(source);
+	return *target ? 0 : -1;
+}
+
+static int read_pagemap_head(struct page_read *pr)
+{
+	PagemapHead *head = NULL;
+	int ret = -1;
+
+	if (pb_read_one(pr->pmi, &head, PB_PAGEMAP_HEAD) < 0)
+		return -1;
+
+	pr->pages_img_id = head->pages_id;
+	if (copy_memory_generation(head->memory_generation_id, &pr->memory_generation_id,
+				   "memory generation") ||
+	    copy_memory_generation(head->parent_memory_generation_id,
+				   &pr->parent_memory_generation_id,
+				   "parent memory generation"))
+		goto out;
+	if (pr->parent_memory_generation_id && !pr->memory_generation_id) {
+		pr_err("Pagemap has a parent generation without its own generation\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	if (ret) {
+		xfree(pr->memory_generation_id);
+		xfree(pr->parent_memory_generation_id);
+		pr->memory_generation_id = NULL;
+		pr->parent_memory_generation_id = NULL;
+	}
+	pagemap_head__free_unpacked(head, NULL);
+	return ret;
+}
+
+static bool page_read_uses_parent(const struct page_read *pr)
+{
+	int i;
+
+	for (i = 0; i < pr->nr_pmes; i++)
+		if (pagemap_in_parent(pr->pmes[i]))
+			return true;
+	return false;
+}
+
+static int validate_parent_memory_generation(const struct page_read *pr)
+{
+	if (!page_read_uses_parent(pr))
+		return 0;
+
+	if (pr->memory_generation_id && !pr->parent_memory_generation_id) {
+		pr_err("Pagemap is missing the expected parent memory generation\n");
+		return -1;
+	}
+	if (!pr->parent_memory_generation_id)
+		return 0;
+	if (!pr->parent || !pr->parent->memory_generation_id ||
+	    strcmp(pr->parent_memory_generation_id, pr->parent->memory_generation_id)) {
+		pr_err("Parent pagemap generation does not match the expected memory generation\n");
+		return -1;
+	}
+	return 0;
+}
+
 int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
 {
 	int flags, i_typ;
@@ -2598,6 +2676,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_len = 0;
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
+	pr->memory_generation_id = NULL;
+	pr->parent_memory_generation_id = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
 	pr->use_direct = false;
@@ -2614,19 +2694,29 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return 0;
 	}
 
+	if (read_pagemap_head(pr)) {
+		close_page_read(pr);
+		return -1;
+	}
+
 	if (try_open_parent(dfd, img_id, pr, pr_flags)) {
-		close_image(pr->pmi);
+		close_page_read(pr);
 		return -1;
 	}
 	set_encoded_read_owner(pr, pr);
 
-	pr->pi = open_pages_image_at(dfd, flags | oflags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_image_at(dfd, CR_FD_PAGES, flags | oflags, pr->pages_img_id);
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
 	}
 
 	if (init_pagemaps(pr)) {
+		close_page_read(pr);
+		return -1;
+	}
+
+	if (validate_parent_memory_generation(pr)) {
 		close_page_read(pr);
 		return -1;
 	}
@@ -2721,6 +2811,9 @@ void dup_page_read(struct page_read *src, struct page_read *dst)
 	dst->blk.cache_vaddr = 0;
 	dst->blk.cache_size = 0;
 	dst->blk.encoded_ctx = NULL;
+	/* Generation metadata is validated while the source reader opens. */
+	dst->memory_generation_id = NULL;
+	dst->parent_memory_generation_id = NULL;
 	/*
 	 * UFFD fork readers are shallow duplicates and keep their root lpi alive
 	 * through its reference count. Reuse that root's chain context instead of
