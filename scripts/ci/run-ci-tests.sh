@@ -195,6 +195,11 @@ fi
 # Just try to run it everywhere for now.
 time make unittest
 
+if [ -n "${REMOTE_PARENT_EXPERIMENT:-}" ]; then
+	time make -C test/others/remote-parent-experiment check
+	exit 0
+fi
+
 [ -n "$SKIP_CI_TEST" ] && exit 0
 
 # Umount cpuset in cgroupv1 to make it move to cgroupv2
