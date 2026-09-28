@@ -2029,12 +2029,17 @@ int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args)
 
 char criu_run_id[RUN_ID_HASH_LENGTH];
 
-void util_init(void)
+void generate_run_id(char id[RUN_ID_HASH_LENGTH])
 {
 	uuid_t uuid;
 
 	uuid_generate(uuid);
-	uuid_unparse(uuid, criu_run_id);
+	uuid_unparse(uuid, id);
+}
+
+void util_init(void)
+{
+	generate_run_id(criu_run_id);
 	pr_info("CRIU run id = %s\n", criu_run_id);
 	memcpy(compel_run_id, criu_run_id, sizeof(criu_run_id));
 }

@@ -962,7 +962,7 @@ struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, stru
 
 		*id = h.pages_id = page_ids++;
 		if (generation_id && generation_id[0])
-			h.dump_criu_run_id = (char *)generation_id;
+			h.memory_generation_id = (char *)generation_id;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 	}

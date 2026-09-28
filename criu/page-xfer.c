@@ -237,7 +237,7 @@ static inline int send_psi(int sk, struct page_server_iov *pi)
 	return send_psi_flags(sk, pi, 0);
 }
 
-int page_server_set_generation(const char *parent_id, bool has_parent)
+int page_server_set_generation(const char *generation_id, const char *parent_id, bool has_parent)
 {
 	struct page_server_generation generation = {};
 	struct page_server_iov pi = {
@@ -250,10 +250,14 @@ int page_server_set_generation(const char *parent_id, bool has_parent)
 		pr_err("Page-server connection is not available\n");
 		return -1;
 	}
+	if (!generation_id || !generation_id[0]) {
+		pr_err("Memory generation id is missing\n");
+		return -1;
+	}
 
-	if (snprintf(generation.current, sizeof(generation.current), "%s", criu_run_id) >=
+	if (snprintf(generation.current, sizeof(generation.current), "%s", generation_id) >=
 	    sizeof(generation.current)) {
-		pr_err("CRIU run id is too long for page-server generation metadata\n");
+		pr_err("Memory generation id is too long\n");
 		return -1;
 	}
 
@@ -262,7 +266,7 @@ int page_server_set_generation(const char *parent_id, bool has_parent)
 	if (parent_id && parent_id[0]) {
 		if (snprintf(generation.parent, sizeof(generation.parent), "%s", parent_id) >=
 		    sizeof(generation.parent)) {
-			pr_err("Parent CRIU run id is too long for page-server generation metadata\n");
+			pr_err("Parent memory generation id is too long\n");
 			return -1;
 		}
 		generation.flags |= PS_GENERATION_HAS_PARENT_ID;
@@ -908,7 +912,7 @@ static void close_page_xfer(struct page_xfer *xfer)
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress,
-				bool use_parent, const char *dump_criu_run_id)
+				bool use_parent, const char *generation_id)
 {
 	u32 pages_id;
 
@@ -1631,11 +1635,11 @@ static int read_parent_generation(int fd_type, unsigned long img_id, char *gener
 		goto err;
 	if (pb_read_one(pmi, &head, PB_PAGEMAP_HEAD) < 0)
 		goto err;
-	if (!head->dump_criu_run_id || !head->dump_criu_run_id[0]) {
+	if (!head->memory_generation_id || !head->memory_generation_id[0]) {
 		ret = 0;
 		goto out;
 	}
-	if (snprintf(generation, size, "%s", head->dump_criu_run_id) >= size) {
+	if (snprintf(generation, size, "%s", head->memory_generation_id) >= size) {
 		pr_err("Parent pagemap generation id is too long\n");
 		goto err;
 	}

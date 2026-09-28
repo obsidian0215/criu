@@ -6,8 +6,8 @@ import "opts.proto";
 
 message pagemap_head {
 	required uint32 pages_id	= 1;
-	/* CRIU run that produced this memory generation, when available. */
-	optional string dump_criu_run_id = 2;
+	/* Identifies the memory generation stored by this pagemap. */
+	optional string memory_generation_id = 2;
 }
 
 message pagemap_entry {

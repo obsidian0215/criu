@@ -43,4 +43,6 @@ message inventory_entry {
 	optional uint32			compress = 15;
 	/* Block size in bytes when compress = 1. Informational. */
 	optional uint32			compress_block_size = 16;
+	/* Identifies the memory generation produced by this dump. */
+	optional string			memory_generation_id = 17;
 }

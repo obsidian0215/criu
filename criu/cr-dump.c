@@ -1683,7 +1683,7 @@ static int setup_alarm_handler(void)
 	return 0;
 }
 
-static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
+static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie, const char *generation_id)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	struct pstree_item *item;
@@ -1707,6 +1707,7 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
 	he.has_compress = true;
 	he.compress = opts.compress_mode;
 	he.dump_criu_run_id = criu_run_id;
+	he.memory_generation_id = (char *)generation_id;
 
 	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
 		he.has_compress_block_size = true;
@@ -1794,8 +1795,11 @@ err:
 int cr_pre_dump_tasks(pid_t pid)
 {
 	InventoryEntry *parent_ie = NULL;
+	char generation_id[RUN_ID_HASH_LENGTH];
 	struct pstree_item *item;
 	int ret = -1;
+
+	generate_run_id(generation_id);
 
 	/*
 	 * We might need a lot of pipes to fetch huge number of pages to dump.
@@ -1837,6 +1841,10 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	if (connect_to_page_server_to_send() < 0)
 		goto err;
+	if (page_server_set_generation(generation_id,
+				       parent_ie ? parent_ie->memory_generation_id : NULL,
+				       parent_ie != NULL))
+		goto err;
 
 	if (setup_alarm_handler())
 		goto err;
@@ -1855,7 +1863,9 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	if (get_parent_inventory(&parent_ie))
 		goto err;
-	if (page_server_set_generation(parent_ie ? parent_ie->dump_criu_run_id : NULL, parent_ie != NULL))
+	if (page_server_set_generation(generation_id,
+				       parent_ie ? parent_ie->memory_generation_id : NULL,
+				       parent_ie != NULL))
 		goto err;
 
 	for_each_pstree_item(item)
@@ -1871,7 +1881,7 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	ret = 0;
 err:
-	ret = cr_pre_dump_finish(ret, parent_ie);
+	ret = cr_pre_dump_finish(ret, parent_ie, generation_id);
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 	return ret;
@@ -1997,9 +2007,12 @@ int cr_dump_tasks(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
+	char generation_id[RUN_ID_HASH_LENGTH];
 	struct pstree_item *item;
 	int ret;
 	int exit_code = -1;
+
+	generate_run_id(generation_id);
 
 	kerndat_warn_about_madv_guards();
 
@@ -2053,6 +2066,7 @@ int cr_dump_tasks(pid_t pid)
 
 	if (prepare_inventory(&he, parent_ie))
 		goto err;
+	he.memory_generation_id = generation_id;
 
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_dump_cpuinfo())
