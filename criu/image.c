@@ -966,24 +966,34 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
-struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id,
+					   const char *generation_id)
 {
 	unsigned long mode = flags & ~O_FORCE_LOCAL;
 
 	if (mode == O_RDONLY || mode == O_RDWR) {
 		PagemapHead *h;
+
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
+
 		*id = h.pages_id = page_ids++;
+		if (generation_id && generation_id[0])
+			h.memory_generation_id = (char *)generation_id;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 	}
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
+}
+
+struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	return open_pages_image_at_generation(dfd, flags, pmi, id, NULL);
 }
 
 struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *id)
