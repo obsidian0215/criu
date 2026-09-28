@@ -20,7 +20,6 @@
 #include "image.h"
 #include "bfd.h"
 #include "page-xfer.h"
-#include "bfd.h"
 #include "remote-parent.h"
 #include "page-pipe.h"
 #include "util.h"

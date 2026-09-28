@@ -1841,8 +1841,6 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	if (connect_to_page_server_to_send() < 0)
 		goto err;
-	if (page_server_send_generation())
-		goto err;
 
 	if (setup_alarm_handler())
 		goto err;
@@ -2070,6 +2068,8 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	if (connect_to_page_server_to_send() < 0)
+		goto err;
+	if (page_server_send_generation())
 		goto err;
 
 	if (setup_alarm_handler())
