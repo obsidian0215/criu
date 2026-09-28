@@ -913,7 +913,7 @@ static void close_page_xfer(struct page_xfer *xfer)
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress,
-				bool use_parent, const char *generation_id)
+				bool use_parent, const char *generation_id, const char *parent_generation_id)
 {
 	u32 pages_id;
 
@@ -922,7 +922,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		return -1;
 
 	xfer->pi = open_pages_image_at_generation(get_service_fd(IMG_FD_OFF), O_DUMP, xfer->pmi, &pages_id,
-					       generation_id);
+					       generation_id, parent_generation_id);
 	if (!xfer->pi)
 		goto err_pmi;
 
@@ -1001,7 +1001,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
 
-	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF, true, NULL);
+	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF, true, NULL, NULL);
 	if (ret)
 		return ret;
 
@@ -1710,6 +1710,7 @@ static int page_server_open(int sk, struct page_server_iov *pi,
 			    const struct page_server_generation *generation)
 {
 	const char *generation_id = generation ? generation->current : NULL;
+	const char *parent_generation_id = NULL;
 	int type, use_parent;
 	unsigned long id;
 
@@ -1732,7 +1733,10 @@ static int page_server_open(int sk, struct page_server_iov *pi,
 	use_parent = page_server_parent_usable(type, id, generation);
 	if (use_parent < 0)
 		return -1;
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, use_parent, generation_id))
+	if (use_parent && generation && (generation->flags & PS_GENERATION_HAS_PARENT_ID))
+		parent_generation_id = generation->parent;
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, use_parent, generation_id,
+				 parent_generation_id))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;

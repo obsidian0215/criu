@@ -946,7 +946,7 @@ void up_page_ids_base(void)
 }
 
 struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id,
-					   const char *generation_id)
+					   const char *generation_id, const char *parent_generation_id)
 {
 	unsigned long mode = flags & ~O_FORCE_LOCAL;
 
@@ -963,6 +963,8 @@ struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, stru
 		*id = h.pages_id = page_ids++;
 		if (generation_id && generation_id[0])
 			h.memory_generation_id = (char *)generation_id;
+		if (parent_generation_id && parent_generation_id[0])
+			h.parent_memory_generation_id = (char *)parent_generation_id;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 	}
@@ -972,7 +974,7 @@ struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, stru
 
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	return open_pages_image_at_generation(dfd, flags, pmi, id, NULL);
+	return open_pages_image_at_generation(dfd, flags, pmi, id, NULL, NULL);
 }
 
 struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *id)
