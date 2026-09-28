@@ -67,7 +67,11 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
 #define PS_IOV_ADD_F_COMPRESSED 8
-#define PS_IOV_OPEN3            9
+/*
+ * Generation-aware image open. An older peer must reject this command
+ * instead of silently accepting an image without the parent check.
+ */
+#define PS_IOV_OPEN_GENERATION 9
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -236,9 +240,14 @@ static inline int send_psi(int sk, struct page_server_iov *pi)
 	return send_psi_flags(sk, pi, 0);
 }
 
-int page_server_set_generation(const char *generation_id, const char *parent_id, bool has_parent)
+static void page_server_clear_generation(void)
 {
 	memset(&client_generation, 0, sizeof(client_generation));
+}
+
+int page_server_set_generation(const char *generation_id, const char *parent_id, bool has_parent)
+{
+	page_server_clear_generation();
 
 	if (!opts.use_page_server)
 		return 0;
@@ -399,7 +408,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	char has_parent;
 	bool bind_generation = client_generation.current[0] != '\0';
 	struct page_server_iov pi = {
-		.cmd = bind_generation ? PS_IOV_OPEN3 : PS_IOV_OPEN2,
+		.cmd = bind_generation ? PS_IOV_OPEN_GENERATION : PS_IOV_OPEN2,
 	};
 
 	xfer->sk = page_server_sk;
@@ -2071,7 +2080,7 @@ static int page_server_serve(int sk)
 		case PS_IOV_OPEN2:
 			ret = page_server_open(sk, &pi, NULL);
 			break;
-		case PS_IOV_OPEN3: {
+		case PS_IOV_OPEN_GENERATION: {
 			struct page_server_generation generation;
 
 			ret = page_server_receive_generation(sk, &generation);
@@ -2507,6 +2516,7 @@ static int connect_to_page_server(void)
 
 int connect_to_page_server_to_send(void)
 {
+	page_server_clear_generation();
 	return connect_to_page_server();
 }
 
@@ -2515,6 +2525,8 @@ int disconnect_from_page_server(void)
 	struct page_server_iov pi = {};
 	int32_t status = -1;
 	int ret = -1;
+
+	page_server_clear_generation();
 
 	if (!opts.use_page_server)
 		return 0;
