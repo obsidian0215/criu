@@ -947,7 +947,8 @@ static void close_page_xfer(struct page_xfer *xfer)
 	close_image(xfer->pmi);
 }
 
-static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress)
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress,
+				const char *generation_id, const char *parent_generation_id, bool use_parent)
 {
 	u32 pages_id;
 
@@ -955,7 +956,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	if (!xfer->pmi)
 		return -1;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+	xfer->pi = open_pages_image_at_generation(get_service_fd(IMG_FD_OFF), O_DUMP, xfer->pmi, &pages_id,
+						       generation_id, parent_generation_id);
 	if (!xfer->pi)
 		goto err_pmi;
 
@@ -1769,7 +1771,9 @@ static void page_server_close(void)
 
 static int page_server_open(int sk, struct page_server_iov *pi)
 {
-	int type;
+	const char *generation_id = NULL;
+	const char *parent_generation_id = NULL;
+	int type, use_parent;
 	unsigned long id;
 
 	type = decode_pm(pi->dst_id, &id);
@@ -1788,7 +1792,16 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 	 * callbacks selected here; PS_IOV_ADD_F_COMPRESSED is handled directly
 	 * by page_server_add_compressed().
 	 */
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false))
+	use_parent = page_server_parent_usable(type, id);
+	if (use_parent < 0)
+		return -1;
+	if (server_generation_set) {
+		generation_id = server_generation.current;
+		if (server_generation.flags & PS_GENERATION_HAS_PARENT_ID)
+			parent_generation_id = server_generation.parent;
+	}
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, generation_id,
+				 parent_generation_id, use_parent))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -2085,6 +2098,9 @@ static int page_server_serve(int sk)
 	bool flushed = false;
 	bool receiving_pages = !opts.lazy_pages;
 
+	memset(&server_generation, 0, sizeof(server_generation));
+	server_generation_set = false;
+
 	if (receiving_pages) {
 		/*
 		 * This socket only accepts data except one thing -- it
@@ -2138,6 +2154,9 @@ static int page_server_serve(int sk)
 			break;
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
+			break;
+		case PS_IOV_GENERATION:
+			ret = page_server_receive_generation(sk);
 			break;
 		case PS_IOV_ADD_F_COMPRESSED: {
 			u32 flags = decode_ps_flags(pi.cmd);
