@@ -921,7 +921,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		return -1;
 
 	xfer->pi = open_pages_image_at_generation(get_service_fd(IMG_FD_OFF), O_DUMP, xfer->pmi, &pages_id,
-					       dump_criu_run_id);
+					       generation_id);
 	if (!xfer->pi)
 		goto err_pmi;
 
