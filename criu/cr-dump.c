@@ -2071,6 +2071,10 @@ int cr_dump_tasks(pid_t pid)
 
 	if (connect_to_page_server_to_send() < 0)
 		goto err;
+	if (page_server_set_generation(generation_id,
+				       parent_ie ? parent_ie->memory_generation_id : NULL,
+				       parent_ie != NULL))
+		goto err;
 
 	if (setup_alarm_handler())
 		goto err;
