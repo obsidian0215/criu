@@ -1706,6 +1706,7 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
 
 	he.has_compress = true;
 	he.compress = opts.compress_mode;
+	he.dump_criu_run_id = criu_run_id;
 
 	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
 		he.has_compress_block_size = true;
@@ -1776,6 +1777,9 @@ err:
 		ret = -1;
 
 	if (write_img_inventory(&he, parent_ie))
+		ret = -1;
+
+	if (bfd_flush_images())
 		ret = -1;
 
 	if (ret)
@@ -1850,6 +1854,8 @@ int cr_pre_dump_tasks(pid_t pid)
 		goto err;
 
 	if (get_parent_inventory(&parent_ie))
+		goto err;
+	if (page_server_set_generation(parent_ie ? parent_ie->dump_criu_run_id : NULL, parent_ie != NULL))
 		goto err;
 
 	for_each_pstree_item(item)

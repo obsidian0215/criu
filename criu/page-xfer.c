@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -17,6 +18,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
+#include "bfd.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
 #include "util.h"
@@ -32,6 +34,18 @@
 #include "compression.h"
 
 static int page_server_sk = -1;
+
+#define PS_GENERATION_HAS_PARENT    (1U << 0)
+#define PS_GENERATION_HAS_PARENT_ID (1U << 1)
+
+struct page_server_generation {
+	u32 flags;
+	char current[RUN_ID_HASH_LENGTH];
+	char parent[RUN_ID_HASH_LENGTH];
+};
+
+static struct page_server_generation server_generation;
+static bool server_generation_set;
 
 struct page_server_iov {
 	u32 cmd;
@@ -54,6 +68,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
 #define PS_IOV_ADD_F_COMPRESSED 8
+#define PS_IOV_GENERATION       9
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -220,6 +235,42 @@ static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 static inline int send_psi(int sk, struct page_server_iov *pi)
 {
 	return send_psi_flags(sk, pi, 0);
+}
+
+int page_server_set_generation(const char *parent_id, bool has_parent)
+{
+	struct page_server_generation generation = {};
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_GENERATION,
+	};
+
+	if (!opts.use_page_server)
+		return 0;
+	if (page_server_sk < 0) {
+		pr_err("Page-server connection is not available\n");
+		return -1;
+	}
+
+	if (snprintf(generation.current, sizeof(generation.current), "%s", criu_run_id) >=
+	    sizeof(generation.current)) {
+		pr_err("CRIU run id is too long for page-server generation metadata\n");
+		return -1;
+	}
+
+	if (has_parent)
+		generation.flags |= PS_GENERATION_HAS_PARENT;
+	if (parent_id && parent_id[0]) {
+		if (snprintf(generation.parent, sizeof(generation.parent), "%s", parent_id) >=
+		    sizeof(generation.parent)) {
+			pr_err("Parent CRIU run id is too long for page-server generation metadata\n");
+			return -1;
+		}
+		generation.flags |= PS_GENERATION_HAS_PARENT_ID;
+	}
+
+	if (send_psi(page_server_sk, &pi))
+		return -1;
+	return send_full(page_server_sk, &generation, sizeof(generation), "page-server generation");
 }
 
 static void tcp_cork(int sk, bool on)
@@ -856,7 +907,8 @@ static void close_page_xfer(struct page_xfer *xfer)
 	close_image(xfer->pmi);
 }
 
-static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress)
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress,
+				bool use_parent, const char *dump_criu_run_id)
 {
 	u32 pages_id;
 
@@ -864,7 +916,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	if (!xfer->pmi)
 		return -1;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+	xfer->pi = open_pages_image_at_generation(get_service_fd(IMG_FD_OFF), O_DUMP, xfer->pmi, &pages_id,
+					       dump_criu_run_id);
 	if (!xfer->pi)
 		goto err_pmi;
 
@@ -883,7 +936,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	 *    to exist in parent (either pagemap or hole)
 	 */
 	xfer->parent = NULL;
-	if (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP) {
+	if (use_parent && (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP)) {
 		int ret;
 		int pfd;
 		int pr_flags = PR_FORCE_LOCAL | ((fd_type == CR_FD_PAGEMAP) ? PR_TASK : PR_SHMEM);
@@ -943,7 +996,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
 
-	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF);
+	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF, true, NULL);
 	if (ret)
 		return ret;
 
@@ -1535,6 +1588,100 @@ static struct pipe_read_dest pipe_read_dest = {
 	.sink_fd = -1,
 };
 
+static int page_server_receive_generation(int sk)
+{
+	struct page_server_generation generation;
+
+	if (recv_full(sk, &generation, sizeof(generation), "page-server generation"))
+		return -1;
+
+	if (!memchr(generation.current, '\0', sizeof(generation.current)) ||
+	    !memchr(generation.parent, '\0', sizeof(generation.parent)) ||
+	    !generation.current[0] ||
+	    (generation.flags & ~(PS_GENERATION_HAS_PARENT | PS_GENERATION_HAS_PARENT_ID)) ||
+	    ((generation.flags & PS_GENERATION_HAS_PARENT_ID) &&
+	     (!(generation.flags & PS_GENERATION_HAS_PARENT) || !generation.parent[0])) ||
+	    (!(generation.flags & PS_GENERATION_HAS_PARENT_ID) && generation.parent[0])) {
+		pr_err("Invalid page-server generation metadata\n");
+		return -1;
+	}
+
+	server_generation = generation;
+	server_generation_set = true;
+	return 0;
+}
+
+static int read_parent_generation(int fd_type, unsigned long img_id, char *generation, size_t size)
+{
+	PagemapHead *head = NULL;
+	struct cr_img *pmi = NULL;
+	int pfd = -1;
+	int ret;
+
+	ret = check_parent_local_xfer(fd_type, img_id);
+	if (ret <= 0)
+		return ret;
+	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+		return -1;
+	if (pfd < 0)
+		return 0;
+
+	pmi = open_image_at(pfd, fd_type, O_RSTR | O_FORCE_LOCAL, img_id);
+	if (!pmi)
+		goto err;
+	if (pb_read_one(pmi, &head, PB_PAGEMAP_HEAD) < 0)
+		goto err;
+	if (!head->dump_criu_run_id || !head->dump_criu_run_id[0]) {
+		ret = 0;
+		goto out;
+	}
+	if (snprintf(generation, size, "%s", head->dump_criu_run_id) >= size) {
+		pr_err("Parent pagemap generation id is too long\n");
+		goto err;
+	}
+	ret = 1;
+	goto out;
+
+err:
+	ret = -1;
+out:
+	if (head)
+		pagemap_head__free_unpacked(head, NULL);
+	if (pmi)
+		close_image(pmi);
+	close_safe(&pfd);
+	return ret;
+}
+
+static int page_server_parent_usable(int fd_type, unsigned long img_id)
+{
+	char actual[RUN_ID_HASH_LENGTH];
+	int ret;
+
+	if (!server_generation_set)
+		return 1;
+	if (!(server_generation.flags & PS_GENERATION_HAS_PARENT))
+		return 0;
+	if (!(server_generation.flags & PS_GENERATION_HAS_PARENT_ID)) {
+		pr_warn("Parent generation is unavailable; writing a self-contained image\n");
+		return 0;
+	}
+
+	ret = read_parent_generation(fd_type, img_id, actual, sizeof(actual));
+	if (ret < 0)
+		return -1;
+	if (!ret) {
+		pr_warn("Parent pagemap has no generation id; writing a self-contained image\n");
+		return 0;
+	}
+	if (strcmp(actual, server_generation.parent)) {
+		pr_warn("Parent generation does not match the source parent; writing a self-contained image\n");
+		return 0;
+	}
+
+	return 1;
+}
+
 static void page_server_close(void)
 {
 	if (cxfer.dst_id != ~0ULL) {
@@ -1549,7 +1696,8 @@ static void page_server_close(void)
 
 static int page_server_open(int sk, struct page_server_iov *pi)
 {
-	int type;
+	const char *generation_id = NULL;
+	int type, use_parent;
 	unsigned long id;
 
 	type = decode_pm(pi->dst_id, &id);
@@ -1568,7 +1716,12 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 	 * callbacks selected here; PS_IOV_ADD_F_COMPRESSED is handled directly
 	 * by page_server_add_compressed().
 	 */
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false))
+	use_parent = page_server_parent_usable(type, id);
+	if (use_parent < 0)
+		return -1;
+	if (server_generation_set)
+		generation_id = server_generation.current;
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, use_parent, generation_id))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -1865,6 +2018,9 @@ static int page_server_serve(int sk)
 	bool flushed = false;
 	bool receiving_pages = !opts.lazy_pages;
 
+	memset(&server_generation, 0, sizeof(server_generation));
+	server_generation_set = false;
+
 	if (receiving_pages) {
 		/*
 		 * This socket only accepts data except one thing -- it
@@ -1919,6 +2075,9 @@ static int page_server_serve(int sk)
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
+		case PS_IOV_GENERATION:
+			ret = page_server_receive_generation(sk);
+			break;
 		case PS_IOV_ADD_F_COMPRESSED: {
 			u32 flags = decode_ps_flags(pi.cmd);
 
@@ -1944,7 +2103,11 @@ static int page_server_serve(int sk)
 		case PS_IOV_FORCE_CLOSE: {
 			int32_t status = 0;
 
-			ret = 0;
+			if (receiving_pages) {
+				page_server_close();
+				status = bfd_flush_images();
+			}
+			ret = status;
 
 			/*
 			 * An answer must be sent back to inform another side,
