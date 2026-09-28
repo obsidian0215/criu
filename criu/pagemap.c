@@ -2560,41 +2560,34 @@ int probe_pages_o_direct(int fd)
 	return 0;
 }
 
-static int read_pagemap_generation(int dfd, int type, unsigned long img_id,
-				   char **generation_id, char **parent_generation_id)
+static int read_pagemap_head(struct page_read *pr)
 {
 	PagemapHead *head = NULL;
-	struct cr_img *pmi;
 	int ret = -1;
 
-	*generation_id = NULL;
-	*parent_generation_id = NULL;
-	pmi = open_image_at(dfd, type, O_RSTR, img_id);
-	if (!pmi)
+	if (pb_read_one(pr->pmi, &head, PB_PAGEMAP_HEAD) < 0)
 		return -1;
-	if (pb_read_one(pmi, &head, PB_PAGEMAP_HEAD) < 0)
-		goto out;
+
+	pr->pages_img_id = head->pages_id;
 	if (head->dump_criu_run_id) {
-		*generation_id = xstrdup(head->dump_criu_run_id);
-		if (!*generation_id)
+		pr->generation_id = xstrdup(head->dump_criu_run_id);
+		if (!pr->generation_id)
 			goto out;
 	}
 	if (head->parent_criu_run_id) {
-		*parent_generation_id = xstrdup(head->parent_criu_run_id);
-		if (!*parent_generation_id)
+		pr->parent_generation_id = xstrdup(head->parent_criu_run_id);
+		if (!pr->parent_generation_id)
 			goto out;
 	}
 	ret = 0;
 out:
 	if (ret) {
-		xfree(*generation_id);
-		xfree(*parent_generation_id);
-		*generation_id = NULL;
-		*parent_generation_id = NULL;
+		xfree(pr->generation_id);
+		xfree(pr->parent_generation_id);
+		pr->generation_id = NULL;
+		pr->parent_generation_id = NULL;
 	}
-	if (head)
-		pagemap_head__free_unpacked(head, NULL);
-	close_image(pmi);
+	pagemap_head__free_unpacked(head, NULL);
 	return ret;
 }
 
@@ -2665,8 +2658,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return 0;
 	}
 
-	if (read_pagemap_generation(dfd, i_typ, img_id, &pr->generation_id,
-				    &pr->parent_generation_id)) {
+	if (read_pagemap_head(pr)) {
 		close_image(pr->pmi);
 		return -1;
 	}
@@ -2677,7 +2669,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	}
 	set_encoded_read_owner(pr, pr);
 
-	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_image_at(dfd, CR_FD_PAGES, flags, pr->pages_img_id);
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
