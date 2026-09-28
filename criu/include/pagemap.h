@@ -151,6 +151,8 @@ struct page_read {
 	struct cr_img *pmi;
 	struct cr_img *pi;
 	uint32_t pages_img_id;
+	char *generation_id;
+	char *parent_generation_id;
 
 	/* Current pagemap we are on */
 	PagemapEntry *pe;

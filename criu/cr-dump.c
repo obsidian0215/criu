@@ -1707,6 +1707,7 @@ static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
 
 	he.has_compress = true;
 	he.compress = opts.compress_mode;
+	he.dump_criu_run_id = criu_run_id;
 
 	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
 		he.has_compress_block_size = true;
@@ -1840,6 +1841,8 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	if (connect_to_page_server_to_send() < 0)
 		goto err;
+	if (page_server_send_generation())
+		goto err;
 
 	if (setup_alarm_handler())
 		goto err;
@@ -1857,6 +1860,9 @@ int cr_pre_dump_tasks(pid_t pid)
 		goto err;
 
 	if (get_parent_inventory(&parent_ie))
+		goto err;
+	page_xfer_set_generation(parent_ie ? parent_ie->dump_criu_run_id : NULL, parent_ie != NULL);
+	if (page_server_send_generation())
 		goto err;
 
 	for_each_pstree_item(item)
@@ -2053,6 +2059,7 @@ int cr_dump_tasks(pid_t pid)
 
 	if (get_parent_inventory(&parent_ie))
 		goto err;
+	page_xfer_set_generation(parent_ie ? parent_ie->dump_criu_run_id : NULL, parent_ie != NULL);
 
 	if (prepare_inventory(&he, parent_ie))
 		goto err;

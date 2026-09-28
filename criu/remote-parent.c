@@ -84,6 +84,7 @@ static int write_pagemap_header(struct cr_img *image, int fd_type)
 
 	/* No pages image exists on the source side. */
 	head.pages_id = 0;
+	head.dump_criu_run_id = criu_run_id;
 	return pb_write_one(image, &head, PB_PAGEMAP_HEAD);
 }
 

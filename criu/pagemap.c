@@ -1939,6 +1939,10 @@ static void close_page_read(struct page_read *pr)
 
 	if (pr->pmi)
 		close_image(pr->pmi);
+	xfree(pr->generation_id);
+	xfree(pr->parent_generation_id);
+	pr->generation_id = NULL;
+	pr->parent_generation_id = NULL;
 	if (pr->pi)
 		close_image(pr->pi);
 	if (pr->pmes) {
@@ -2556,6 +2560,54 @@ int probe_pages_o_direct(int fd)
 	return 0;
 }
 
+static int read_pagemap_generation(int dfd, int type, unsigned long img_id,
+				   char **generation_id, char **parent_generation_id)
+{
+	PagemapHead *head = NULL;
+	struct cr_img *pmi;
+	int ret = -1;
+
+	*generation_id = NULL;
+	*parent_generation_id = NULL;
+	pmi = open_image_at(dfd, type, O_RSTR, img_id);
+	if (!pmi)
+		return -1;
+	if (pb_read_one(pmi, &head, PB_PAGEMAP_HEAD) < 0)
+		goto out;
+	if (head->dump_criu_run_id) {
+		*generation_id = xstrdup(head->dump_criu_run_id);
+		if (!*generation_id)
+			goto out;
+	}
+	if (head->parent_criu_run_id) {
+		*parent_generation_id = xstrdup(head->parent_criu_run_id);
+		if (!*parent_generation_id)
+			goto out;
+	}
+	ret = 0;
+out:
+	if (ret) {
+		xfree(*generation_id);
+		xfree(*parent_generation_id);
+		*generation_id = NULL;
+		*parent_generation_id = NULL;
+	}
+	if (head)
+		pagemap_head__free_unpacked(head, NULL);
+	close_image(pmi);
+	return ret;
+}
+
+static bool page_read_uses_parent(const struct page_read *pr)
+{
+	int i;
+
+	for (i = 0; i < pr->nr_pmes; i++)
+		if (pagemap_in_parent(pr->pmes[i]))
+			return true;
+	return false;
+}
+
 int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
 {
 	int flags, i_typ;
@@ -2598,6 +2650,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_len = 0;
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
+	pr->generation_id = NULL;
+	pr->parent_generation_id = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
 	pr->use_direct = false;
@@ -2609,6 +2663,12 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (empty_image(pr->pmi)) {
 		close_image(pr->pmi);
 		return 0;
+	}
+
+	if (read_pagemap_generation(dfd, i_typ, img_id, &pr->generation_id,
+				    &pr->parent_generation_id)) {
+		close_image(pr->pmi);
+		return -1;
 	}
 
 	if (try_open_parent(dfd, img_id, pr, pr_flags)) {
@@ -2626,6 +2686,15 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (init_pagemaps(pr)) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	if (pr->parent_generation_id && page_read_uses_parent(pr)) {
+		if (!pr->parent || !pr->parent->generation_id ||
+		    strcmp(pr->parent_generation_id, pr->parent->generation_id)) {
+			pr_err("Parent pagemap generation does not match the expected dump\n");
+			close_page_read(pr);
+			return -1;
+		}
 	}
 
 	{

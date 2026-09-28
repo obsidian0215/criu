@@ -111,6 +111,8 @@ struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int connect_to_page_server_to_send(void);
+extern void page_xfer_set_generation(const char *parent_id, bool has_parent);
+extern int page_server_send_generation(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
 
