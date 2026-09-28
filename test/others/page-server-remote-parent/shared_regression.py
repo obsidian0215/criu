@@ -164,13 +164,13 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
                                 client.wait()
                 if any(source.glob('pages-*.img')):
                     raise RuntimeError('source retained page payload')
-                if len(list(source.glob('remote-parent-pagemap-*.img'))) != 2:
+                if len(list(source.glob('pagemap-*.img'))) != 2:
                     raise RuntimeError('coverage missing for one of the two processes')
                 # On this path anonymous shared mappings are represented as
                 # memfd-backed FILE_SHARED VMAs. Stock pre-dump defers them to
                 # the final dump; remote coverage does not track shared-page
                 # dirtiness. Check final capture and sharing below.
-                if list(source.glob('.remote-parent-*.tmp.*')):
+                if list(source.glob('.pagemap-*.img.tmp.*')):
                     raise RuntimeError('temporary coverage remained')
                 payloads.append(sum(p.stat().st_size for p in target.glob('pages-*.img')))
                 captured = [verify_dirty_capture(target, pid, private, private_size,
@@ -197,7 +197,7 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
                        if int(vma['start']) <= shared < int(vma['end'])]
             if len(mapping) != 1 or not int(mapping[0]['flags']) & 1:
                 raise RuntimeError('shared mapping metadata was not preserved')
-            shared_counts = [len(list((base / f'source-{i}').glob('remote-parent-shmem-*.img')))
+            shared_counts = [len(list((base / f'source-{i}').glob('pagemap-shmem-*.img')))
                              for i in (1, 2)]
             memfd_backed = bool(int(mapping[0]['status']) & (1 << 14))
             if not any(shared_counts) and not memfd_backed:
