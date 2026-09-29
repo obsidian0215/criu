@@ -2499,6 +2499,16 @@ free_pagemaps:
 	return -1;
 }
 
+static bool pagemap_references_parent(const struct page_read *pr)
+{
+	int i;
+
+	for (i = 0; i < pr->nr_pmes; i++)
+		if (pagemap_in_parent(pr->pmes[i]))
+			return true;
+	return false;
+}
+
 int probe_pages_o_direct(int fd)
 {
 	int fl, ret, memerr;
@@ -2602,6 +2612,10 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->disable_dedup = false;
 	pr->use_direct = false;
 	pr->streamed = streamed;
+	pr->pmi = NULL;
+	pr->pi = NULL;
+	pr->memory_generation_id[0] = '\0';
+	pr->parent_memory_generation_id[0] = '\0';
 	if (pr_flags & PR_FORCE_LOCAL)
 		oflags = O_FORCE_LOCAL;
 
@@ -2620,7 +2634,13 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	}
 	set_encoded_read_owner(pr, pr);
 
-	pr->pi = open_pages_image_at(dfd, flags | oflags, pr->pmi, &pr->pages_img_id);
+	if (read_pagemap_head(pr->pmi, &pr->pages_img_id,
+			      pr->memory_generation_id, pr->parent_memory_generation_id)) {
+		close_page_read(pr);
+		return -1;
+	}
+
+	pr->pi = open_image_at(dfd, CR_FD_PAGES, flags | oflags, pr->pages_img_id);
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
@@ -2629,6 +2649,15 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (init_pagemaps(pr)) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	if (pr->parent_memory_generation_id[0] && pagemap_references_parent(pr)) {
+		if (!pr->parent || !pr->parent->memory_generation_id[0] ||
+		    strcmp(pr->parent_memory_generation_id, pr->parent->memory_generation_id)) {
+			pr_err("Parent memory generation does not match pagemap expectation\n");
+			close_page_read(pr);
+			return -1;
+		}
 	}
 
 	{
