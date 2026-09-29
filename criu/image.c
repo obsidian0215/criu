@@ -966,24 +966,61 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
+static int copy_pagemap_generation(char *dst, const char *src)
+{
+	if (!dst)
+		return 0;
+	dst[0] = '\0';
+	if (!src)
+		return 0;
+	if (strlen(src) >= RUN_ID_HASH_LENGTH)
+		return -1;
+	memcpy(dst, src, strlen(src) + 1);
+	return 0;
+}
+
+int read_pagemap_head(struct cr_img *pmi, u32 *id,
+		      char *generation_id, char *parent_generation_id)
+{
+	PagemapHead *h;
+	int ret = -1;
+
+	if (generation_id)
+		generation_id[0] = '\0';
+	if (parent_generation_id)
+		parent_generation_id[0] = '\0';
+	if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
+		return -1;
+	*id = h->pages_id;
+
+	if (copy_pagemap_generation(generation_id, h->memory_generation_id) ||
+	    copy_pagemap_generation(parent_generation_id, h->parent_memory_generation_id)) {
+		pr_err("Invalid pagemap generation metadata\n");
+		goto out;
+	}
+
+	ret = 0;
+out:
+	pagemap_head__free_unpacked(h, NULL);
+	return ret;
+}
+
 struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id,
-					   const char *generation_id)
+					      const char *generation_id, const char *parent_generation_id)
 {
 	unsigned long mode = flags & ~O_FORCE_LOCAL;
 
 	if (mode == O_RDONLY || mode == O_RDWR) {
-		PagemapHead *h;
-
-		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
+		if (read_pagemap_head(pmi, id, NULL, NULL))
 			return NULL;
-		*id = h->pages_id;
-		pagemap_head__free_unpacked(h, NULL);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
 
 		*id = h.pages_id = page_ids++;
 		if (generation_id && generation_id[0])
 			h.memory_generation_id = (char *)generation_id;
+		if (parent_generation_id && parent_generation_id[0])
+			h.parent_memory_generation_id = (char *)parent_generation_id;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 	}
@@ -993,7 +1030,7 @@ struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, stru
 
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	return open_pages_image_at_generation(dfd, flags, pmi, id, NULL);
+	return open_pages_image_at_generation(dfd, flags, pmi, id, NULL, NULL);
 }
 
 struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *id)

@@ -8,6 +8,8 @@ message pagemap_head {
 	required uint32 pages_id	= 1;
 	/* Identifies the memory generation stored by this pagemap. */
 	optional string memory_generation_id = 2;
+	/* Identifies the parent generation expected by this pagemap. */
+	optional string parent_memory_generation_id = 3;
 }
 
 message pagemap_entry {

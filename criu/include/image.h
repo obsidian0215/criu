@@ -182,7 +182,9 @@ extern int open_image_lazy(struct cr_img *img);
 extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *pages_id);
 extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *pages_id);
 extern struct cr_img *open_pages_image_at_generation(int dfd, unsigned long flags, struct cr_img *pmi, u32 *pages_id,
-					    const char *generation_id);
+						     const char *generation_id, const char *parent_generation_id);
+extern int read_pagemap_head(struct cr_img *pmi, u32 *pages_id,
+			     char *generation_id, char *parent_generation_id);
 extern void up_page_ids_base(void);
 
 extern struct cr_img *img_from_fd(int fd); /* for cr-show mostly */

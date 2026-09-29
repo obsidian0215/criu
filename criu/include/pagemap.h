@@ -8,6 +8,7 @@
 #include <sys/uio.h>
 
 #include "common/list.h"
+#include "compel/infect-util.h"
 #include "images/pagemap.pb-c.h"
 #include "page.h"
 #include "pagemap-block.h"
@@ -180,6 +181,8 @@ struct page_read {
 
 	/* Pagemap image file ID */
 	unsigned long img_id;
+	char memory_generation_id[RUN_ID_HASH_LENGTH];
+	char parent_memory_generation_id[RUN_ID_HASH_LENGTH];
 
 	PagemapEntry **pmes;
 	int nr_pmes;
