@@ -25,6 +25,7 @@ check-boundaries:
 
 check-contracts:
 	bash ./parent-contract-regression.sh
+	bash ./post-final-parent-swap.sh
 
 check-pid-reuse:
 	bash ./pid-reuse-regression.sh
