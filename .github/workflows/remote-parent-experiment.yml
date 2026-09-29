@@ -3,8 +3,11 @@ name: Remote parent experiment
 on:
   push:
     branches:
-      - 'validation/remote-parent-route1-clean'
+      - 'validation/remote-parent-route2h-v1'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -16,9 +19,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Apply Route 2H product changes
+        run: |
+          set -euxo pipefail
+          python3 experiments/remote-parent/apply-route2h.py "$GITHUB_WORKSPACE"
       - name: Validate experiment sources
         run: |
           set -euxo pipefail
+          python3 -m py_compile experiments/remote-parent/apply-route2h.py
           for script in test/others/remote-parent-experiment/*.sh; do
             bash -n "$script"
           done
@@ -104,3 +112,51 @@ jobs:
           name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}
           path: ${{ env.DIAGNOSTIC_ARCHIVE }}
           if-no-files-found: error
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      BASE_BRANCH: feature/remote-parent-page-server-route1-clean
+      TARGET_BRANCH: feature/remote-parent-page-server-route2h-v1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Publish clean Route 2H candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          transform="$RUNNER_TEMP/apply-route2h.py"
+          cp experiments/remote-parent/apply-route2h.py "$transform"
+          git fetch origin "refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+          git checkout --detach "refs/remotes/origin/$BASE_BRANCH"
+          python3 "$transform" "$GITHUB_WORKSPACE"
+          git diff --check
+          git status --short
+          git add \
+            images/pagemap.proto \
+            criu/include/image.h \
+            criu/include/pagemap.h \
+            criu/image.c \
+            criu/page-xfer.c \
+            criu/pagemap.c
+          git diff --cached --quiet && {
+            echo 'Route 2H transformation produced no changes' >&2
+            exit 1
+          }
+          git config user.name 'YIFAN LU'
+          git config user.email 'luyifan20@mails.ucas.edu.cn'
+          git commit -m 'pagemap: bind inherited pages to parent generation' \
+            -m 'Record the destination parent generation in page-server-created pagemaps and verify it against the parent that restore actually opens. Self-contained fallback images remain unbound because they contain no inherited ranges.' \
+            -m 'Signed-off-by: YIFAN LU <luyifan20@mails.ucas.edu.cn>'
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null; then
+            git fetch origin "refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
+            expected=$(git rev-parse "refs/remotes/origin/$TARGET_BRANCH")
+            git push --force-with-lease="refs/heads/$TARGET_BRANCH:$expected" \
+              origin "HEAD:refs/heads/$TARGET_BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          fi
