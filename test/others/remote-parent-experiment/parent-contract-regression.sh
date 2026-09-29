@@ -214,6 +214,27 @@ probe_tracked() {
 		python3 "$PROBE" "$directory" "$image_id" "$address"
 }
 
+
+pagemap_generation() {
+	local directory=$1 image_id=$2 field_name=$3
+	PYTHONPATH="$TOP/lib${PYTHONPATH:+:$PYTHONPATH}" \
+		python3 - "$directory" "$image_id" "$field_name" <<'PY_GENERATION'
+from pathlib import Path
+import sys
+import pycriu.images
+
+directory, image_id, field = sys.argv[1:]
+with (Path(directory) / f'pagemap-{image_id}.img').open('rb') as image:
+    entries = pycriu.images.load(image)['entries']
+if not entries:
+    raise SystemExit('empty pagemap image')
+value = entries[0].get(field)
+if not value:
+    raise SystemExit(f'missing {field}')
+print(value)
+PY_GENERATION
+}
+
 restore_and_check() {
 	local target=$1 root_pid=$2
 	ORACLE_RESULT=""
@@ -237,6 +258,54 @@ record() {
 	printf '%s\t%s\t%s\t%s\n' "$name" "$outcome" "$final_class" "$detail" >> "$RESULTS"
 	printf 'PARENT-CONTRACT route=%s case=%s outcome=%s class=%s detail=%s\n' \
 		"$ROUTE" "$name" "$outcome" "$final_class" "$detail"
+}
+
+run_source_coverage_generation_skew() {
+	local base="$WORK_ROOT/source-coverage-generation-skew"
+	local source_pre1="$base/source-pre1"
+	local source_pre2="$base/source-pre2"
+	local source_final="$base/source-final"
+	local target_pre1="$base/target-pre1"
+	local target_pre2="$base/target-pre2"
+	local target_final="$base/target-final"
+	local root_pid tracked old_generation new_generation
+
+	[ "$ROUTE" = local-pagemap ] || return 0
+	mkdir -p "$base"
+	start_workload "$base"
+	root_pid=$PID
+	tracked=$(field tracked)
+
+	remote_predump "$source_pre1" "$target_pre1"
+	probe_tracked "$target_pre1" "$root_pid" "$tracked" present >/dev/null ||
+		fail "first parent does not contain the tracked page"
+	old_generation=$(pagemap_generation "$source_pre1" "$root_pid" dump_criu_run_id) ||
+		fail "first source coverage has no generation id"
+
+	kill -USR1 "$PID" || fail "unable to create the second memory generation"
+	wait_phase GEN2 || fail "workload did not create the second generation"
+	printf '62\n' > "$EXPECTED_FILE"
+	remote_predump "$source_pre2" "$target_pre2" "$source_pre1" "$target_pre1"
+	new_generation=$(pagemap_generation "$source_pre2" "$root_pid" dump_criu_run_id) ||
+		fail "second source coverage has no generation id"
+	[ "$old_generation" != "$new_generation" ] ||
+		fail "distinct source pre-dumps reused one generation id"
+
+	cp "$source_pre1/pagemap-$root_pid.img" "$source_pre2/pagemap-$root_pid.img"
+	[ "$(pagemap_generation "$source_pre2" "$root_pid" dump_criu_run_id)" = "$old_generation" ] ||
+		fail "coverage replacement did not install the older generation"
+
+	if final_dump "$source_final" "$target_final" "$source_pre2" "$target_pre2"; then
+		fail "local final dump accepted coverage from a different parent generation"
+	fi
+	[ -n "$PID" ] && kill -0 "$PID" 2>/dev/null ||
+		fail "coverage-generation rejection did not leave the workload running"
+	grep -q 'Remote-parent pagemap generation does not match the selected parent' \
+		"$source_final/dump.log" ||
+		fail "stale coverage was rejected for an unrelated reason"
+	record source-coverage-generation-skew SAFE_REJECT not-produced \
+		"local final dump rejected coverage from an older source generation"
+	cleanup_processes
 }
 
 run_parent_loss() {
@@ -353,6 +422,7 @@ mkdir -p "$WORK_ROOT" "$RESULT_DIR"
 	fail "identity workload compilation failed"
 printf 'case\toutcome\tfinal_class\tdetail\n' > "$RESULTS"
 
+run_source_coverage_generation_skew
 run_parent_loss
 run_generation_skew
 
@@ -369,6 +439,7 @@ json.dump({
     'harness_status': 'PASS',
     'parent_loss': by_case.get('parent-loss'),
     'generation_mismatch': by_case.get('generation-skew'),
+    'source_coverage_generation_skew': by_case.get('source-coverage-generation-skew'),
     'cases': rows,
 }, open(target, 'w'), indent=2)
 open(target, 'a').write('\n')
@@ -384,6 +455,11 @@ if [ "$ROUTE" = final-page-server ]; then
 		SAFE_REJECT|SAFE_FULL) ;;
 		*) fail "final page-server accepted an unbound parent generation ($GENERATION_SKEW)" ;;
 	esac
+fi
+if [ "$ROUTE" = local-pagemap ]; then
+	COVERAGE_SKEW=$(awk -F '\t' '$1 == "source-coverage-generation-skew" {print $2}' "$RESULTS")
+	[ "$COVERAGE_SKEW" = SAFE_REJECT ] ||
+		fail "local final dump accepted stale source coverage ($COVERAGE_SKEW)"
 fi
 
 printf 'PARENT-CONTRACT PASS route=%s\n' "$ROUTE"
