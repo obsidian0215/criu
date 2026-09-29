@@ -275,6 +275,17 @@ EOF_JSON
 		exit 0
 	fi
 
+	if [ "$FINAL_PRESENT" -eq 0 ] && [ "$FINAL_PARENT" -eq 0 ] &&
+	   [ "$FINAL_UNCOVERED" -eq $((SIZE / PAGE_SIZE)) ]; then
+		restore_and_verify "$TARGET_FINAL" "$BASE" ||
+			fail "zero-page omission did not restore the relocated mapping"
+		cat > "$RESULT_DIR/summary.json" <<EOF_JSON
+{"route":"$ROUTE","status":"PASS","outcome":"safe-zero-omission","softdirty_pages":$SOFTDIRTY,"parent_covered_pages":$PARENT_COVERED,"final_present_pages":$FINAL_PRESENT,"final_parent_pages":$FINAL_PARENT,"final_uncovered_pages":$FINAL_UNCOVERED}
+EOF_JSON
+		echo "RELOCATION-REGRESSION PASS route=$ROUTE outcome=safe-zero-omission"
+		exit 0
+	fi
+
 	RESTORE_RESULT="failed"
 	if restore_and_verify "$TARGET_FINAL" "$BASE"; then
 		RESTORE_RESULT="unexpected-success"
@@ -282,7 +293,7 @@ EOF_JSON
 	cat > "$RESULT_DIR/summary.json" <<EOF_JSON
 {"route":"$ROUTE","status":"FAIL","outcome":"unsafe-parent-accepted","softdirty_pages":$SOFTDIRTY,"parent_covered_pages":$PARENT_COVERED,"final_present_pages":$FINAL_PRESENT,"final_parent_pages":$FINAL_PARENT,"final_uncovered_pages":$FINAL_UNCOVERED,"restore":"$RESTORE_RESULT"}
 EOF_JSON
-	fail "final dump accepted parent references for a relocated range absent from the remote parent"
+	fail "final dump accepted an unsupported relocated range"
 fi
 
 kill -0 "$PID" 2>/dev/null || fail "failed final dump killed the workload"

@@ -31,7 +31,7 @@ check-pid-reuse:
 	bash ./pid-reuse-regression.sh
 
 check-relocation:
-	bash ./relocation-regression.sh || python3 ./accept-zero-relocation.py results/relocation/summary.json results/relocation/normalized-summary.json
+	bash ./relocation-regression.sh
 
 clean:
 	rm -rf work-* fault-work-* lifecycle-work-* boundary-work-* contract-work-* pid-reuse-work-* relocation-work-* results
