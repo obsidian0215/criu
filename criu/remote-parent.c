@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,9 +21,8 @@
 #include "images/pagemap.pb-c.h"
 
 /*
- * The source-side file is a regular CRIU pagemap image. It contains no page
- * payload, so pages_id is zero and the file is used only to validate parent
- * ranges during the later local dump.
+ * The source keeps a pagemap without a pages image. The local final dump
+ * uses it to validate ranges that already exist on the page server.
  */
 struct remote_parent_range {
 	unsigned long start;
@@ -359,7 +359,8 @@ rollback:
 	return -1;
 }
 
-static int open_coverage_image(int dirfd, int fd_type, unsigned long img_id, struct cr_img **out)
+static int open_coverage_image(int dirfd, int fd_type, unsigned long img_id,
+			       const char *expected_generation, struct cr_img **out)
 {
 	PagemapHead *head = NULL;
 	struct cr_img *image = NULL;
@@ -414,6 +415,22 @@ static int open_coverage_image(int dirfd, int fd_type, unsigned long img_id, str
 		pagemap_head__free_unpacked(head, NULL);
 		close_image(image);
 		return 0;
+	}
+	if (expected_generation) {
+		if (!expected_generation[0] ||
+		    strnlen(expected_generation, RUN_ID_HASH_LENGTH) == RUN_ID_HASH_LENGTH) {
+			pr_err("Invalid selected parent generation for remote-parent pagemap %s\n", name);
+			goto err;
+		}
+		if (!head->dump_criu_run_id || !head->dump_criu_run_id[0] ||
+		    strnlen(head->dump_criu_run_id, RUN_ID_HASH_LENGTH) == RUN_ID_HASH_LENGTH) {
+			pr_err("Remote-parent pagemap %s has no valid generation id\n", name);
+			goto err;
+		}
+		if (strcmp(head->dump_criu_run_id, expected_generation)) {
+			pr_err("Remote-parent pagemap generation does not match the selected parent\n");
+			goto err;
+		}
 	}
 
 	pagemap_head__free_unpacked(head, NULL);
@@ -477,8 +494,9 @@ static int coverage_add(struct remote_parent_coverage *coverage, uint64_t start,
 	return 0;
 }
 
-int remote_parent_coverage_open(int dirfd, int fd_type, unsigned long img_id,
-				struct remote_parent_coverage **out)
+static int remote_parent_coverage_read(int dirfd, int fd_type, unsigned long img_id,
+				       const char *expected_generation,
+				       struct remote_parent_coverage **out)
 {
 	struct remote_parent_coverage *coverage;
 	struct cr_img *image;
@@ -486,7 +504,7 @@ int remote_parent_coverage_open(int dirfd, int fd_type, unsigned long img_id,
 	int ret;
 
 	*out = NULL;
-	ret = open_coverage_image(dirfd, fd_type, img_id, &image);
+	ret = open_coverage_image(dirfd, fd_type, img_id, expected_generation, &image);
 	if (ret <= 0)
 		return ret;
 
@@ -538,12 +556,23 @@ err:
 	return -1;
 }
 
+int remote_parent_coverage_open(int dirfd, int fd_type, unsigned long img_id,
+				const char *expected_generation,
+				struct remote_parent_coverage **coverage)
+{
+	if (!expected_generation || !expected_generation[0]) {
+		pr_err("Selected parent generation is unavailable for remote-parent coverage\n");
+		return -1;
+	}
+	return remote_parent_coverage_read(dirfd, fd_type, img_id, expected_generation, coverage);
+}
+
 int remote_parent_coverage_exists(int dirfd, int fd_type, unsigned long img_id)
 {
 	struct remote_parent_coverage *coverage = NULL;
 	int ret;
 
-	ret = remote_parent_coverage_open(dirfd, fd_type, img_id, &coverage);
+	ret = remote_parent_coverage_read(dirfd, fd_type, img_id, NULL, &coverage);
 	if (ret > 0)
 		remote_parent_coverage_close(coverage);
 	return ret;

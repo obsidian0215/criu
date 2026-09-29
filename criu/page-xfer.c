@@ -990,14 +990,15 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		if (pfd < 0)
 			goto out;
 
-		ret = remote_parent_coverage_open(pfd, fd_type, img_id, &xfer->parent.remote);
+		ret = remote_parent_coverage_open(pfd, fd_type, img_id, parent_generation_id,
+					  &xfer->parent.remote);
 		if (ret < 0) {
 			close(pfd);
 			goto err_pi;
 		}
 		if (ret > 0) {
 			xfer->parent.kind = PAGE_PARENT_REMOTE_COVERAGE;
-			pr_info("Using parent pagemap as remote coverage for %d/%lu\n", fd_type, img_id);
+			pr_info("Using source pagemap coverage for %d/%lu\n", fd_type, img_id);
 			close(pfd);
 			goto out;
 		}

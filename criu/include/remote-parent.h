@@ -15,6 +15,7 @@ void remote_parent_writer_close(struct remote_parent_writer *writer);
 int remote_parent_finish(bool commit);
 
 int remote_parent_coverage_open(int dirfd, int fd_type, unsigned long img_id,
+				const char *expected_generation,
 				struct remote_parent_coverage **coverage);
 int remote_parent_coverage_exists(int dirfd, int fd_type, unsigned long img_id);
 bool remote_parent_coverage_contains(const struct remote_parent_coverage *coverage,
