@@ -2651,9 +2651,15 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	if (pr->parent_memory_generation_id[0] && pagemap_references_parent(pr)) {
-		if (!pr->parent || !pr->parent->memory_generation_id[0] ||
-		    strcmp(pr->parent_memory_generation_id, pr->parent->memory_generation_id)) {
+	if (pagemap_references_parent(pr)) {
+		if (!pr->parent_memory_generation_id[0]) {
+			if (pr->memory_generation_id[0]) {
+				pr_err("Inherited pagemap is missing the expected parent generation\n");
+				close_page_read(pr);
+				return -1;
+			}
+		} else if (!pr->parent || !pr->parent->memory_generation_id[0] ||
+			   strcmp(pr->parent_memory_generation_id, pr->parent->memory_generation_id)) {
 			pr_err("Parent memory generation does not match pagemap expectation\n");
 			close_page_read(pr);
 			return -1;
