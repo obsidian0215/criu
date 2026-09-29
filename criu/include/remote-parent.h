@@ -14,9 +14,11 @@ int remote_parent_writer_record(struct remote_parent_writer *writer, const struc
 void remote_parent_writer_close(struct remote_parent_writer *writer);
 int remote_parent_finish(bool commit);
 
+/* Coverage is usable only for the parent generation that produced it. */
 int remote_parent_coverage_open(int dirfd, int fd_type, unsigned long img_id,
 				const char *expected_generation,
 				struct remote_parent_coverage **coverage);
+/* This probes the image only; it does not establish a parent relationship. */
 int remote_parent_coverage_exists(int dirfd, int fd_type, unsigned long img_id);
 bool remote_parent_coverage_contains(const struct remote_parent_coverage *coverage,
 				     unsigned long vaddr, unsigned long len);
