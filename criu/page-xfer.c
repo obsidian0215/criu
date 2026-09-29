@@ -966,6 +966,17 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 			close(pfd);
 			goto out;
 		}
+		if (parent_generation_id &&
+		    (!xfer->parent->memory_generation_id[0] ||
+		     strcmp(parent_generation_id, xfer->parent->memory_generation_id))) {
+			pr_warn("Opened parent generation does not match the source parent; "
+				"writing a self-contained image\n");
+			xfer->parent->close(xfer->parent);
+			xfree(xfer->parent);
+			xfer->parent = NULL;
+			close(pfd);
+			goto out;
+		}
 		close(pfd);
 	}
 
@@ -1623,76 +1634,18 @@ static int page_server_receive_generation(int sk, struct page_server_generation 
 	return 0;
 }
 
-static int read_parent_generation(int fd_type, unsigned long img_id, char *generation, size_t size)
+static bool page_server_should_use_parent(const struct page_server_generation *generation)
 {
-	PagemapHead *head = NULL;
-	struct cr_img *pmi = NULL;
-	int pfd = -1;
-	int ret;
-
-	ret = check_parent_local_xfer(fd_type, img_id);
-	if (ret <= 0)
-		return ret;
-	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
-		return -1;
-	if (pfd < 0)
-		return 0;
-
-	pmi = open_image_at(pfd, fd_type, O_RSTR | O_FORCE_LOCAL, img_id);
-	if (!pmi)
-		goto err;
-	if (pb_read_one(pmi, &head, PB_PAGEMAP_HEAD) < 0)
-		goto err;
-	if (!head->memory_generation_id || !head->memory_generation_id[0]) {
-		ret = 0;
-		goto out;
-	}
-	if (snprintf(generation, size, "%s", head->memory_generation_id) >= size) {
-		pr_err("Parent pagemap generation id is too long\n");
-		goto err;
-	}
-	ret = 1;
-	goto out;
-
-err:
-	ret = -1;
-out:
-	if (head)
-		pagemap_head__free_unpacked(head, NULL);
-	if (pmi)
-		close_image(pmi);
-	close_safe(&pfd);
-	return ret;
-}
-
-static int page_server_parent_usable(int fd_type, unsigned long img_id,
-				     const struct page_server_generation *generation)
-{
-	char actual[RUN_ID_HASH_LENGTH];
-	int ret;
-
 	if (!generation)
-		return 1;
+		return true;
 	if (!(generation->flags & PS_GENERATION_HAS_PARENT))
-		return 0;
+		return false;
 	if (!(generation->flags & PS_GENERATION_HAS_PARENT_ID)) {
 		pr_warn("Parent generation is unavailable; writing a self-contained image\n");
-		return 0;
+		return false;
 	}
 
-	ret = read_parent_generation(fd_type, img_id, actual, sizeof(actual));
-	if (ret < 0)
-		return -1;
-	if (!ret) {
-		pr_warn("Parent pagemap has no generation id; writing a self-contained image\n");
-		return 0;
-	}
-	if (strcmp(actual, generation->parent)) {
-		pr_warn("Parent generation does not match the source parent; writing a self-contained image\n");
-		return 0;
-	}
-
-	return 1;
+	return true;
 }
 
 static void page_server_close(void)
@@ -1711,7 +1664,8 @@ static int page_server_open(int sk, struct page_server_iov *pi,
 			    const struct page_server_generation *generation)
 {
 	const char *generation_id = generation ? generation->current : NULL;
-	int type, use_parent;
+	bool use_parent;
+	int type;
 	unsigned long id;
 
 	type = decode_pm(pi->dst_id, &id);
@@ -1730,9 +1684,7 @@ static int page_server_open(int sk, struct page_server_iov *pi,
 	 * callbacks selected here; PS_IOV_ADD_F_COMPRESSED is handled directly
 	 * by page_server_add_compressed().
 	 */
-	use_parent = page_server_parent_usable(type, id, generation);
-	if (use_parent < 0)
-		return -1;
+	use_parent = page_server_should_use_parent(generation);
 	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, use_parent, generation_id,
 				 use_parent && generation ? generation->parent : NULL))
 		return -1;
