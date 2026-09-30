@@ -7,7 +7,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "bfd.h"
 #include "cr_options.h"
 #include "image-desc.h"
 #include "image.h"

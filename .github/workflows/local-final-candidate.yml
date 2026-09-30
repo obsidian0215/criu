@@ -65,8 +65,7 @@ jobs:
                  test/others/page-server-remote-parent/comparison.*
                  test/others/page-server-remote-parent/remote-parent-regression.*
                  test/others/page-server-remote-parent/shared-regression.*
-                 test/zdtm/static/compress_pages00.out
-                 test/zdtm/static/compress_pages00.out.inprogress)
+                 test/zdtm/static/compress_pages00.out*)
           # Root-owned PID/image files are read by tar, never traversed by the uploader.
           sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
             sudo tar --null --no-recursion -czf "$archive" --files-from=-

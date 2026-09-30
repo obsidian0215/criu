@@ -12,7 +12,7 @@ BASELINE=3e067bc2639b7f98e8bc64b30c05f60b4dd52df8
 EVIDENCE="$ROOT/.local-final-ci"
 mkdir -p "$EVIDENCE"
 exec > >(tee "$EVIDENCE/runner.log") 2>&1
-trap 'result=$?; printf "%s\n" "$result" > "$EVIDENCE/exit-code"' EXIT
+trap 'printf "%s\n" "$?" > "$EVIDENCE/exit-code"' EXIT
 JOBS=$(nproc)
 [ "$JOBS" -le 8 ] || JOBS=8
 status=0
