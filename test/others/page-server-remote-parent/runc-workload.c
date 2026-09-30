@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,13 @@ static void mark(const char *name, const char *value) {
 	if (!f || fprintf(f, "%s\n", value) < 0 || fclose(f)) _exit(2);
 }
 int main(void) {
+	/* runc's diagnostic stderr belongs to the host. Replace inherited stdio
+	 * with this container's /dev/null so every workload fd is restorable. */
+	int nullfd = open("/dev/null", O_RDWR);
+	if (nullfd < 0) return 2;
+	for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++)
+		if (dup2(nullfd, fd) < 0) return 2;
+	if (nullfd > STDERR_FILENO && close(nullfd)) return 2;
 	if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) return 2;
 	unsigned char *p = mmap(NULL, LENGTH, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (p == MAP_FAILED || madvise(p, LENGTH, MADV_NOHUGEPAGE)) return 2;
