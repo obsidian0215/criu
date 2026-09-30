@@ -247,4 +247,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        for log in sorted(WORK.rglob("*.log")):
+            print(f"--- {log} ---", flush=True)
+            print("\n".join(log.read_text(errors="replace").splitlines()[-40:]), flush=True)
+        raise
