@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'exp/remote-parent-route-*'
+      - 'exp/remote-parent-local-final'
   workflow_dispatch:
 
 jobs:
