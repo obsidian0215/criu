@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -17,6 +18,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
+#include "bfd.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
 #include "util.h"
@@ -32,6 +34,17 @@
 #include "compression.h"
 
 static int page_server_sk = -1;
+
+#define PS_GENERATION_HAS_PARENT    (1U << 0)
+#define PS_GENERATION_HAS_PARENT_ID (1U << 1)
+
+struct page_server_generation {
+	u32 flags;
+	char current[RUN_ID_HASH_LENGTH];
+	char parent[RUN_ID_HASH_LENGTH];
+};
+
+static struct page_server_generation client_generation;
 
 struct page_server_iov {
 	u32 cmd;
@@ -54,6 +67,12 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
 #define PS_IOV_ADD_F_COMPRESSED 8
+/*
+ * Generation-aware image open. An older peer must reject this command
+ * instead of silently accepting an image without the parent check.
+ */
+#define PS_IOV_OPEN_GENERATION 9
+#define PS_IOV_PARENT_GENERATION 10
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -222,6 +241,42 @@ static inline int send_psi(int sk, struct page_server_iov *pi)
 	return send_psi_flags(sk, pi, 0);
 }
 
+static void page_server_clear_generation(void)
+{
+	memset(&client_generation, 0, sizeof(client_generation));
+}
+
+int page_server_set_generation(const char *generation_id, const char *parent_id, bool has_parent)
+{
+	page_server_clear_generation();
+
+	if (!opts.use_page_server)
+		return 0;
+	if (!generation_id || !generation_id[0]) {
+		pr_err("Memory generation id is missing\n");
+		return -1;
+	}
+
+	if (snprintf(client_generation.current, sizeof(client_generation.current), "%s", generation_id) >=
+	    sizeof(client_generation.current)) {
+		pr_err("Memory generation id is too long\n");
+		return -1;
+	}
+
+	if (has_parent)
+		client_generation.flags |= PS_GENERATION_HAS_PARENT;
+	if (parent_id && parent_id[0]) {
+		if (snprintf(client_generation.parent, sizeof(client_generation.parent), "%s", parent_id) >=
+		    sizeof(client_generation.parent)) {
+			pr_err("Parent memory generation id is too long\n");
+			return -1;
+		}
+		client_generation.flags |= PS_GENERATION_HAS_PARENT_ID;
+	}
+
+	return 0;
+}
+
 static void tcp_cork(int sk, bool on)
 {
 	int val = on ? 1 : 0;
@@ -352,8 +407,9 @@ static void close_server_xfer(struct page_xfer *xfer)
 static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	char has_parent;
+	bool bind_generation = client_generation.current[0] != '\0';
 	struct page_server_iov pi = {
-		.cmd = PS_IOV_OPEN2,
+		.cmd = bind_generation ? PS_IOV_OPEN_GENERATION : PS_IOV_OPEN2,
 	};
 
 	xfer->sk = page_server_sk;
@@ -364,7 +420,9 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	xfer->parent = NULL;
 
 	pi.dst_id = xfer->dst_id;
-	if (send_psi(xfer->sk, &pi)) {
+	if (send_psi(xfer->sk, &pi) ||
+	    (bind_generation &&
+	     send_full(xfer->sk, &client_generation, sizeof(client_generation), "page-server generation"))) {
 		pr_perror("Can't write to page server");
 		return -1;
 	}
@@ -372,9 +430,8 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	/* Push the command NOW */
 	tcp_nodelay(xfer->sk, true);
 
-	if (recv_full(xfer->sk, &has_parent, sizeof(has_parent), "page-server open response")) {
+	if (recv_full(xfer->sk, &has_parent, sizeof(has_parent), "page-server open response"))
 		return -1;
-	}
 
 	if (has_parent)
 		xfer->parent = (void *)1; /* This is required for generate_iovs() */
@@ -446,14 +503,9 @@ static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *io
 
 	/* Non-present pages (holes, parent refs): write immediately */
 	if (flags & PE_PARENT) {
-		if (xfer->parent != NULL) {
-			ret = check_pagehole_in_parent(xfer->parent, iov);
-			if (ret) {
-				pr_err("Hole %p - %p not found in parent\n",
-				       iov->iov_base, iov->iov_base + iov->iov_len);
-				return -1;
-			}
-		}
+		ret = check_pagehole_in_parent(xfer->parent, iov);
+		if (ret)
+			return ret;
 	}
 
 	{
@@ -769,6 +821,12 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 	int ret;
 	unsigned long off, end;
 
+	if (!p) {
+		pr_err("Inherited range %p-%p has no usable parent\n",
+		       iov->iov_base, iov->iov_base + iov->iov_len);
+		return -1;
+	}
+
 	/*
 	 * Try to find pagemap entry in parent, from which
 	 * the data will be read on restore.
@@ -827,14 +885,9 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 			}
 		}
 	} else if (flags & PE_PARENT) {
-		if (xfer->parent != NULL) {
-			ret = check_pagehole_in_parent(xfer->parent, iov);
-			if (ret) {
-				pr_err("Hole %p - %p not found in parent\n",
-				       iov->iov_base, iov->iov_base + iov->iov_len);
-				return -1;
-			}
-		}
+		ret = check_pagehole_in_parent(xfer->parent, iov);
+		if (ret)
+			return ret;
 	}
 
 	if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
@@ -856,7 +909,9 @@ static void close_page_xfer(struct page_xfer *xfer)
 	close_image(xfer->pmi);
 }
 
-static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress)
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id, bool compress,
+				bool use_parent, const char *generation_id,
+				const char *parent_generation_id)
 {
 	u32 pages_id;
 
@@ -864,7 +919,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	if (!xfer->pmi)
 		return -1;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+	xfer->pi = open_pages_image_at_generation(get_service_fd(IMG_FD_OFF), O_DUMP, xfer->pmi, &pages_id,
+						  generation_id, parent_generation_id);
 	if (!xfer->pi)
 		goto err_pmi;
 
@@ -883,7 +939,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	 *    to exist in parent (either pagemap or hole)
 	 */
 	xfer->parent = NULL;
-	if (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP) {
+	if (use_parent && (fd_type == CR_FD_PAGEMAP || fd_type == CR_FD_SHMEM_PAGEMAP)) {
 		int ret;
 		int pfd;
 		int pr_flags = PR_FORCE_LOCAL | ((fd_type == CR_FD_PAGEMAP) ? PR_TASK : PR_SHMEM);
@@ -902,6 +958,17 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
 		if (ret <= 0) {
 			pr_perror("No parent image found, though parent directory is set");
+			xfree(xfer->parent);
+			xfer->parent = NULL;
+			close(pfd);
+			goto out;
+		}
+		if (parent_generation_id &&
+		    (!xfer->parent->memory_generation_id[0] ||
+		     strcmp(parent_generation_id, xfer->parent->memory_generation_id))) {
+			pr_warn("Opened parent generation does not match the source parent; "
+				"disabling parent reuse\n");
+			xfer->parent->close(xfer->parent);
 			xfree(xfer->parent);
 			xfer->parent = NULL;
 			close(pfd);
@@ -943,7 +1010,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
 
-	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF);
+	ret = open_page_local_xfer(xfer, fd_type, img_id, opts.compress_mode != COMPRESS_OFF, true, NULL, NULL);
 	if (ret)
 		return ret;
 
@@ -1504,11 +1571,16 @@ static int check_parent_server_xfer(int fd_type, unsigned long img_id)
 {
 	struct page_server_iov pi = {};
 	int has_parent;
+	bool bind_generation = client_generation.current[0] != '\0';
 
-	pi.cmd = PS_IOV_PARENT;
+	/* Check identity before pre-dump omits clean pages from its buffers. */
+	pi.cmd = bind_generation ? PS_IOV_PARENT_GENERATION : PS_IOV_PARENT;
 	pi.dst_id = encode_pm(fd_type, img_id);
 
-	if (send_psi(page_server_sk, &pi))
+	if (send_psi(page_server_sk, &pi) ||
+	    (bind_generation &&
+	     send_full(page_server_sk, &client_generation, sizeof(client_generation),
+		       "page-server parent generation")))
 		return -1;
 
 	tcp_nodelay(page_server_sk, true);
@@ -1545,6 +1617,75 @@ static struct pipe_read_dest pipe_read_dest = {
 	.sink_fd = -1,
 };
 
+static int page_server_receive_generation(int sk, struct page_server_generation *generation)
+{
+	if (recv_full(sk, generation, sizeof(*generation), "page-server generation"))
+		return -1;
+
+	if (!memchr(generation->current, '\0', sizeof(generation->current)) ||
+	    !memchr(generation->parent, '\0', sizeof(generation->parent)) ||
+	    !generation->current[0] ||
+	    (generation->flags & ~(PS_GENERATION_HAS_PARENT | PS_GENERATION_HAS_PARENT_ID)) ||
+	    ((generation->flags & PS_GENERATION_HAS_PARENT_ID) &&
+	     (!(generation->flags & PS_GENERATION_HAS_PARENT) || !generation->parent[0])) ||
+	    (!(generation->flags & PS_GENERATION_HAS_PARENT_ID) && generation->parent[0])) {
+		pr_err("Invalid page-server generation metadata\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static bool page_server_may_use_parent(const struct page_server_generation *generation)
+{
+	if (!generation)
+		return true;
+	if (!(generation->flags & PS_GENERATION_HAS_PARENT))
+		return false;
+	if (!(generation->flags & PS_GENERATION_HAS_PARENT_ID)) {
+		pr_warn("Parent generation is unavailable; disabling parent reuse\n");
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * This query does not reserve the parent. OPEN_GENERATION checks it again;
+ * if it changed after page selection, inherited writes must fail.
+ */
+static int page_server_check_parent_generation(int sk, struct page_server_iov *pi,
+					       const struct page_server_generation *generation)
+{
+	struct page_read parent;
+	unsigned long id;
+	int type, pfd, ret;
+	int has_parent = 0;
+
+	type = decode_pm(pi->dst_id, &id);
+	if (type < 0) {
+		pr_err("Unknown pagemap type received\n");
+		return -1;
+	}
+	if (!page_server_may_use_parent(generation))
+		goto reply;
+	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+		return -1;
+	if (pfd < 0)
+		goto reply;
+
+	ret = open_page_read_at(pfd, id, &parent,
+			       PR_FORCE_LOCAL | (type == CR_FD_PAGEMAP ? PR_TASK : PR_SHMEM));
+	close(pfd);
+	if (ret > 0) {
+		has_parent = parent.memory_generation_id[0] &&
+			     !strcmp(generation->parent, parent.memory_generation_id);
+		parent.close(&parent);
+	}
+reply:
+	return send_full(sk, &has_parent, sizeof(has_parent), "page-server parent response");
+}
+
 static void page_server_close(void)
 {
 	if (cxfer.dst_id != ~0ULL) {
@@ -1557,8 +1698,11 @@ static void page_server_close(void)
 	close_safe(&pipe_read_dest.p[1]);
 }
 
-static int page_server_open(int sk, struct page_server_iov *pi)
+static int page_server_open(int sk, struct page_server_iov *pi,
+			    const struct page_server_generation *generation)
 {
+	const char *generation_id = generation ? generation->current : NULL;
+	bool use_parent;
 	int type;
 	unsigned long id;
 
@@ -1578,7 +1722,9 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 	 * callbacks selected here; PS_IOV_ADD_F_COMPRESSED is handled directly
 	 * by page_server_add_compressed().
 	 */
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false))
+	use_parent = page_server_may_use_parent(generation);
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, false, use_parent, generation_id,
+				 use_parent && generation ? generation->parent : NULL))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -1598,7 +1744,7 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 {
 	if (cxfer.dst_id != pi->dst_id) {
 		pr_warn("Deprecated IO w/o open\n");
-		return page_server_open(-1, pi);
+		return page_server_open(-1, pi, NULL);
 	} else
 		return 0;
 }
@@ -1921,14 +2067,30 @@ static int page_server_serve(int sk)
 
 		switch (cmd) {
 		case PS_IOV_OPEN:
-			ret = page_server_open(-1, &pi);
+			ret = page_server_open(-1, &pi, NULL);
 			break;
 		case PS_IOV_OPEN2:
-			ret = page_server_open(sk, &pi);
+			ret = page_server_open(sk, &pi, NULL);
 			break;
+		case PS_IOV_OPEN_GENERATION: {
+			struct page_server_generation generation;
+
+			ret = page_server_receive_generation(sk, &generation);
+			if (!ret)
+				ret = page_server_open(sk, &pi, &generation);
+			break;
+		}
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
+		case PS_IOV_PARENT_GENERATION: {
+			struct page_server_generation generation;
+
+			ret = page_server_receive_generation(sk, &generation);
+			if (!ret)
+				ret = page_server_check_parent_generation(sk, &pi, &generation);
+			break;
+		}
 		case PS_IOV_ADD_F_COMPRESSED: {
 			u32 flags = decode_ps_flags(pi.cmd);
 
@@ -1954,7 +2116,11 @@ static int page_server_serve(int sk)
 		case PS_IOV_FORCE_CLOSE: {
 			int32_t status = 0;
 
-			ret = 0;
+			if (receiving_pages) {
+				page_server_close();
+				status = bfd_flush_images();
+			}
+			ret = status;
 
 			/*
 			 * An answer must be sent back to inform another side,
@@ -2350,6 +2516,7 @@ static int connect_to_page_server(void)
 
 int connect_to_page_server_to_send(void)
 {
+	page_server_clear_generation();
 	return connect_to_page_server();
 }
 
@@ -2358,6 +2525,8 @@ int disconnect_from_page_server(void)
 	struct page_server_iov pi = {};
 	int32_t status = -1;
 	int ret = -1;
+
+	page_server_clear_generation();
 
 	if (!opts.use_page_server)
 		return 0;

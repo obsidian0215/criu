@@ -2499,6 +2499,16 @@ free_pagemaps:
 	return -1;
 }
 
+static bool pagemap_references_parent(const struct page_read *pr)
+{
+	int i;
+
+	for (i = 0; i < pr->nr_pmes; i++)
+		if (pagemap_in_parent(pr->pmes[i]))
+			return true;
+	return false;
+}
+
 int probe_pages_o_direct(int fd)
 {
 	int fl, ret, memerr;
@@ -2559,6 +2569,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	/* Shared across asyncd fill-daemon workers, which open page-reads concurrently. */
 	static atomic_t ids = { 0 };
 	bool remote = pr_flags & PR_REMOTE;
+	bool needs_parent;
 	bool streamed = opts.stream && !(pr_flags & PR_FORCE_LOCAL);
 	unsigned long oflags = 0;
 	const char *src;
@@ -2602,6 +2613,10 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->disable_dedup = false;
 	pr->use_direct = false;
 	pr->streamed = streamed;
+	pr->pmi = NULL;
+	pr->pi = NULL;
+	pr->memory_generation_id[0] = '\0';
+	pr->parent_memory_generation_id[0] = '\0';
 	if (pr_flags & PR_FORCE_LOCAL)
 		oflags = O_FORCE_LOCAL;
 
@@ -2614,13 +2629,13 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return 0;
 	}
 
-	if (try_open_parent(dfd, img_id, pr, pr_flags)) {
-		close_image(pr->pmi);
+	if (read_pagemap_head(pr->pmi, &pr->pages_img_id,
+			      pr->memory_generation_id, pr->parent_memory_generation_id)) {
+		close_page_read(pr);
 		return -1;
 	}
-	set_encoded_read_owner(pr, pr);
 
-	pr->pi = open_pages_image_at(dfd, flags | oflags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_image_at(dfd, CR_FD_PAGES, flags | oflags, pr->pages_img_id);
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
@@ -2630,6 +2645,34 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		close_page_read(pr);
 		return -1;
 	}
+
+	needs_parent = pagemap_references_parent(pr);
+	/* A self-contained image does not depend on the parent directory. */
+	if (needs_parent) {
+		if (try_open_parent(dfd, img_id, pr, pr_flags)) {
+			close_page_read(pr);
+			return -1;
+		}
+		if (!pr->parent_memory_generation_id[0]) {
+			if (pr->memory_generation_id[0]) {
+				pr_err("Inherited pagemap is missing the expected parent generation\n");
+				close_page_read(pr);
+				return -1;
+			}
+		} else if (!pr->parent || !pr->parent->memory_generation_id[0] ||
+			   strcmp(pr->parent_memory_generation_id, pr->parent->memory_generation_id)) {
+			pr_err("Parent memory generation does not match pagemap expectation\n");
+			close_page_read(pr);
+			return -1;
+		}
+	}
+
+	/* Ancestors are optional when used only to reclaim duplicate pages. */
+	if (!needs_parent && (pr_flags & PR_MOD)) {
+		if (try_open_parent(dfd, img_id, pr, pr_flags))
+			pr_warn("Ignoring unusable dedup parent for image %lu\n", img_id);
+	}
+	set_encoded_read_owner(pr, pr);
 
 	{
 		int pfd = img_raw_fd(pr->pi);
