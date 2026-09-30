@@ -27,10 +27,15 @@ jobs:
         run: |
           sudo find test/others/page-server-performance/evidence -name '*.log' \
             -type f -print -exec tail -n 60 {} \;
+      - name: Package generated benchmark evidence
+        if: always()
+        run: |
+          sudo tar -C test/others/page-server-performance -czf "$RUNNER_TEMP/page-server-performance-evidence.tar.gz" evidence
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/page-server-performance-evidence.tar.gz"
       - name: Save benchmark evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: page-server-performance-${{ github.run_id }}
-          path: test/others/page-server-performance/evidence/
+          path: ${{ runner.temp }}/page-server-performance-evidence.tar.gz
           retention-days: 14

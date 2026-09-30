@@ -50,3 +50,11 @@ the candidate also includes correctness/flush changes. The summary provides all 
 medians and paired differences, with observed ranges rather than misleading p99 or
 confidence/equivalence claims from five observations. The screening result should guide
 whether a larger and more isolated experiment is warranted.
+
+Timing uses blocking waitpid through Popen.wait() with a separate timeout watchdog,
+not Popen.wait(timeout)'s polling loop. Monotonic completion timestamps are captured
+before watchdog cleanup. CRIU's internal frozen_time remains a separate metric.
+The first screening run used polling waits and is unsuitable for sub-50-ms latency
+comparisons; its payload and correctness evidence is unaffected. Requested dirtying
+is a percentage of workload pages rewritten, not a guarantee of the same transfer
+fraction: kernel page/huge-page dirty-tracking granularity can expand the transfer.

@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import time
+import threading
 import traceback
 
 import pycriu.images
@@ -28,6 +29,43 @@ def load_image(path):
 def command(binary, *args):
     return [str(binary), '--no-default-config', *map(str, args)]
 
+
+
+def wait_process(process, timeout):
+    """Wait without Popen.wait(timeout)'s exponential polling delay.
+
+    A separate watchdog enforces the limit while the measuring thread blocks in
+    waitpid. Timer shutdown is outside the returned process-completion timestamp.
+    """
+    expired = threading.Event()
+
+    def terminate():
+        expired.set()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+    watchdog = threading.Timer(timeout, terminate)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        status = process.wait()
+        completion_ns = time.monotonic_ns()
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+    if expired.is_set():
+        raise subprocess.TimeoutExpired(process.args, timeout)
+    return status, completion_ns
+
+
+def run_measured(arguments, timeout, **kwargs):
+    process = subprocess.Popen(arguments, **kwargs)
+    status, completion_ns = wait_process(process, timeout)
+    if status:
+        raise subprocess.CalledProcessError(status, arguments)
+    return completion_ns
 
 def directory_size(directory):
     files = [p for p in directory.glob('*.img') if p.is_file()]
@@ -105,12 +143,11 @@ def transfer(binary, directory, pid, index, mode, source_parent, target_parent, 
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     start = time.monotonic_ns()
     try:
-        subprocess.run(dump_command, pass_fds=(client.fileno(),), check=True, timeout=120)
-        dump_return = time.monotonic_ns()
+        dump_return = run_measured(dump_command, 120, pass_fds=(client.fileno(),))
         client.shutdown(socket.SHUT_WR)
-        if server.wait(timeout=30):
+        server_status, destination_ready = wait_process(server, 30)
+        if server_status:
             raise AssertionError('Page server failed')
-        destination_ready = time.monotonic_ns()
         usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
         tcp_metrics = json.loads(subprocess.check_output(
             [str(HERE / 'tcp-metrics'), str(client.fileno()), str(server_socket.fileno())],
@@ -177,7 +214,7 @@ def run_case(args, binary, route, dirty, repetition, warmup=False):
             if no_parent and metrics['inherited_pages']:
                 raise AssertionError('Full-final control inherited pages')
             source_parent, target_parent = source, target
-        workload.wait(timeout=10)
+        wait_process(workload, 10)
         pid = None
         for path in source.iterdir():
             if path.is_file() and path.suffix == '.img' and not path.name.startswith(('pages-', 'pagemap-')):
@@ -185,9 +222,10 @@ def run_case(args, binary, route, dirty, repetition, warmup=False):
         result['final_metadata_ready_ms'] = (time.monotonic_ns() - start) / 1e6
         pidfile = directory / 'restored.pid'
         restore_start = time.monotonic_ns()
-        subprocess.run(command(binary, 'restore', '-D', target, '-W', target, '-o', 'restore.log',
-                               '-v1', '-d', '--pidfile', pidfile), check=True, timeout=120)
-        result['restore_ms'] = (time.monotonic_ns() - restore_start) / 1e6
+        restore_completed = run_measured(
+            command(binary, 'restore', '-D', target, '-W', target, '-o', 'restore.log',
+                    '-v1', '-d', '--pidfile', pidfile), 120)
+        result['restore_ms'] = (restore_completed - restore_start) / 1e6
         pid = int(pidfile.read_text())
         result['restored_sha256'] = verify_memory(pid, address, size, dirty, args.predumps)
         result['final_start_to_external_verification_ms'] = (time.monotonic_ns() - start) / 1e6
