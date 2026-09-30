@@ -68,7 +68,6 @@ def recv_exact(sock, size):
 def page_server(directory, parent=None):
     directory.mkdir()
     client, server = socket.socketpair()
-    client.settimeout(20)
     command = [str(CRIU), "--no-default-config", "page-server", "-D", str(directory),
                "-o", "page-server.log", "-v4", "--ps-socket", str(server.fileno())]
     if parent is not None:
@@ -208,6 +207,7 @@ def changed_parent():
         generation = struct.pack("=I37s37s2x", 3, current.encode(), parent.encode())
         dst_id = case.pid << 8 | 1
         with page_server(case.directory / "target-race", target) as (sock, server):
+            sock.settimeout(20)
             sock.sendall(struct.pack("=I4xQQQ", 10, 0, 0, dst_id) + generation)
             assert struct.unpack("=i", recv_exact(sock, 4))[0] == 1
             change_generation(target, str(uuid.uuid4()))
