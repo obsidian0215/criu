@@ -10,7 +10,7 @@ export PYTHONPATH=/criu/lib
 # Keep both failing baseline cases, not just the first assertion failure.
 baseline=$(mktemp -d)
 trap 'rm -rf "$baseline"' EXIT
-git archive 2e2d58c78fe9f12d36baa4d029308535e3b16653 | tar -x -C "$baseline"
+git -c safe.directory=/criu archive 2e2d58c78fe9f12d36baa4d029308535e3b16653 | tar -x -C "$baseline"
 make -C "$baseline" -j4 > test/others/page-server-identity/baseline-build.log 2>&1
 for case in predump ancestor; do
 	set +e
