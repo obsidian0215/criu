@@ -90,6 +90,7 @@ static int write_pagemap_header(struct cr_img *image, int fd_type)
 int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_parent_writer **out)
 {
 	struct remote_parent_writer *writer;
+	struct stat st;
 	int base_fd;
 	int fd = -1;
 	int ret;
@@ -125,6 +126,15 @@ int remote_parent_writer_open(int fd_type, unsigned long img_id, struct remote_p
 	writer->dirfd = fcntl(base_fd, F_DUPFD_CLOEXEC, 0);
 	if (writer->dirfd < 0) {
 		pr_perror("Unable to duplicate image directory");
+		goto err;
+	}
+
+	/* Check before OPEN2 lets a same-directory receiver create its own image. */
+	ret = fstatat(writer->dirfd, writer->final_name, &st, AT_SYMLINK_NOFOLLOW);
+	if (!ret || errno != ENOENT) {
+		if (!ret)
+			errno = EEXIST;
+		pr_perror("Source pagemap must not already exist: %s", writer->final_name);
 		goto err;
 	}
 
@@ -586,3 +596,4 @@ void remote_parent_coverage_close(struct remote_parent_coverage *coverage)
 	xfree(coverage->ranges);
 	xfree(coverage);
 }
+

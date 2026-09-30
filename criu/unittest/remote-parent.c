@@ -221,6 +221,59 @@ static void test_malformed_images(int dirfd)
 	check_empty(dirfd);
 }
 
+/* Reusing a source directory must not turn stale local images into coverage. */
+static void test_existing_source_images(int dirfd)
+{
+	struct remote_parent_writer *writer = NULL, *pending;
+	struct iovec iov = { .iov_base = (void *)PAGE_SIZE, .iov_len = PAGE_SIZE };
+	PagemapEntry entry = PAGEMAP_ENTRY__INIT;
+	char original[128], actual[128], payload[4];
+	int saved_mode = opts.mode;
+	ssize_t length;
+	int fd;
+
+	entry.vaddr = PAGE_SIZE;
+	entry.has_nr_pages = true;
+	entry.nr_pages = 1;
+	entry.has_flags = true;
+	entry.flags = PE_PRESENT;
+	write_test_pagemap(dirfd, "pagemap-10.img", CR_FD_PAGEMAP, IMG_COMMON_MAGIC,
+			   imgset_template[CR_FD_PAGEMAP].magic, 42, &entry, 1);
+	fd = openat(dirfd, "pagemap-10.img", O_RDONLY);
+	assert(fd >= 0);
+	length = read(fd, original, sizeof(original));
+	assert(length > 0 && (size_t)length < sizeof(original));
+	assert(!close(fd));
+	fd = openat(dirfd, "pages-42.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	assert(fd >= 0 && write(fd, "keep", 4) == 4);
+	assert(!close(fd));
+
+	/* This source-only preflight must not change final-dump behavior. */
+	opts.mode = CR_DUMP;
+	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &writer));
+	assert(!writer);
+	opts.mode = saved_mode;
+
+	assert(!remote_parent_writer_open(CR_FD_SHMEM_PAGEMAP, 20, &pending));
+	assert(!remote_parent_writer_record(pending, &iov, PE_PRESENT));
+	assert(remote_parent_writer_open(CR_FD_PAGEMAP, 10, &writer) < 0);
+	assert(!writer);
+	assert(remote_parent_finish(true) < 0);
+	assert(faccessat(dirfd, "pagemap-shmem-20.img", F_OK, 0) < 0 && errno == ENOENT);
+
+	fd = openat(dirfd, "pagemap-10.img", O_RDONLY);
+	assert(fd >= 0 && read(fd, actual, sizeof(actual)) == length);
+	assert(!memcmp(actual, original, length));
+	assert(!close(fd));
+	fd = openat(dirfd, "pages-42.img", O_RDONLY);
+	assert(fd >= 0 && read(fd, payload, sizeof(payload)) == sizeof(payload));
+	assert(!memcmp(payload, "keep", sizeof(payload)));
+	assert(!close(fd));
+	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
+	assert(!unlinkat(dirfd, "pages-42.img", 0));
+	check_empty(dirfd);
+}
+
 void test_remote_parent(void)
 {
 	char path[] = "/tmp/criu-remote-parent.XXXXXX";
@@ -240,6 +293,7 @@ void test_remote_parent(void)
 	assert(install_service_fd(IMG_FD_OFF, dirfd) >= 0);
 	opts.mode = CR_PRE_DUMP;
 	test_writer_open_failures(dirfd);
+	test_existing_source_images(dirfd);
 
 	assert(!remote_parent_coverage_open(dirfd, CR_FD_PAGEMAP, 10, &coverage));
 	assert(!coverage);
@@ -277,7 +331,8 @@ void test_remote_parent(void)
 	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
 	check_empty(dirfd);
 
-	/* A payload-bearing pagemap in the same directory belongs to the page server. */
+	/* The same-directory page server creates its image only after OPEN2. */
+	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
 	payload_entry.vaddr = PAGE_SIZE;
 	payload_entry.has_nr_pages = true;
 	payload_entry.nr_pages = 1;
@@ -288,7 +343,6 @@ void test_remote_parent(void)
 	fd = openat(dirfd, "pages-42.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
 	assert(fd >= 0);
 	assert(!close(fd));
-	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
 	iov.iov_base = (void *)PAGE_SIZE;
 	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
 	assert(!remote_parent_finish(true));
@@ -298,14 +352,15 @@ void test_remote_parent(void)
 	assert(!unlinkat(dirfd, "pages-42.img", 0));
 	check_empty(dirfd);
 
-	fd = openat(dirfd, "pagemap-10.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
-	assert(fd >= 0 && write(fd, "keep", 4) == 4);
-	assert(!close(fd));
+	/* A late collision still rolls back only this transaction's publications. */
 	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
 	iov.iov_base = (void *)PAGE_SIZE;
 	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
 	assert(!remote_parent_writer_open(CR_FD_SHMEM_PAGEMAP, 20, &second));
 	assert(!remote_parent_writer_record(second, &iov, PE_PRESENT));
+	fd = openat(dirfd, "pagemap-10.img", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	assert(fd >= 0 && write(fd, "keep", 4) == 4);
+	assert(!close(fd));
 	assert(remote_parent_finish(true) < 0);
 	assert(faccessat(dirfd, "pagemap-shmem-20.img", F_OK, 0) < 0 && errno == ENOENT);
 	fd = openat(dirfd, "pagemap-10.img", O_RDONLY);
@@ -315,10 +370,10 @@ void test_remote_parent(void)
 	assert(!unlinkat(dirfd, "pagemap-10.img", 0));
 	check_empty(dirfd);
 
-	/* An existing FIFO must fail publication without waiting for a writer. */
-	assert(!mkfifoat(dirfd, "pagemap-10.img", 0600));
+	/* A FIFO appearing after preflight must not block publication. */
 	assert(!remote_parent_writer_open(CR_FD_PAGEMAP, 10, &first));
 	assert(!remote_parent_writer_record(first, &iov, PE_PRESENT));
+	assert(!mkfifoat(dirfd, "pagemap-10.img", 0600));
 	alarm(5);
 	assert(remote_parent_finish(true) < 0);
 	alarm(0);
@@ -361,3 +416,4 @@ void test_remote_parent(void)
 	assert(!close(dirfd));
 	assert(!rmdir(path));
 }
+

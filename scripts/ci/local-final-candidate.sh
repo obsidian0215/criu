@@ -54,6 +54,11 @@ if [ "$CC" = gcc ]; then
 	if stage baseline-build make -C "$BASE_DIR" -j "$JOBS" CC=gcc HOSTCC=gcc; then
 		stage baseline-comparison bash test/others/page-server-remote-parent/compare-baseline.sh \
 			"$BASE_DIR/criu/criu" "$ROOT/criu/criu" || true
+		# Official Alpine package, installed only in the disposable CI container.
+		if stage runc-install apk add --no-cache runc; then
+			stage runc-smoke bash test/others/page-server-remote-parent/runc-smoke.sh \
+				"$BASE_DIR/criu/criu" "$ROOT/criu/criu" "$EVIDENCE/runc-smoke" || true
+		fi
 	fi
 fi
 exit "$status"

@@ -371,6 +371,10 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	xfer->parent.local = NULL;
 	xfer->remote_parent_writer = NULL;
 
+	/* Reject stale source images before the receiver can create this pagemap. */
+	if (remote_parent_writer_open(fd_type, img_id, &xfer->remote_parent_writer))
+		return -1;
+
 	pi.dst_id = xfer->dst_id;
 	if (send_psi(xfer->sk, &pi)) {
 		pr_perror("Can't write to page server");
@@ -386,9 +390,6 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 
 	if (has_parent)
 		xfer->parent.kind = PAGE_PARENT_SERVER;
-
-	if (remote_parent_writer_open(fd_type, img_id, &xfer->remote_parent_writer))
-		return -1;
 
 	return 0;
 }
@@ -2647,3 +2648,4 @@ int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete c
 	else
 		return page_server_start_sync_read(buf, nr, complete, priv);
 }
+
