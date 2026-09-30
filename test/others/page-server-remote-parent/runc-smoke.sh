@@ -20,15 +20,35 @@ PS_PID=
 SRC_ROOT=
 DST_ROOT=
 ID=
+failure_command=
+failure_line=
 cleanup() {
 	[ -z "$PS_PID" ] || { kill "$PS_PID" 2>/dev/null || true; wait "$PS_PID" 2>/dev/null || true; }
 	for root in "$SRC_ROOT" "$DST_ROOT"; do
 		[ -z "$root" ] || "$RUNC" --root "$root" delete -f "$ID" 2>/dev/null || true
 	done
 }
-trap cleanup EXIT
+on_exit() {
+	local status=$?
+	trap - EXIT
+	if [ "$status" -ne 0 ]; then
+		printf 'RUNC SMOKE FAIL: status=%s line=%s command=%s\n' "$status" "$failure_line" "$failure_command" >&2
+		# Keep actionable errors in the job log, even when artifact download fails.
+		local log count=0
+		while IFS= read -r -d '' log; do
+			printf '\n--- %s (last 40 lines) ---\n' "$log" >&2
+			tail -n 40 "$log" >&2 || true
+			count=$((count + 1))
+			[ "$count" -lt 12 ] || break
+		done < <(find "$RESULTS" -maxdepth 5 -type f -name '*.log' -print0)
+	fi
+	cleanup
+	exit "$status"
+}
+trap 'failure_command=$BASH_COMMAND; failure_line=$LINENO' ERR
+trap on_exit EXIT
 wait_file() {
-	for _ in $(seq 1 300); do [ ! -f "$1" ] || return; sleep 0.1; done
+	for _ in $(seq 1 300); do [ ! -f "$1" ] || return 0; sleep 0.1; done
 	echo "Timed out waiting for $1" >&2; return 1
 }
 sum_images() {
