@@ -1,0 +1,36 @@
+name: Page-server paired performance
+on:
+  push:
+    branches:
+      - 'validation/remote-parent-performance-*'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Build benchmark container
+        run: sudo make -C scripts/build alpine
+      - name: Run correctness-gated paired comparison
+        run: |
+          sudo docker run --rm --privileged --userns=host --cgroupns=host \
+            -v "$PWD:/criu" --tmpfs /run \
+            -e CC=gcc -e HOSTCC=gcc \
+            criu-alpine sh test/others/page-server-performance/check-ci.sh
+      - name: Collect failure details
+        if: failure()
+        run: |
+          sudo find test/others/page-server-performance/evidence -name '*.log' \
+            -type f -print -exec tail -n 60 {} \;
+      - name: Save benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: page-server-performance-${{ github.run_id }}
+          path: test/others/page-server-performance/evidence/
+          retention-days: 14
