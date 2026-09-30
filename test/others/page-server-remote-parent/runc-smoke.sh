@@ -61,7 +61,8 @@ for variant in baseline candidate; do
 	binary=$CANDIDATE
 	[ "$variant" != baseline ] || binary=$BASELINE
 	dir="$RESULTS/$variant"
-	mkdir -p "$dir"/{bin,source/parent0,source/image,destination/parent0,destination/image,state,bundle/rootfs/state,bundle/rootfs/proc,bundle/rootfs/dev}
+	# CRIU's pivot_root uses an existing /tmp on a read-only container root.
+	mkdir -p "$dir"/{bin,source/parent0,source/image,destination/parent0,destination/image,state,bundle/rootfs/state,bundle/rootfs/proc,bundle/rootfs/dev,bundle/rootfs/tmp}
 	# Modern runc ignores --criu. Both version and swrk use executable lookup.
 	ln -s "$binary" "$dir/bin/criu"
 	export PATH="$dir/bin:$ORIGINAL_PATH"
