@@ -266,7 +266,7 @@ run_remote_parent_regression() {
 	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
 		--prev-images-dir ../source-pre ||
 		fail "remote-parent final local dump failed"
-	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+	grep -q "Using source pagemap coverage for" "$final/dump.log" ||
 		fail "final dump did not select the source parent pagemap"
 
 	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
@@ -371,7 +371,7 @@ run_remote_parent_multiround_regression() {
 	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
 		--prev-images-dir ../source-pre2 ||
 		fail "multiround final local dump failed"
-	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+	grep -q "Using source pagemap coverage for" "$final/dump.log" ||
 		fail "multiround final dump did not select the source parent pagemap"
 
 	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
