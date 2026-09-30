@@ -26,7 +26,15 @@ runs:
     # passing -vga none.  Without it the kernel only registers a CGA
     # text console and VT ioctls (TIOCSLCKTRMIOS, TIOCSWINSZ) fail,
     # which breaks the zdtm/static/vt test on restore.
-    run: limactl start --plain --name=default --cpus=4 --memory=12 --set '.video.display = "vnc"' template://${{ inputs.template }}
+    env:
+      TEMPLATE: ${{ inputs.template }}
+    run: |
+      args=(--plain --name=default --cpus=4 --memory=12 --set '.video.display = "vnc"')
+      if [ "$TEMPLATE" = centos-stream-9 ]; then
+        # Pin the official compose and checksum while cloud.centos.org is unavailable.
+        args+=(--set '.images = [{"location": "https://odcs.stream.centos.org/production/CentOS-Stream-9-20260930.0/compose/BaseOS/x86_64/images/CentOS-Stream-GenericCloud-9-20260930.0.x86_64.qcow2", "arch": "x86_64", "digest": "sha256:a7f804379970e055d5d5ff408787f0d984b4d640e261473ff58d83561bd19433"}]')
+      fi
+      limactl start "${args[@]}" "template://$TEMPLATE"
   - name: Copy source into VM
     shell: bash
     run: |
