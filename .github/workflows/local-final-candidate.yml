@@ -1,0 +1,83 @@
+name: Local incremental final candidate
+
+on:
+  push:
+    branches:
+      - 'validation/local-final-*'
+      - 'local-final-core-candidate'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Local final (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check focused test sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bash -n scripts/ci/local-final-candidate.sh
+          bash -n test/others/page-server-remote-parent/regression.sh
+          bash -n test/others/page-server-remote-parent/compare-baseline.sh
+          python3 -m py_compile test/others/page-server-remote-parent/*.py
+          git diff --check
+      - name: Build the standard Alpine test image
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p .local-final-ci
+          target=alpine
+          if [ '${{ matrix.compiler }}' = clang ]; then
+            target=alpine-clang
+          fi
+          sudo make -C scripts/build "$target" 2>&1 | tee .local-final-ci/container-build.log
+      - name: Run focused privileged validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo docker run --rm --privileged --userns=host --cgroupns=host \
+            --tmpfs /run -v /lib/modules:/lib/modules \
+            -v "$GITHUB_WORKSPACE:/criu" \
+            -e CC='${{ matrix.compiler }}' -e HOSTCC='${{ matrix.compiler }}' \
+            criu-alpine bash scripts/ci/local-final-candidate.sh
+      - name: Package validation evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          archive="$RUNNER_TEMP/local-final-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p .local-final-ci
+          sudo dmesg > .local-final-ci/dmesg.txt || true
+          shopt -s nullglob
+          paths=(.local-final-ci
+                 test/others/page-server-remote-parent/comparison.*
+                 test/others/page-server-remote-parent/remote-parent-regression.*
+                 test/others/page-server-remote-parent/shared-regression.*
+                 test/zdtm/static/compress_pages00.out
+                 test/zdtm/static/compress_pages00.out.inprogress)
+          # Root-owned PID/image files are read by tar, never traversed by the uploader.
+          sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
+            sudo tar --null --no-recursion -czf "$archive" --files-from=-
+          sudo chown "$(id -u):$(id -g)" "$archive"
+          chmod a+r "$archive"
+          test -r "$archive"
+          echo "DIAGNOSTIC_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-final-${{ matrix.compiler }}-${{ github.run_id }}
+          path: ${{ env.DIAGNOSTIC_ARCHIVE }}
+          if-no-files-found: error
