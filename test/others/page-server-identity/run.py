@@ -225,6 +225,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=["predump", "ancestor", "race", "all"], default="all")
     args = parser.parse_args()
+    feature = subprocess.run([str(CRIU), "--no-default-config", "check",
+                              "--feature", "mem_dirty_track"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, timeout=30)
+    if feature.returncode:
+        print("SKIP: page-server identity requires memory dirty tracking")
+        print(feature.stdout)
+        return
     if WORK.exists():
         raise SystemExit(f"Remove previous test output before running: {WORK}")
     WORK.mkdir()
