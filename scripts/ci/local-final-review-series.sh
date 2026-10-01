@@ -18,6 +18,8 @@ WORK=$(mktemp -d /tmp/criu-review-series.XXXXXX)/source
 chmod 755 "$(dirname "$WORK")"
 status=0
 last_built=0
+# Invoked by the EXIT trap below, including early failures.
+# shellcheck disable=SC2329
 finish() {
 	local result=$?
 	trap - EXIT
