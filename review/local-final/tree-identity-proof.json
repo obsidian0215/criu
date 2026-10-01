@@ -1,0 +1,26 @@
+{
+  "base_commit": "3e067bc2639b7f98e8bc64b30c05f60b4dd52df8",
+  "validated_commit": "67eb051014b788f16600782c86cdd92a644d1040",
+  "base_tree": "51a002895e3198aa7314f5db0cf5a4a8bba6a2de",
+  "patch_1_tree": "4b5de5a9911084fcdfcd777ffe4e6fc619bebb85",
+  "patch_2_tree": "515f7ec083ed5393bfa26ad368dc6b49ea931dc6",
+  "three_patch_tree": "a1346bc77bb96269e19fb74e219a8cec30ecf45d",
+  "with_validation_supplement_tree": "f9946ae4a0bf9e5efde8e3d10af3942b10a0ab23",
+  "validated_remote_tree": "f9946ae4a0bf9e5efde8e3d10af3942b10a0ab23",
+  "full_tree_identical": true,
+  "all_patch_replays_match": true,
+  "changed_file_blob_ids_verified": true,
+  "patches": [
+    "0001-page-xfer-read-buffer.patch",
+    "0002-local-final-core-and-unit-tests.patch",
+    "0003-local-final-integration-regression.patch",
+    "validation-only-supplement.patch"
+  ],
+  "production_and_unit_blobs_identical_after_three_patches": true,
+  "default_oracle_equivalence_cases": 16,
+  "known_validated_tree_whitespace_warnings": [
+    "criu/page-xfer.c: extra blank line at EOF",
+    "criu/remote-parent.c: extra blank line at EOF",
+    "criu/unittest/remote-parent.c: extra blank line at EOF"
+  ]
+}

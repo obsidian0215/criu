@@ -1,0 +1,1348 @@
+diff --git a/scripts/ci/run-ci-tests.sh b/scripts/ci/run-ci-tests.sh
+index 8425c6d3a0b1bb09c370a3f6545a35bde3b83858..fb10bcccbe69e8ae26545bdb54eaceeff69e8769 100755
+--- a/scripts/ci/run-ci-tests.sh
++++ b/scripts/ci/run-ci-tests.sh
+@@ -390,6 +390,16 @@ run_non_shardable_tests() {
+ 		echo "Skipping hugetlb compression tests"
+ 	fi
+ 
++	# Remote pre-dumps followed by a local final dump, including write faults.
++	if criu/criu check --feature mem_dirty_track; then
++		for predump_mode in splice read; do
++			PRE_DUMP_MODE="$predump_mode" make -C test/others/page-server-remote-parent regression
++		done
++		make -C test/others/page-server-remote-parent shared-regression
++	else
++		echo "Skipping remote-parent tests: memory dirty tracking unavailable"
++	fi
++
+ 	# Compression pre-dump and incremental parent-chain coverage.
+ 	if criu/criu check --feature compress && criu/criu check --feature mem_dirty_track; then
+ 		make -C test/others/compression/vma-boundary run
+diff --git a/test/others/page-server-remote-parent/Makefile b/test/others/page-server-remote-parent/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..70cac2ba20c03581a2757565943a580edca5c3d4
+--- /dev/null
++++ b/test/others/page-server-remote-parent/Makefile
+@@ -0,0 +1,12 @@
++regression:
++	bash ./regression.sh
++
++shared-regression:
++	python3 ./shared_regression.py
++
++check:
++	$(MAKE) PRE_DUMP_MODE=splice regression
++	$(MAKE) PRE_DUMP_MODE=read regression
++	$(MAKE) shared-regression
++
++.PHONY: regression shared-regression check
+diff --git a/test/others/page-server-remote-parent/README.md b/test/others/page-server-remote-parent/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad2be49f92225e486afb4d0bbe949f164e73fe20
+--- /dev/null
++++ b/test/others/page-server-remote-parent/README.md
+@@ -0,0 +1,33 @@
++# Page-server remote-parent regression
++
++This test covers [issue #2503](https://github.com/checkpoint-restore/criu/issues/2503): one or more page-server pre-dumps followed by a local final dump.
++
++A remote pre-dump writes page payload to the page-server image chain and keeps a standard CRIU pagemap on the source. The source pagemap records parent coverage but has no local pages image. A later local dump accepts a parent reference only when the corresponding range is present in that pagemap. The assembled destination chain must restore successfully.
++
++## Run
++
++```sh
++make -C test/others/page-server-remote-parent check
++```
++
++The targets can also be run separately:
++
++```sh
++make -C test/others/page-server-remote-parent PRE_DUMP_MODE=splice regression
++make -C test/others/page-server-remote-parent PRE_DUMP_MODE=read regression
++make -C test/others/page-server-remote-parent shared-regression
++```
++
++Set `KEEP_WORK_DIR=1` to keep images and logs from the regression.
++
++The regression covers a local incremental control, one- and two-round remote pre-dumps, page-generation placement, restore, metadata rollback after image-write failures, and page-server disconnects.
++
++The shared-memory regression verifies restored bytes and aliasing with `CRIU_TRACK_SHMEM` unset, so shared contents follow the default conservative copy path.
++
++Coverage files are source-side dump metadata, not restorable destination
++parents. The suite also checks that accidentally configuring a page server
++with such a parent fails without publishing the next round's coverage.
++The ordinary payload reader rejects their reserved `pages_id = 0` marker.
++This change retains the existing operational requirement to assemble the
++correct parent chain; cryptographic or generation-identity binding is outside
++this feature's scope.
+diff --git a/test/others/page-server-remote-parent/base_page_launcher.c b/test/others/page-server-remote-parent/base_page_launcher.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9c8833db7b9df27c5eb3e0045fa4ad63ef69390
+--- /dev/null
++++ b/test/others/page-server-remote-parent/base_page_launcher.c
+@@ -0,0 +1,20 @@
++/* The generation oracle assumes base-page dirty tracking granularity. */
++#include <stdio.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++int main(int argc, char **argv)
++{
++	if (argc < 2) {
++		fprintf(stderr, "usage: base-page-launcher command [args ...]\n");
++		return 2;
++	}
++	/* Inherited across fork/exec; no system-wide THP setting is changed. */
++	if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) {
++		perror("prctl(PR_SET_THP_DISABLE)");
++		return 1;
++	}
++	execvp(argv[1], &argv[1]);
++	perror("execvp");
++	return 1;
++}
+diff --git a/test/others/page-server-remote-parent/fail_image_write.c b/test/others/page-server-remote-parent/fail_image_write.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..196b0de620df84ae3b91a52b48cfe39134d4b0e8
+--- /dev/null
++++ b/test/others/page-server-remote-parent/fail_image_write.c
+@@ -0,0 +1,152 @@
++/* Test-only LD_PRELOAD shim; never linked into CRIU. */
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++static bool selected_image(int fd)
++{
++	const char *mode = getenv("CRIU_TEST_FAIL_IMAGE");
++	const char *base;
++	char proc[64], path[PATH_MAX];
++	ssize_t size;
++
++	if (!mode)
++		return false;
++	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
++	size = readlink(proc, path, sizeof(path) - 1);
++	if (size < 0)
++		return false;
++	path[size] = '\0';
++	base = strrchr(path, '/');
++	if (!base)
++		return false;
++	base++;
++	if (!strcmp(mode, "inventory"))
++		return !strcmp(base, "inventory.img");
++	if (!strcmp(mode, "pagemap")) {
++		size_t length = strlen(base);
++
++		return !strncmp(base, "pagemap-", 8) && length > 12 &&
++		       !strcmp(base + length - 4, ".img");
++	}
++	return false;
++}
++
++ssize_t write(int fd, const void *data, size_t size)
++{
++	ssize_t (*real_write)(int, const void *, size_t);
++
++	real_write = dlsym(RTLD_NEXT, "write");
++	if (!real_write) {
++		errno = EIO;
++		return -1;
++	}
++	if (selected_image(fd)) {
++		static const char message[] = "TEST_FAULT: image write rejected with ENOSPC\n";
++
++		real_write(STDERR_FILENO, message, sizeof(message) - 1);
++		errno = ENOSPC;
++		return -1;
++	}
++	return real_write(fd, data, size);
++}
++
++ssize_t writev(int fd, const struct iovec *iov, int count)
++{
++	ssize_t (*real_writev)(int, const struct iovec *, int);
++
++	real_writev = dlsym(RTLD_NEXT, "writev");
++	if (!real_writev) {
++		errno = EIO;
++		return -1;
++	}
++	if (selected_image(fd)) {
++		ssize_t (*real_write)(int, const void *, size_t);
++		static const char message[] = "TEST_FAULT: image writev rejected with ENOSPC\n";
++
++		real_write = dlsym(RTLD_NEXT, "write");
++		if (real_write)
++			real_write(STDERR_FILENO, message, sizeof(message) - 1);
++		errno = ENOSPC;
++		return -1;
++	}
++	return real_writev(fd, iov, count);
++}
++
++#include <stdint.h>
++#include <sys/socket.h>
++
++static void disconnect_now(int fd)
++{
++	ssize_t (*real_write)(int, const void *, size_t) = dlsym(RTLD_NEXT, "write");
++	static const char message[] = "TEST_FAULT: page server disconnected\n";
++
++	if (real_write)
++		real_write(STDERR_FILENO, message, sizeof(message) - 1);
++	shutdown(fd, SHUT_RDWR);
++	_exit(73);
++}
++
++ssize_t recv(int fd, void *data, size_t size, int flags)
++{
++	ssize_t (*real_recv)(int, void *, size_t, int) = dlsym(RTLD_NEXT, "recv");
++	const char *mode = getenv("CRIU_TEST_DISCONNECT");
++	/* Match the native page-server frame layout, including ABI padding. */
++	struct command_frame {
++		uint32_t cmd;
++		uint64_t nr_pages;
++		uint64_t vaddr;
++		uint64_t dst_id;
++	};
++	static struct command_frame frame;
++	static size_t received;
++	ssize_t ret;
++
++	if (!real_recv) {
++		errno = EIO;
++		return -1;
++	}
++	ret = real_recv(fd, data, size, flags);
++	/* Raw page payload uses splice(); recv() carries command frames only. */
++	if (mode && !strcmp(mode, "close") && ret > 0 && size == sizeof(frame) - received) {
++		memcpy((char *)&frame + received, data, ret);
++		received += ret;
++		if (received == sizeof(frame)) {
++			received = 0;
++			if ((frame.cmd & 0xffff) == 0x1023 || (frame.cmd & 0xffff) == 0x1024)
++				disconnect_now(fd);
++		}
++	}
++	return ret;
++}
++
++ssize_t splice(int in, off_t *in_off, int out, off_t *out_off, size_t size, unsigned int flags)
++{
++	ssize_t (*real_splice)(int, off_t *, int, off_t *, size_t, unsigned int);
++	const char *mode = getenv("CRIU_TEST_DISCONNECT");
++	static size_t received;
++	int type;
++	socklen_t len = sizeof(type);
++	bool selected = mode && !strcmp(mode, "transfer") &&
++			!getsockopt(in, SOL_SOCKET, SO_TYPE, &type, &len);
++	ssize_t ret;
++
++	real_splice = dlsym(RTLD_NEXT, "splice");
++	if (!real_splice) {
++		errno = EIO;
++		return -1;
++	}
++	if (selected && received >= 8192)
++		disconnect_now(in);
++	ret = real_splice(in, in_off, out, out_off, size, flags);
++	if (selected && ret > 0)
++		received += ret;
++	return ret;
++}
+diff --git a/test/others/page-server-remote-parent/generation_oracle.py b/test/others/page-server-remote-parent/generation_oracle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb84c8af168f65a351994609119bea241d56e7ea
+--- /dev/null
++++ b/test/others/page-server-remote-parent/generation_oracle.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python3
++"""External page-generation oracle for the remote-parent regression.
++
++Expected bytes are retained outside the checkpointed task. Mutations remain in
++place until *after* restored bytes have been verified, then are undone so the
++unchanged compress_pages00 workload can verify all its other memory as well.
++"""
++import argparse
++import json
++import os
++from pathlib import Path
++import sys
++
++PE_PARENT = 1
++PE_PRESENT = 4
++
++
++def entries(directory, pid):
++    import pycriu.images
++    with (Path(directory) / f'pagemap-{pid}.img').open('rb') as image:
++        return pycriu.images.load(image)['entries'][1:]
++
++
++def read_exact(fd, address, size):
++    data = os.pread(fd, size, address)
++    if len(data) != size:
++        raise RuntimeError(f'Short memory read at {address:#x}: {len(data)}/{size}')
++    return data
++
++
++def write_exact(fd, address, data):
++    if os.pwrite(fd, data, address) != len(data):
++        raise RuntimeError(f'Short memory write at {address:#x}')
++
++
++def save(path, state):
++    # The directory belongs exclusively to this regression invocation.
++    temporary = path.with_suffix(path.suffix + '.tmp')
++    with temporary.open('x') as output:
++        json.dump(state, output, indent=2)
++        output.write('\n')
++    temporary.replace(path)
++
++
++def mutate(directory, pid, state_path):
++    state_path = Path(state_path)
++    with open(f'/proc/{pid}/mem', 'r+b', buffering=0) as memory:
++        fd = memory.fileno()
++        if state_path.exists():
++            state = json.loads(state_path.read_text())
++        else:
++            size = os.sysconf('SC_PAGE_SIZE')
++            present = [e for e in entries(directory, pid)
++                       if int(e.get('flags', 0)) & PE_PRESENT]
++            if not present:
++                raise RuntimeError('No present range for generation test')
++            chosen = max(present, key=lambda e: int(e.get('nr_pages', 0)))
++            if int(chosen.get('nr_pages', 0)) < 16:
++                raise RuntimeError('Workload has no sufficiently large range')
++            # Skip the boundary of the largest (33 MiB patterned) workload range.
++            address = int(chosen['vaddr']) + 4 * size
++            pages = []
++            for offset in range(3):
++                base = address + offset * size
++                original = read_exact(fd, base, size).hex()
++                pages.append({'address': base, 'original': original,
++                              'expected': original, 'generation': 0})
++            state = {'page_size': size, 'mutations': 0, 'pages': pages}
++        index = state['mutations']
++        if index not in (0, 1):
++            raise RuntimeError('Only two mutation generations are supported')
++        page = state['pages'][index]
++        expected = bytes.fromhex(page['expected'])
++        if read_exact(fd, page['address'], len(expected)) != expected:
++            raise RuntimeError('Workload changed a page reserved for the oracle')
++        changed = bytes(value ^ (0x55 if index == 0 else 0xAA) for value in expected)
++        write_exact(fd, page['address'], changed)
++        page['expected'] = changed.hex()
++        page['generation'] = index + 1
++        state['mutations'] += 1
++        save(state_path, state)
++        print(f'GENERATION: changed page {index}, generation {index + 1}')
++
++
++def check_entries(image_entries, state):
++    # Only the latest mutation belongs in the current image; the previous
++    # generation and untouched control must resolve through its parent.
++    latest = state['mutations'] - 1
++    size = state['page_size']
++    for index, page in enumerate(state['pages']):
++        address = page['address']
++        found = [e for e in image_entries
++                 if int(e['vaddr']) <= address
++                 and int(e['vaddr']) + int(e['nr_pages']) * size >= address + size]
++        if len(found) != 1:
++            raise RuntimeError(f'Expected one pagemap entry for {address:#x}')
++        flags = int(found[0].get('flags', 0)) & (PE_PARENT | PE_PRESENT)
++        wanted = PE_PRESENT if index == latest else PE_PARENT
++        if flags != wanted:
++            raise RuntimeError(f'Page {index}: flags {flags}, expected {wanted}')
++    print('GENERATION: current payload and parent-reference placement verified')
++
++
++def check_image(directory, pid, state_path):
++    check_entries(entries(directory, pid), json.loads(Path(state_path).read_text()))
++
++
++def verify_and_reset(pid, state_path):
++    state = json.loads(Path(state_path).read_text())
++    with open(f'/proc/{pid}/mem', 'r+b', buffering=0) as memory:
++        fd = memory.fileno()
++        # Verify EVERY selected page before modifying ANY restored byte.
++        for index, page in enumerate(state['pages']):
++            expected = bytes.fromhex(page['expected'])
++            actual = read_exact(fd, page['address'], len(expected))
++            if actual != expected:
++                raise RuntimeError(f'Restored page {index} is stale or corrupted; '
++                                   f'expected generation {page["generation"]}')
++        print('GENERATION: all restored pages match external expected bytes')
++        for page in state['pages']:
++            if page['generation']:
++                write_exact(fd, page['address'], bytes.fromhex(page['original']))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    sub = parser.add_subparsers(dest='command', required=True)
++    for command in ('mutate', 'check-image'):
++        p = sub.add_parser(command)
++        p.add_argument('directory')
++        p.add_argument('pid', type=int)
++        p.add_argument('state_path')
++    p = sub.add_parser('verify-and-reset')
++    p.add_argument('pid', type=int)
++    p.add_argument('state_path')
++    args = parser.parse_args()
++    if args.command == 'mutate':
++        mutate(args.directory, args.pid, args.state_path)
++    elif args.command == 'check-image':
++        check_image(args.directory, args.pid, args.state_path)
++    else:
++        verify_and_reset(args.pid, args.state_path)
++
++
++if __name__ == '__main__':
++    try:
++        main()
++    except (OSError, ValueError, RuntimeError) as error:
++        print(f'FAIL: {error}', file=sys.stderr)
++        sys.exit(1)
+diff --git a/test/others/page-server-remote-parent/regression.sh b/test/others/page-server-remote-parent/regression.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..1b1eb259212b12f3e06c3a2964698b018867dc4b
+--- /dev/null
++++ b/test/others/page-server-remote-parent/regression.sh
+@@ -0,0 +1,561 @@
++#!/bin/bash
++
++set -euo pipefail
++
++# shellcheck source=test/others/env.sh
++source ../env.sh
++
++CRIU_CMD=("${CRIU}" --no-default-config)
++ZDTM_DIR="../../zdtm/static"
++IMAGE_TOOL="./generation_oracle.py"
++PRE_DUMP_MODE="${PRE_DUMP_MODE:-splice}"
++case "$PRE_DUMP_MODE" in
++	splice|read) ;;
++	*) echo "Invalid PRE_DUMP_MODE: $PRE_DUMP_MODE" >&2; exit 2 ;;
++esac
++ORACLE_STATE=""
++WORK_DIR="remote-parent-regression.$$"
++PID=""
++PAGE_SERVER_PID=""
++
++fail() {
++	echo "FAIL: $*"
++	if [ -d "$WORK_DIR" ]; then
++		find "$WORK_DIR" -type f -name '*.log' -print -exec sh -c 'echo "--- $1"; tail -n 100 "$1"' _ {} \; || true
++	fi
++	exit 1
++}
++
++cleanup() {
++	if [ -n "$PAGE_SERVER_PID" ] && kill -0 "$PAGE_SERVER_PID" 2>/dev/null; then
++		kill -TERM "$PAGE_SERVER_PID" 2>/dev/null || true
++		wait "$PAGE_SERVER_PID" 2>/dev/null || true
++	fi
++	PAGE_SERVER_PID=""
++
++	if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
++		kill -TERM "$PID" 2>/dev/null || true
++		for _ in $(seq 1 50); do
++			kill -0 "$PID" 2>/dev/null || break
++			sleep 0.1
++		done
++		if kill -0 "$PID" 2>/dev/null; then
++			kill -KILL "$PID" 2>/dev/null || true
++		fi
++	fi
++	PID=""
++}
++trap cleanup EXIT
++
++sum_pages_bytes() {
++	local directory="$1"
++	local total=0
++	local file
++
++	for file in "$directory"/pages-*.img; do
++		[ -e "$file" ] || continue
++		total=$((total + $(wc -c < "$file")))
++	done
++	printf '%d\n' "$total"
++}
++
++sum_parent_pagemap_bytes() {
++	local directory="$1"
++	local total=0
++	local file
++
++	for file in "$directory"/pagemap-*.img; do
++		[ -e "$file" ] || continue
++		total=$((total + $(wc -c < "$file")))
++	done
++	printf '%d\n' "$total"
++}
++
++count_pages_images() {
++	local directory="$1"
++	local count=0
++	local file
++
++	for file in "$directory"/pages-*.img; do
++		[ -e "$file" ] || continue
++		count=$((count + 1))
++	done
++	printf '%d\n' "$count"
++}
++
++assert_parent_pagemap_committed() {
++	local directory="$1"
++
++	compgen -G "$directory/pagemap-*.img" >/dev/null ||
++		fail "source parent pagemap is missing"
++	[ "$(count_pages_images "$directory")" -eq 0 ] ||
++		fail "source retained a pages image"
++	if compgen -G "$directory/.pagemap-*.img.tmp.*" >/dev/null; then
++		fail "temporary source parent pagemap was not removed"
++	fi
++}
++
++free_port() {
++	python3 - <<'PY'
++import socket
++
++with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
++    sock.bind(("127.0.0.1", 0))
++    print(sock.getsockname()[1])
++PY
++}
++
++wait_page_server() {
++	local port="$1"
++	local i
++
++	for i in $(seq 1 100); do
++		kill -0 "$PAGE_SERVER_PID" 2>/dev/null ||
++			fail "page server exited before accepting a connection"
++		if [ -n "$(ss -H -ltn "sport = :$port")" ]; then
++			return
++		fi
++		sleep 0.02
++	done
++	fail "page server did not start listening"
++}
++
++start_page_server() {
++	local image_dir="$1"
++	local port="$2"
++
++	shift 2
++	"${CRIU_CMD[@]}" page-server -D "$image_dir" -o page-server.log -v4 --port "$port" "$@" &
++	PAGE_SERVER_PID=$!
++	wait_page_server "$port"
++}
++
++finish_page_server() {
++	local label="$1"
++
++	if ! wait "$PAGE_SERVER_PID"; then
++		fail "$label"
++	fi
++	PAGE_SERVER_PID=""
++}
++
++start_test() {
++	ORACLE_STATE=""
++	(
++		cd "$ZDTM_DIR"
++		make compress_pages00.cleanout
++		make compress_pages00
++		"$BASE_PAGE_LAUNCHER" make compress_pages00.pid
++	)
++
++	PID=$(cat "$ZDTM_DIR/compress_pages00.pid")
++	kill -0 "$PID" 2>/dev/null || fail "workload did not start"
++}
++
++stop_test() {
++	local label="$1"
++
++	if [ -n "$ORACLE_STATE" ]; then
++		run_image_tool verify-and-reset "$PID" "$ORACLE_STATE" ||
++			fail "$label: stale or corrupt restored page generation"
++	fi
++
++	(
++		cd "$ZDTM_DIR"
++		make compress_pages00.stop
++		grep PASS compress_pages00.out
++	) || fail "$label: restored memory verification failed"
++	PID=""
++}
++
++run_image_tool() {
++	PYTHONPATH="${BASE_DIR}/lib${PYTHONPATH:+:${PYTHONPATH}}" \
++		python3 "$IMAGE_TOOL" "$@"
++}
++
++dirty_page_generation() {
++	local image_dir="$1"
++	local address_file="$2"
++
++	ORACLE_STATE="$address_file"
++	run_image_tool mutate "$image_dir" "$PID" "$ORACLE_STATE"
++}
++
++run_local_parent_control() {
++	local base="$WORK_DIR/local-control"
++	local pre="$base/pre"
++	local final="$base/final"
++	local pre_bytes
++	local final_bytes
++
++	echo "=== local parent control ==="
++	mkdir -p "$pre" "$final"
++	start_test
++
++	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" -D "$pre" -o dump.log -t "$PID" -v4 --track-mem ||
++		fail "local control pre-dump failed"
++	dirty_page_generation "$pre" "$base/toggle-address" ||
++		fail "local control could not dirty workload page"
++
++	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
++		--prev-images-dir ../pre ||
++		fail "local control final dump failed"
++
++	pre_bytes=$(sum_pages_bytes "$pre")
++	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
++		fail "final image has incorrect generation placement"
++	final_bytes=$(sum_pages_bytes "$final")
++	echo "local-control pre pages bytes:   $pre_bytes"
++	echo "local-control final pages bytes: $final_bytes"
++
++	[ "$pre_bytes" -gt $((8 * 1024 * 1024)) ] ||
++		fail "local control workload is too small"
++	[ "$final_bytes" -gt 0 ] ||
++		fail "local control final dump contains no page payload"
++	[ $((final_bytes * 4)) -lt "$pre_bytes" ] ||
++		fail "local control final dump is not incremental"
++
++	"${CRIU_CMD[@]}" restore -D "$final" -o restore.log -v4 -d ||
++		fail "local control restore failed"
++	stop_test "local control"
++
++	LOCAL_CONTROL_FINAL_BYTES="$final_bytes"
++}
++
++run_remote_parent_regression() {
++	local base="$WORK_DIR/remote-parent"
++	local source_pre="$base/source-pre"
++	local target_pre="$base/target-pre"
++	local final="$base/final"
++	local port
++	local source_pre_bytes
++	local coverage_bytes
++	local remote_pre_bytes
++	local final_bytes
++
++	echo "=== remote page-server parent regression ==="
++	mkdir -p "$source_pre" "$target_pre" "$final"
++	start_test
++	port=$(free_port)
++	start_page_server "$target_pre" "$port"
++
++	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" -D "$source_pre" -o dump.log -t "$PID" -v4 --track-mem \
++		--page-server --address 127.0.0.1 --port "$port" ||
++		fail "remote pre-dump failed"
++	finish_page_server "page server failed while receiving pre-dump"
++
++	source_pre_bytes=$(sum_pages_bytes "$source_pre")
++	coverage_bytes=$(sum_parent_pagemap_bytes "$source_pre")
++	remote_pre_bytes=$(sum_pages_bytes "$target_pre")
++	echo "source-side pre-dump page bytes: $source_pre_bytes"
++	echo "source-side coverage bytes:      $coverage_bytes"
++	echo "page-server pre-dump page bytes: $remote_pre_bytes"
++
++	[ "$source_pre_bytes" -eq 0 ] ||
++		fail "pre-dump retained memory payload on the source"
++	[ "$remote_pre_bytes" -gt $((8 * 1024 * 1024)) ] ||
++		fail "page server did not receive the expected payload"
++	assert_parent_pagemap_committed "$source_pre"
++	if [ "$coverage_bytes" -le 0 ] || [ $((coverage_bytes * 64)) -ge "$remote_pre_bytes" ]; then
++		fail "source-side coverage is not compact"
++	fi
++
++	dirty_page_generation "$target_pre" "$base/toggle-address" ||
++		fail "remote-parent case could not dirty workload page"
++
++	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
++		--prev-images-dir ../source-pre ||
++		fail "remote-parent final local dump failed"
++	final_bytes=$(sum_pages_bytes "$final")
++	echo "remote-parent final pages bytes: $final_bytes"
++	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
++		fail "final dump did not select the source parent pagemap"
++	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
++		fail "final image has incorrect generation placement"
++	[ "$final_bytes" -gt 0 ] || fail "final dump contains no dirty-page payload"
++	[ "$final_bytes" -le $((LOCAL_CONTROL_FINAL_BYTES * 4)) ] ||
++		fail "remote-parent final dump is larger than the local control"
++	[ $((final_bytes * 4)) -lt "$remote_pre_bytes" ] ||
++		fail "remote-parent final dump fell back toward a full image"
++
++	mkdir -p "$base/target-final"
++	cp -a "$final/." "$base/target-final/"
++	rm -f "$base/target-final/parent"
++	ln -s ../target-pre "$base/target-final/parent"
++	"${CRIU_CMD[@]}" restore -D "$base/target-final" -o restore.log -v4 -d ||
++		fail "assembled destination image failed to restore"
++	stop_test "remote-parent incremental restore"
++
++	REMOTE_PARENT_COVERAGE_BYTES="$coverage_bytes"
++	REMOTE_PARENT_FINAL_BYTES="$final_bytes"
++	REMOTE_PARENT_PRE_BYTES="$remote_pre_bytes"
++}
++
++run_remote_parent_multiround_regression() {
++	local base="$WORK_DIR/remote-parent-multiround"
++	local source_pre1="$base/source-pre1"
++	local source_pre2="$base/source-pre2"
++	local target_pre1="$base/target-pre1"
++	local target_pre2="$base/target-pre2"
++	local final="$base/final"
++	local port
++	local source_pre1_bytes
++	local source_pre2_bytes
++	local coverage_pre1_bytes
++	local coverage_pre2_bytes
++	local target_pre1_bytes
++	local target_pre2_bytes
++	local final_bytes
++
++	echo "=== chained remote page-server parent regression ==="
++	mkdir -p "$source_pre1" "$source_pre2" "$target_pre1" "$target_pre2" "$final"
++	start_test
++
++	port=$(free_port)
++	start_page_server "$target_pre1" "$port"
++	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" -D "$source_pre1" -o dump.log -t "$PID" -v4 --track-mem \
++		--page-server --address 127.0.0.1 --port "$port" ||
++		fail "first remote pre-dump failed"
++	finish_page_server "first-round page server failed"
++
++	source_pre1_bytes=$(sum_pages_bytes "$source_pre1")
++	coverage_pre1_bytes=$(sum_parent_pagemap_bytes "$source_pre1")
++	target_pre1_bytes=$(sum_pages_bytes "$target_pre1")
++	[ "$source_pre1_bytes" -eq 0 ] ||
++		fail "first pre-dump retained memory payload on the source"
++	[ "$target_pre1_bytes" -gt $((8 * 1024 * 1024)) ] ||
++		fail "first page-server pre-dump is unexpectedly small"
++	assert_parent_pagemap_committed "$source_pre1"
++
++	dirty_page_generation "$target_pre1" "$base/toggle-address" ||
++		fail "could not dirty a page before the second pre-dump"
++
++	port=$(free_port)
++	start_page_server "$target_pre2" "$port" --prev-images-dir ../target-pre1
++	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" -D "$source_pre2" -o dump.log -t "$PID" -v4 --track-mem \
++		--prev-images-dir ../source-pre1 \
++		--page-server --address 127.0.0.1 --port "$port" ||
++		fail "second remote pre-dump failed"
++	finish_page_server "second-round page server failed"
++	run_image_tool check-image "$target_pre2" "$PID" "$ORACLE_STATE" ||
++		fail "second round has incorrect generation placement"
++
++	source_pre2_bytes=$(sum_pages_bytes "$source_pre2")
++	coverage_pre2_bytes=$(sum_parent_pagemap_bytes "$source_pre2")
++	target_pre2_bytes=$(sum_pages_bytes "$target_pre2")
++	echo "multiround source pre1 pages:    $source_pre1_bytes"
++	echo "multiround source pre1 coverage: $coverage_pre1_bytes"
++	echo "multiround target pre1 pages:    $target_pre1_bytes"
++	echo "multiround source pre2 pages:    $source_pre2_bytes"
++	echo "multiround source pre2 coverage: $coverage_pre2_bytes"
++	echo "multiround target pre2 pages:    $target_pre2_bytes"
++
++	[ "$source_pre2_bytes" -eq 0 ] ||
++		fail "second pre-dump retained memory payload on the source"
++	[ "$target_pre2_bytes" -gt 0 ] ||
++		fail "second page-server pre-dump contains no dirty-page payload"
++	[ $((target_pre2_bytes * 4)) -lt "$target_pre1_bytes" ] ||
++		fail "second page-server pre-dump is not incremental"
++	assert_parent_pagemap_committed "$source_pre2"
++	if [ "$coverage_pre2_bytes" -le 0 ] || [ $((coverage_pre2_bytes * 64)) -ge "$target_pre1_bytes" ]; then
++		fail "second source-side coverage is not compact"
++	fi
++	[ -L "$target_pre2/parent" ] ||
++		fail "second destination pre-dump is not linked to its parent"
++
++	dirty_page_generation "$target_pre2" "$base/toggle-address" ||
++		fail "could not dirty a page before the final dump"
++
++	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
++		--prev-images-dir ../source-pre2 ||
++		fail "multiround final local dump failed"
++	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
++		fail "multiround final dump did not select the source parent pagemap"
++
++	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
++		fail "final image has incorrect generation placement"
++	final_bytes=$(sum_pages_bytes "$final")
++	echo "multiround final pages bytes: $final_bytes"
++	[ "$final_bytes" -gt 0 ] ||
++		fail "multiround final dump contains no dirty-page payload"
++	[ "$final_bytes" -le $((LOCAL_CONTROL_FINAL_BYTES * 4)) ] ||
++		fail "multiround final dump is unexpectedly large"
++	[ $((final_bytes * 4)) -lt "$target_pre1_bytes" ] ||
++		fail "multiround final dump fell back toward a full image"
++
++	mkdir -p "$base/target-final"
++	cp -a "$final/." "$base/target-final/"
++	rm -f "$base/target-final/parent"
++	ln -s ../target-pre2 "$base/target-final/parent"
++	"${CRIU_CMD[@]}" restore -D "$base/target-final" -o restore.log -v4 -d ||
++		fail "multiround destination image failed to restore"
++	stop_test "multiround remote-parent incremental restore"
++
++	MULTIROUND_PRE1_BYTES="$target_pre1_bytes"
++	MULTIROUND_PRE2_BYTES="$target_pre2_bytes"
++	MULTIROUND_COVERAGE_BYTES="$coverage_pre2_bytes"
++	MULTIROUND_FINAL_BYTES="$final_bytes"
++}
++
++assert_no_parent_pagemap() {
++	local directory="$1"
++
++	if compgen -G "$directory/pagemap-*.img" >/dev/null ||
++	   compgen -G "$directory/.pagemap-*.img.tmp.*" >/dev/null; then
++		fail "failed round left a published or temporary parent pagemap"
++	fi
++}
++
++run_image_write_failure() {
++	local side="$1"
++	local base="$WORK_DIR/failure-$side"
++	local source_pre="$base/source-pre"
++	local target_pre="$base/target-pre"
++	local port
++
++	mkdir -p "$source_pre" "$target_pre"
++	start_test
++	port=$(free_port)
++	if [ "$side" = server ]; then
++		CRIU_TEST_FAIL_IMAGE=pagemap LD_PRELOAD="$FAULT_LIBRARY" \
++			start_page_server "$target_pre" "$port" >"$base/server-stderr.log" 2>&1
++		if "${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
++			-D "$source_pre" -o dump.log -t "$PID" -v4 --track-mem \
++			--page-server --address 127.0.0.1 --port "$port"; then
++			fail "source accepted a destination pagemap write failure"
++		fi
++		if wait "$PAGE_SERVER_PID"; then
++			fail "page-server acknowledged failed image writes as success"
++		fi
++		PAGE_SERVER_PID=""
++		grep -q TEST_FAULT "$base/server-stderr.log" ||
++			fail "server fault injection did not execute"
++	else
++		start_page_server "$target_pre" "$port"
++		if CRIU_TEST_FAIL_IMAGE=inventory LD_PRELOAD="$FAULT_LIBRARY" \
++			"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
++			-D "$source_pre" -o dump.log -t "$PID" -v4 --track-mem \
++			--page-server --address 127.0.0.1 --port "$port" \
++			2>"$base/source-stderr.log"; then
++			fail "source inventory write failure was ignored"
++		fi
++		finish_page_server "healthy destination failed during source-only fault"
++		grep -q TEST_FAULT "$base/source-stderr.log" ||
++			fail "source inventory fault injection did not execute"
++	fi
++	assert_no_parent_pagemap "$source_pre"
++	kill -0 "$PID" 2>/dev/null || fail "failed pre-dump did not resume its workload"
++	stop_test "$side write failure preserves workload"
++	echo "FAILURE-REGRESSION PASS: $side write failure did not publish a parent pagemap"
++}
++
++run_destination_coverage_failure() {
++	local base="$WORK_DIR/destination-coverage"
++	local source_pre="$base/source-pre"
++	local target_pre="$base/target-pre"
++	local source_next="$base/source-next"
++	local target_next="$base/target-next"
++	local port
++
++	echo "=== source coverage cannot serve as destination payload ==="
++	mkdir -p "$source_pre" "$target_pre" "$source_next" "$target_next"
++	start_test
++	port=$(free_port)
++	start_page_server "$target_pre" "$port"
++	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
++		-D "$source_pre" -o dump.log -t "$PID" -v4 --track-mem \
++		--page-server --address 127.0.0.1 --port "$port" || fail "setup pre-dump failed"
++	finish_page_server "setup page server failed"
++	assert_parent_pagemap_committed "$source_pre"
++
++	# Deliberately select the source-only metadata directory at the receiver.
++	port=$(free_port)
++	start_page_server "$target_next" "$port" --prev-images-dir ../source-pre
++	if "${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
++		-D "$source_next" -o dump.log -t "$PID" -v4 --track-mem \
++		--prev-images-dir ../source-pre \
++		--page-server --address 127.0.0.1 --port "$port"; then
++		fail "receiver accepted coverage-only parent without page payload"
++	fi
++	if wait "$PAGE_SERVER_PID"; then
++		fail "receiver reported success for a coverage-only parent"
++	fi
++	PAGE_SERVER_PID=""
++	grep -Eq 'Page-server parent (contains source coverage|must contain destination)' \
++		"$target_next/page-server.log" || fail "receiver did not reject coverage-only parent"
++	assert_no_parent_pagemap "$source_next"
++	kill -0 "$PID" 2>/dev/null || fail "failed pre-dump did not resume workload"
++	stop_test "destination coverage rejection preserves workload"
++}
++
++run_disconnect_failure() {
++	local when="$1"
++	local base="$WORK_DIR/disconnect-$when"
++	local source_pre="$base/source-pre"
++	local target_pre="$base/target-pre"
++	local port
++
++	mkdir -p "$source_pre" "$target_pre"
++	start_test
++	port=$(free_port)
++	CRIU_TEST_DISCONNECT="$when" LD_PRELOAD="$FAULT_LIBRARY" \
++		start_page_server "$target_pre" "$port" >"$base/server-stderr.log" 2>&1
++	if "${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
++		-D "$source_pre" -o dump.log -t "$PID" -v4 --track-mem \
++		--page-server --address 127.0.0.1 --port "$port"; then
++		fail "source accepted a disconnected page server ($when)"
++	fi
++	if wait "$PAGE_SERVER_PID"; then
++		fail "disconnected server returned success"
++	fi
++	PAGE_SERVER_PID=""
++	grep -q 'TEST_FAULT: page server disconnected' "$base/server-stderr.log" ||
++		fail "disconnect injection did not execute"
++	assert_no_parent_pagemap "$source_pre"
++	kill -0 "$PID" 2>/dev/null || fail "disconnect did not resume workload"
++	stop_test "$when disconnect preserves workload"
++	echo "FAILURE-REGRESSION PASS: disconnect-$when did not publish a parent pagemap"
++}
++
++rm -rf "$WORK_DIR"
++mkdir -p "$WORK_DIR"
++BASE_PAGE_LAUNCHER="$PWD/$WORK_DIR/base-page-launcher"
++"${CC:-cc}" -Wall -Wextra -Werror base_page_launcher.c -o "$BASE_PAGE_LAUNCHER"
++FAULT_LIBRARY="$PWD/$WORK_DIR/fail-image-write.so"
++"${CC:-cc}" -shared -fPIC -Wall -Wextra -Werror fail_image_write.c -ldl -o "$FAULT_LIBRARY"
++
++LOCAL_CONTROL_FINAL_BYTES=0
++REMOTE_PARENT_COVERAGE_BYTES=0
++REMOTE_PARENT_FINAL_BYTES=0
++REMOTE_PARENT_PRE_BYTES=0
++MULTIROUND_PRE1_BYTES=0
++MULTIROUND_PRE2_BYTES=0
++MULTIROUND_COVERAGE_BYTES=0
++MULTIROUND_FINAL_BYTES=0
++
++run_local_parent_control
++run_remote_parent_regression
++run_remote_parent_multiround_regression
++run_image_write_failure server
++run_image_write_failure source
++run_disconnect_failure transfer
++run_disconnect_failure close
++run_destination_coverage_failure
++
++cat <<EOF
++Remote-parent regression PASSED
++  local incremental final:    ${LOCAL_CONTROL_FINAL_BYTES} bytes
++  remote pre-dump payload:    ${REMOTE_PARENT_PRE_BYTES} bytes
++  remote coverage metadata:   ${REMOTE_PARENT_COVERAGE_BYTES} bytes
++  remote-parent local final:  ${REMOTE_PARENT_FINAL_BYTES} bytes
++  chained remote pre1:        ${MULTIROUND_PRE1_BYTES} bytes
++  chained remote pre2:        ${MULTIROUND_PRE2_BYTES} bytes
++  chained coverage metadata:  ${MULTIROUND_COVERAGE_BYTES} bytes
++  chained local final:        ${MULTIROUND_FINAL_BYTES} bytes
++EOF
++
++if [ "${KEEP_WORK_DIR:-0}" != 1 ]; then
++	rm -rf "$WORK_DIR"
++else
++	echo "Kept work directory: $WORK_DIR"
++fi
+diff --git a/test/others/page-server-remote-parent/shared_regression.py b/test/others/page-server-remote-parent/shared_regression.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..ac367c35980a83152f83a569052e5f571333828d
+--- /dev/null
++++ b/test/others/page-server-remote-parent/shared_regression.py
+@@ -0,0 +1,293 @@
++#!/usr/bin/env python3
++"""Hybrid migration of private COW and shared pages; external byte oracle."""
++import json
++import os
++from pathlib import Path
++import signal
++from socket import AF_INET, SOCK_STREAM, socket as Socket
++import subprocess
++import struct
++import sys
++import tempfile
++import time
++
++HERE = Path(__file__).resolve().parent
++ROOT = HERE.parents[2]
++sys.path.insert(0, str(ROOT / 'lib'))
++
++
++def run(command, logfile, env=None):
++    with logfile.open('w') as output:
++        subprocess.run([str(s) for s in command], check=True, timeout=90,
++                       stdout=output, stderr=subprocess.STDOUT, env=env)
++
++
++def wait_until(predicate, message, timeout=15):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if predicate():
++            return
++        time.sleep(0.02)
++    raise RuntimeError(message)
++
++
++def alive(pid):
++    try:
++        return Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1][0] != 'Z'
++    except FileNotFoundError:
++        return False
++
++
++def memory(pid, address, expected=None, value=None):
++    with open(f'/proc/{pid}/mem', 'r+b', buffering=0) as fd:
++        if expected is not None:
++            actual = os.pread(fd.fileno(), len(expected), address)
++            if actual != expected:
++                raise RuntimeError(f'byte mismatch pid={pid} address={address:#x}')
++        if value is not None:
++            if os.pwrite(fd.fileno(), value, address) != len(value):
++                raise RuntimeError('short workload memory write')
++
++
++def image_entries(directory, pid):
++    import pycriu.images
++    with (directory / f'pagemap-{pid}.img').open('rb') as image:
++        return pycriu.images.load(image)['entries'][1:]
++
++
++def page_flags(directory, pid, address, page_size):
++    selected = [entry for entry in image_entries(directory, pid)
++                if int(entry['vaddr']) <= address < int(entry['vaddr']) +
++                int(entry['nr_pages']) * page_size]
++    if len(selected) != 1:
++        raise RuntimeError(f'no unique pagemap entry for {pid}/{address:#x}')
++    return int(selected[0].get('flags', 0)) & 5
++
++
++def dirty_private_pages(pid, address, length, page_size):
++    count = length // page_size
++    with open(f'/proc/{pid}/pagemap', 'rb', buffering=0) as image:
++        data = os.pread(image.fileno(), count * 8, address // page_size * 8)
++    if len(data) != count * 8:
++        raise RuntimeError('short pagemap read from test workload')
++    return [index for index, (entry,) in enumerate(struct.iter_unpack('=Q', data))
++            if entry & (1 << 55)]
++
++
++def verify_dirty_capture(directory, pid, address, length, page_size, dirty):
++    flags = [None] * (length // page_size)
++    for entry in image_entries(directory, pid):
++        lo = max(address, int(entry['vaddr']))
++        hi = min(address + length, int(entry['vaddr']) + int(entry['nr_pages']) * page_size)
++        for current in range(lo, hi, page_size):
++            flags[(current - address) // page_size] = int(entry.get('flags', 0)) & 5
++    if any(value not in (1, 4) for value in flags):
++        raise RuntimeError('private mapping has missing or invalid page coverage')
++    if any(flags[index] != 4 for index in dirty):
++        raise RuntimeError('a page observed soft-dirty was incorrectly inherited')
++    return {'pid': pid, 'softdirty_before': len(dirty),
++            'present_pages': flags.count(4), 'parent_pages': flags.count(1)}
++
++
++def case(work, executable, mode, compressed=False, thp=False, dedup=False):
++    label = f'{mode}-{"compressed" if compressed else "plain"}'
++    label += '-thp' if thp else '-base'
++    label += '-dedup' if dedup else ''
++    base = work / label
++    base.mkdir()
++    manifest = base / 'workload.txt'
++    environment = os.environ.copy()
++    # Cover the default conservative path with shmem tracking disabled.
++    environment.pop('CRIU_TRACK_SHMEM', None)
++    if thp:
++        environment['CRIU_TEST_THP'] = '1'
++    else:
++        environment.pop('CRIU_TEST_THP', None)
++    pids = []
++    server = None
++    process = None
++    criu = [str(ROOT / 'criu/criu'), '--no-default-config']
++    extras = (['--compress'] if compressed else []) + (['--auto-dedup'] if dedup else [])
++    with (base / 'workload.log').open('w') as log:
++        try:
++            process = subprocess.Popen([str(executable), str(manifest)], stdin=subprocess.DEVNULL,
++                                       stdout=log, stderr=log, start_new_session=True, env=environment)
++            wait_until(lambda: manifest.exists() and len(manifest.read_text().split()) == 7,
++                       'workload startup failed')
++            parent, child, private, shared, private_size, shared_size, page_size = map(
++                int, manifest.read_text().split())
++            pids = [parent, child]
++            if process.pid != parent:
++                raise RuntimeError('unexpected workload identity')
++            huge_kb = sum(int(line.split()[1]) for line in Path(f'/proc/{parent}/smaps').read_text().splitlines()
++                          if line.startswith('AnonHugePages:'))
++            print(f'{label}: AnonHugePages={huge_kb} kB', flush=True)
++            payloads = []
++            dirty_evidence = []
++            for iteration in (1, 2):
++                source = base / f'source-{iteration}'
++                target = base / f'target-{iteration}'
++                source.mkdir()
++                target.mkdir()
++                observed_dirty = {pid: dirty_private_pages(pid, private, private_size, page_size)
++                                  for pid in pids}
++                # Keep the listening socket bound; CRIU accepts the actual data
++                # connection via --ps-socket. No free-port/probe race is needed.
++                with Socket(AF_INET, SOCK_STREAM) as listener:
++                    listener.bind(('127.0.0.1', 0))
++                    listener.listen(1)
++                    listener.settimeout(20)
++                    command = criu + ['pre-dump', '-t', str(parent), '-D', str(source),
++                                      '-o', 'dump.log', '-v4', '--track-mem', '--pre-dump-mode', mode,
++                                      '--page-server', '--address', '127.0.0.1', '--port',
++                                      str(listener.getsockname()[1])] + extras
++                    if iteration == 2:
++                        command += ['--prev-images-dir', '../source-1']
++                    with (base / f'client-{iteration}.log').open('w') as client_log:
++                        client = subprocess.Popen(command, stdout=client_log, stderr=client_log, env=environment)
++                        try:
++                            connection, _ = listener.accept()
++                            with connection:
++                                server_command = criu + ['page-server', '-D', str(target), '-o', 'server.log',
++                                                         '-v4', '--ps-socket', str(connection.fileno())]
++                                if iteration == 2:
++                                    server_command += ['--prev-images-dir', '../target-1']
++                                with (base / f'server-{iteration}.log').open('w') as server_log:
++                                    server = subprocess.Popen(server_command, pass_fds=[connection.fileno()],
++                                                              stdout=server_log, stderr=server_log, env=environment)
++                                if client.wait(timeout=60) or server.wait(timeout=60):
++                                    raise RuntimeError('pre-dump/page-server failed')
++                                server = None
++                        finally:
++                            if client.poll() is None:
++                                client.kill()
++                                client.wait()
++                if any(source.glob('pages-*.img')):
++                    raise RuntimeError('source retained page payload')
++                if len(list(source.glob('pagemap-*.img'))) != 2:
++                    raise RuntimeError('coverage missing for one of the two processes')
++                # On this path anonymous shared mappings are represented as
++                # memfd-backed FILE_SHARED VMAs. Stock pre-dump defers them to
++                # the final dump; remote coverage does not track shared-page
++                # dirtiness. Check final capture and sharing below.
++                if list(source.glob('.pagemap-*.img.tmp.*')):
++                    raise RuntimeError('temporary coverage remained')
++                payloads.append(sum(p.stat().st_size for p in target.glob('pages-*.img')))
++                captured = [verify_dirty_capture(target, pid, private, private_size,
++                                                 page_size, observed_dirty[pid]) for pid in pids]
++                dirty_evidence.append({'iteration': iteration, 'processes': captured})
++                (base / 'dirty-capture.json').write_text(json.dumps(dirty_evidence, indent=2) + '\n')
++                memory(child if iteration == 1 else parent, shared + (iteration - 1) * page_size,
++                       value=bytes([0x31 if iteration == 1 else 0x72]) * page_size)
++                memory(child if iteration == 1 else parent, private + (iteration - 1) * page_size,
++                       value=bytes([0xCC if iteration == 1 else 0xDD]) * page_size)
++            final = base / 'final'
++            final.mkdir()
++            final_dirty = {pid: dirty_private_pages(pid, private, private_size, page_size) for pid in pids}
++            run(criu + ['dump', '-t', str(parent), '-D', str(final), '-o', 'dump.log', '-v4',
++                        '--track-mem', '--prev-images-dir', '../source-2'] + extras,
++                base / 'final-command.log', environment)
++            process.wait(timeout=10)
++            # Establish what the shared mapping actually used, rather than
++            # requiring a pre-dump backend that this workload does not enter.
++            import pycriu.images
++            with (final / f'mm-{parent}.img').open('rb') as image:
++                mm = pycriu.images.load(image)['entries'][0]
++            mapping = [vma for vma in mm['vmas']
++                       if int(vma['start']) <= shared < int(vma['end'])]
++            if len(mapping) != 1 or not int(mapping[0]['flags']) & 1:
++                raise RuntimeError('shared mapping metadata was not preserved')
++            shared_counts = [len(list((base / f'source-{i}').glob('pagemap-shmem-*.img')))
++                             for i in (1, 2)]
++            memfd_backed = bool(int(mapping[0]['status']) & (1 << 14))
++            if not any(shared_counts) and not memfd_backed:
++                raise RuntimeError('shared pre-dump coverage missing without memfd deferral')
++            shared_strategy = 'memfd-final-capture' if not any(shared_counts) else 'predump-coverage'
++            final_payload = sum(p.stat().st_size for p in final.glob('pages-*.img'))
++            final_capture = [verify_dirty_capture(final, pid, private, private_size, page_size,
++                                                  final_dirty[pid]) for pid in pids]
++            if not any(item['parent_pages'] for item in final_capture):
++                raise RuntimeError('final dump lost all private parent inheritance')
++            # Private generation A must come through the latest parent chain;
++            # generation B must be in the current image. THP can recopy neighbors.
++            if not thp and (page_flags(final, child, private, page_size) != 1 or
++                            page_flags(final, parent, private + page_size, page_size) != 4):
++                raise RuntimeError('private generation placement is incorrect')
++            # A fixed reduction ratio is meaningful for the base-page test
++            # workload, not for THP/COW where the kernel may mark whole PMDs dirty.
++            # THP must still capture every observed dirty page, retain parent
++            # inheritance, and pass the same external post-restore byte oracle.
++            if not compressed and not thp and (payloads[1] * 4 >= payloads[0] or final_payload * 4 >= payloads[0]):
++                raise RuntimeError('private memory did not remain incremental')
++            (final / 'parent').unlink()
++            (final / 'parent').symlink_to('../target-2')
++            run(criu + ['restore', '-D', str(final), '-o', 'restore.log', '-v4', '-d'],
++                base / 'restore-command.log', environment)
++            if not all(alive(pid) for pid in pids):
++                raise RuntimeError('restored process missing')
++            shared_expected = bytearray([0x19]) * shared_size
++            shared_expected[:page_size] = bytes([0x31]) * page_size
++            shared_expected[page_size:2 * page_size] = bytes([0x72]) * page_size
++            for pid in pids:
++                expected = bytearray([0x29]) * private_size
++                index = 0 if pid == child else 1
++                expected[index * page_size:(index + 1) * page_size] = bytes([0xCC if pid == child else 0xDD]) * page_size
++                memory(pid, private, bytes(expected))
++                memory(pid, shared, bytes(shared_expected))
++            memory(child, shared + 3 * page_size, value=b'Z')
++            memory(parent, shared + 3 * page_size, expected=b'Z')
++            result = {'case': label, 'status': 'PASS', 'pre_payloads': payloads,
++                      'final_payload': final_payload, 'private_bytes_checked': private_size * 2,
++                      'shared_bytes_checked': shared_size * 2, 'huge_kb_before': huge_kb,
++                      'thp_exercised': thp and huge_kb > 0, 'restored_sharing_verified': True, 'shared_strategy': shared_strategy,
++                      'shared_predump_coverage_counts': shared_counts,
++                      'dirty_capture': dirty_evidence, 'final_capture': final_capture,
++                      'predump_payload_ratio': payloads[1] / payloads[0],
++                      'final_payload_ratio': final_payload / payloads[0]}
++            (base / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
++            print(json.dumps(result), flush=True)
++            return result
++        finally:
++            if server is not None and server.poll() is None:
++                server.kill()
++                server.wait()
++            for pid in reversed(pids):
++                try:
++                    os.kill(pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    continue
++            if process is not None and process.poll() is None:
++                process.kill()
++                process.wait()
++
++
++def main():
++    if os.geteuid() != 0:
++        raise RuntimeError('run this regression as root on an isolated CRIU test host')
++    work = Path(tempfile.mkdtemp(prefix='shared-regression.', dir=HERE))
++    print(f'Work directory: {work}', flush=True)
++    executable = work / 'workload'
++    run([os.environ.get('CC', 'cc'), '-O2', '-Wall', '-Wextra', '-Werror',
++         HERE / 'shared_workload.c', '-o', executable], work / 'compile.log')
++    with (work / 'compression-feature.log').open('w') as log:
++        compression = subprocess.run([str(ROOT / 'criu/criu'), '--no-default-config',
++                                      'check', '--feature', 'compress'], stdout=log,
++                                     stderr=subprocess.STDOUT, timeout=30).returncode == 0
++    if not compression:
++        print('SKIP: compressed variants unavailable; plain shared-memory cases still run', flush=True)
++    results = []
++    for mode in ('splice', 'read'):
++        for compressed in ((False, True) if compression else (False,)):
++            results.append(case(work, executable, mode, compressed))
++    results.append(case(work, executable, 'read', thp=True))
++    results.append(case(work, executable, 'splice', dedup=True))
++    (work / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
++    print('SHARED-REGRESSION PASSED', flush=True)
++
++
++if __name__ == '__main__':
++    try:
++        main()
++    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
++        print(f'FAIL: {error}', file=sys.stderr)
++        sys.exit(1)
+diff --git a/test/others/page-server-remote-parent/shared_workload.c b/test/others/page-server-remote-parent/shared_workload.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f6acd462413eeff9d4ed0c5eab2bb2abee88890
+--- /dev/null
++++ b/test/others/page-server-remote-parent/shared_workload.c
+@@ -0,0 +1,58 @@
++#define _GNU_SOURCE
++#include <errno.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/prctl.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++/* The controller retains expected bytes outside this checkpointed tree. */
++int main(int argc, char **argv)
++{
++	const size_t private_size = 16UL << 20;
++	size_t page_size = sysconf(_SC_PAGESIZE);
++	size_t shared_size = 32 * page_size;
++	unsigned char *private, *shared;
++	pid_t child;
++	FILE *manifest;
++
++	if (argc != 2)
++		return 2;
++	if (!getenv("CRIU_TEST_THP") && prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0))
++		return 1;
++	private = mmap(NULL, private_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	shared = mmap(NULL, shared_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (private == MAP_FAILED || shared == MAP_FAILED)
++		return 1;
++	if (getenv("CRIU_TEST_THP"))
++		madvise(private, private_size, MADV_HUGEPAGE);
++	memset(private, 0x29, private_size);
++	memset(shared, 0x19, shared_size);
++	if (getenv("CRIU_TEST_THP")) {
++		/* Optional synchronous collapse; smaps, not this return value, is the oracle. */
++		madvise(private, private_size, 25 /* MADV_COLLAPSE */);
++	}
++	child = fork();
++	if (child < 0)
++		return 1;
++	if (!child) {
++		for (;;)
++			pause();
++	}
++	manifest = fopen(argv[1], "w");
++	if (!manifest) {
++		kill(child, SIGKILL);
++		return 1;
++	}
++	fprintf(manifest, "%d %d %lu %lu %zu %zu %zu\n", getpid(), child,
++		(unsigned long)private, (unsigned long)shared, private_size, shared_size, page_size);
++	if (fclose(manifest)) {
++		kill(child, SIGKILL);
++		return 1;
++	}
++	for (;;)
++		pause();
++}

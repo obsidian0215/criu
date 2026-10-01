@@ -1,0 +1,4 @@
+dbf188a2908cae19aee2705385067722032225297214164a75424e855ef28ac2  ./0001-page-xfer-read-buffer.patch
+0ce8975313975563810e5f32c0b77303066d895bda18869d2b93615550035a3b  ./0002-local-final-core-and-unit-tests.patch
+ca6ab0ae49455a4456b0da82628890311c3a53168a0744a8782ebc71dcf21b9a  ./0003-local-final-integration-regression.patch
+ebcdde6d1b0161bb00eae5c426299fbf2c96929b34a0c1a9e0cadd343469417f  ./validation-only-supplement.patch

@@ -1,0 +1,661 @@
+diff --git a/.github/workflows/local-final-candidate.yml b/.github/workflows/local-final-candidate.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3bae4fe63e740ccf6c91c741c40cff0e467e186
+--- /dev/null
++++ b/.github/workflows/local-final-candidate.yml
+@@ -0,0 +1,82 @@
++name: Local incremental final candidate
++
++on:
++  push:
++    branches:
++      - 'validation/local-final-*'
++      - 'local-final-core-candidate'
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++jobs:
++  validate:
++    name: Local final (${{ matrix.compiler }})
++    runs-on: ubuntu-24.04
++    timeout-minutes: 90
++    strategy:
++      fail-fast: false
++      matrix:
++        compiler: [gcc, clang]
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          fetch-depth: 0
++      - name: Check focused test sources
++        shell: bash
++        run: |
++          set -euxo pipefail
++          bash -n scripts/ci/local-final-candidate.sh
++          bash -n test/others/page-server-remote-parent/regression.sh
++          bash -n test/others/page-server-remote-parent/compare-baseline.sh
++          python3 -m py_compile test/others/page-server-remote-parent/*.py
++          git diff --check
++      - name: Build the standard Alpine test image
++        shell: bash
++        run: |
++          set -euxo pipefail
++          mkdir -p .local-final-ci
++          target=alpine
++          if [ '${{ matrix.compiler }}' = clang ]; then
++            target=alpine-clang
++          fi
++          sudo make -C scripts/build "$target" 2>&1 | tee .local-final-ci/container-build.log
++      - name: Run focused privileged validation
++        shell: bash
++        run: |
++          set -euxo pipefail
++          sudo docker run --rm --privileged --userns=host --cgroupns=host \
++            --tmpfs /run -v /lib/modules:/lib/modules \
++            -v "$GITHUB_WORKSPACE:/criu" \
++            -e CC='${{ matrix.compiler }}' -e HOSTCC='${{ matrix.compiler }}' \
++            criu-alpine bash scripts/ci/local-final-candidate.sh
++      - name: Package validation evidence
++        if: always()
++        shell: bash
++        run: |
++          set -euxo pipefail
++          archive="$RUNNER_TEMP/local-final-${{ matrix.compiler }}-${{ github.run_id }}.tar.gz"
++          cd "$GITHUB_WORKSPACE"
++          mkdir -p .local-final-ci
++          sudo dmesg > .local-final-ci/dmesg.txt || true
++          shopt -s nullglob
++          paths=(.local-final-ci
++                 test/others/page-server-remote-parent/comparison.*
++                 test/others/page-server-remote-parent/remote-parent-regression.*
++                 test/others/page-server-remote-parent/shared-regression.*
++                 test/zdtm/static/compress_pages00.out*)
++          # Root-owned PID/image files are read by tar, never traversed by the uploader.
++          sudo find "${paths[@]}" \( -type f -o -type l \) -print0 |
++            sudo tar --null --no-recursion -czf "$archive" --files-from=-
++          sudo chown "$(id -u):$(id -g)" "$archive"
++          chmod a+r "$archive"
++          test -r "$archive"
++          echo "DIAGNOSTIC_ARCHIVE=$archive" >> "$GITHUB_ENV"
++      - name: Upload validation evidence
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: local-final-${{ matrix.compiler }}-${{ github.run_id }}
++          path: ${{ env.DIAGNOSTIC_ARCHIVE }}
++          if-no-files-found: error
+diff --git a/scripts/ci/local-final-candidate.sh b/scripts/ci/local-final-candidate.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fbafea3520b822c64e3548c34a25c9802a2f858
+--- /dev/null
++++ b/scripts/ci/local-final-candidate.sh
+@@ -0,0 +1,64 @@
++#!/bin/bash
++# Focused CRIU-level validation, run inside the privileged Alpine test image.
++set -euo pipefail
++cd "$(dirname "$0")/../.."
++ROOT=$PWD
++# The host checkout is owned by the runner, while this container runs as root.
++export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$ROOT"
++CC=${CC:-gcc}
++export CC HOSTCC=${HOSTCC:-$CC}
++case "$CC" in gcc|clang) ;; *) echo "Unsupported compiler: $CC" >&2; exit 2 ;; esac
++BASELINE=3e067bc2639b7f98e8bc64b30c05f60b4dd52df8
++EVIDENCE="$ROOT/.local-final-ci"
++mkdir -p "$EVIDENCE"
++exec > >(tee "$EVIDENCE/runner.log") 2>&1
++trap 'printf "%s\n" "$?" > "$EVIDENCE/exit-code"' EXIT
++JOBS=$(nproc)
++[ "$JOBS" -le 8 ] || JOBS=8
++status=0
++stage() {
++	local name=$1
++	shift
++	echo "===== $name ====="
++	if "$@" 2>&1 | tee "$EVIDENCE/$name.log"; then
++		printf '%s PASS\n' "$name" | tee -a "$EVIDENCE/stages.txt"
++	else
++		printf '%s FAIL\n' "$name" | tee -a "$EVIDENCE/stages.txt"
++		status=1
++		return 1
++	fi
++}
++: > "$EVIDENCE/stages.txt"
++git rev-parse HEAD > "$EVIDENCE/candidate-commit.txt"
++git status --short > "$EVIDENCE/candidate-status-before-build.txt"
++git rev-parse "$BASELINE^{commit}" > "$EVIDENCE/baseline-commit.txt"
++uname -a > "$EVIDENCE/kernel.txt"
++grep '^Cap' /proc/self/status > "$EVIDENCE/capabilities.txt"
++"$CC" --version > "$EVIDENCE/compiler.txt"
++stage candidate-build make -j "$JOBS" CC="$CC" HOSTCC="$HOSTCC" || exit 1
++stage workloads-build make -C test/zdtm -j "$JOBS" CC="$CC" || exit 1
++./criu/criu --version > "$EVIDENCE/candidate-version.txt"
++sha256sum ./criu/criu > "$EVIDENCE/candidate-binary.sha256"
++# Required functionality must run; lack of dirty tracking is a failure, not PASS/SKIP.
++stage dirty-tracking ./criu/criu --no-default-config check --feature mem_dirty_track || exit 1
++stage unittest make unittest CC="$CC" HOSTCC="$HOSTCC" || true
++stage splice-regression env KEEP_WORK_DIR=1 PRE_DUMP_MODE=splice \
++	make -C test/others/page-server-remote-parent regression || true
++stage read-regression env KEEP_WORK_DIR=1 PRE_DUMP_MODE=read \
++	make -C test/others/page-server-remote-parent regression || true
++stage shared-regression make -C test/others/page-server-remote-parent shared-regression || true
++if [ "$CC" = gcc ]; then
++	# Archive the exact unmodified tree; do not patch the baseline to pass tests.
++	BASE_DIR=$(mktemp -d /tmp/criu-local-final-baseline.XXXXXX)
++	git archive "$BASELINE" | tar -x -C "$BASE_DIR"
++	if stage baseline-build make -C "$BASE_DIR" -j "$JOBS" CC=gcc HOSTCC=gcc; then
++		stage baseline-comparison bash test/others/page-server-remote-parent/compare-baseline.sh \
++			"$BASE_DIR/criu/criu" "$ROOT/criu/criu" || true
++		# Official Alpine package, installed only in the disposable CI container.
++		if stage runc-install apk add --no-cache runc; then
++			stage runc-smoke bash test/others/page-server-remote-parent/runc-smoke.sh \
++				"$BASE_DIR/criu/criu" "$ROOT/criu/criu" "$EVIDENCE/runc-smoke" || true
++		fi
++	fi
++fi
++exit "$status"
+diff --git a/test/others/page-server-remote-parent/README.md b/test/others/page-server-remote-parent/README.md
+index ad2be49f92225e486afb4d0bbe949f164e73fe20..22f590353f45dc5f9d7fdfc0be4446c337a6a93e 100644
+--- a/test/others/page-server-remote-parent/README.md
++++ b/test/others/page-server-remote-parent/README.md
+@@ -24,6 +24,27 @@ The regression covers a local incremental control, one- and two-round remote pre
+ 
+ The shared-memory regression verifies restored bytes and aliasing with `CRIU_TRACK_SHMEM` unset, so shared contents follow the default conservative copy path.
+ 
++## Compare against the unmodified baseline
++
++Build the unmodified base and candidate in separate checkouts, then run:
++
++```sh
++bash compare-baseline.sh /absolute/path/to/base/criu /absolute/path/to/candidate/criu
++```
++
++This runs the same one-round page-server pre-dump followed by a local final
++without a final page server. The base must retain no source pagemap and copy
++all three oracle pages into a full-sized final; the candidate must inherit
++unchanged pages and write a final at least four times smaller. Both assembled
++images must restore and pass an external expected-byte oracle. Binary hashes,
++versions, logs, and byte counts are retained. Splice mode keeps the independent
++read-buffer repair out of this before/after comparison.
++
++The tested CRIU sequence matches issue #2503's runc workflow: remote pre-dump,
++local final with the source parent directory, transfer final images, and restore
++against the destination pre-dump. This is CRIU-level coverage; it does not by
++itself claim an end-to-end runc invocation was tested.
++
+ Coverage files are source-side dump metadata, not restorable destination
+ parents. The suite also checks that accidentally configuring a page server
+ with such a parent fails without publishing the next round's coverage.
+diff --git a/test/others/page-server-remote-parent/compare-baseline.sh b/test/others/page-server-remote-parent/compare-baseline.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..890272849977308cdb4cacf1b91b4a4accb5f90b
+--- /dev/null
++++ b/test/others/page-server-remote-parent/compare-baseline.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# Run the same remote-pre-dump/local-final sequence with two actual binaries.
++set -euo pipefail
++if [ "$#" -ne 2 ]; then
++	echo "Usage: $0 /absolute/path/to/unmodified/criu /absolute/path/to/candidate/criu" >&2
++	exit 2
++fi
++BASELINE=$(readlink -f "$1")
++CANDIDATE=$(readlink -f "$2")
++[ -x "$BASELINE" ] && [ -x "$CANDIDATE" ] || exit 2
++[ "$BASELINE" != "$CANDIDATE" ] || { echo 'Use distinct baseline and candidate binaries' >&2; exit 2; }
++cd "$(dirname "$0")"
++RESULTS=$(mktemp -d "$PWD/comparison.XXXXXX")
++echo "Keeping comparison evidence in $RESULTS"
++# Splice isolates the local-final change from the separate read-buffer fix.
++for variant in baseline candidate; do
++	binary=$CANDIDATE
++	expect_full=0
++	if [ "$variant" = baseline ]; then
++		binary=$BASELINE
++		expect_full=1
++	fi
++	"$binary" --version > "$RESULTS/$variant-version.txt"
++	sha256sum "$binary" > "$RESULTS/$variant-binary.sha256"
++	REMOTE_PARENT_CRIU="$binary" REMOTE_PARENT_EXPECT_FULL="$expect_full" \
++		REMOTE_PARENT_SINGLE_CASE=1 REMOTE_PARENT_RESULT="$RESULTS/$variant.json" \
++		PRE_DUMP_MODE=splice KEEP_WORK_DIR=1 bash ./regression.sh 2>&1 | tee "$RESULTS/$variant.log"
++done
++python3 - "$RESULTS" <<'PY'
++import json
++from pathlib import Path
++import sys
++root = Path(sys.argv[1])
++base = json.loads((root / 'baseline.json').read_text())
++new = json.loads((root / 'candidate.json').read_text())
++assert base['restored_bytes_verified'] and new['restored_bytes_verified']
++assert base['coverage_bytes'] == 0 and new['coverage_bytes'] > 0
++assert new['final_bytes'] * 4 < base['final_bytes']
++print(f"VERIFIED: unmodified final {base['final_bytes']} bytes; "
++      f"candidate final {new['final_bytes']} bytes; both restored byte-correct")
++PY
+diff --git a/test/others/page-server-remote-parent/generation_oracle.py b/test/others/page-server-remote-parent/generation_oracle.py
+index cb84c8af168f65a351994609119bea241d56e7ea..caa0268d0ed351491702627b2d975c711d3e524c 100644
+--- a/test/others/page-server-remote-parent/generation_oracle.py
++++ b/test/others/page-server-remote-parent/generation_oracle.py
+@@ -82,7 +82,7 @@ def mutate(directory, pid, state_path):
+         print(f'GENERATION: changed page {index}, generation {index + 1}')
+ 
+ 
+-def check_entries(image_entries, state):
++def check_entries(image_entries, state, full=False):
+     # Only the latest mutation belongs in the current image; the previous
+     # generation and untouched control must resolve through its parent.
+     latest = state['mutations'] - 1
+@@ -95,14 +95,15 @@ def check_entries(image_entries, state):
+         if len(found) != 1:
+             raise RuntimeError(f'Expected one pagemap entry for {address:#x}')
+         flags = int(found[0].get('flags', 0)) & (PE_PARENT | PE_PRESENT)
+-        wanted = PE_PRESENT if index == latest else PE_PARENT
++        wanted = PE_PRESENT if full or index == latest else PE_PARENT
+         if flags != wanted:
+             raise RuntimeError(f'Page {index}: flags {flags}, expected {wanted}')
+-    print('GENERATION: current payload and parent-reference placement verified')
++    print('GENERATION: full-payload placement verified' if full else
++          'GENERATION: current payload and parent-reference placement verified')
+ 
+ 
+-def check_image(directory, pid, state_path):
+-    check_entries(entries(directory, pid), json.loads(Path(state_path).read_text()))
++def check_image(directory, pid, state_path, full=False):
++    check_entries(entries(directory, pid), json.loads(Path(state_path).read_text()), full)
+ 
+ 
+ def verify_and_reset(pid, state_path):
+@@ -125,7 +126,7 @@ def verify_and_reset(pid, state_path):
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     sub = parser.add_subparsers(dest='command', required=True)
+-    for command in ('mutate', 'check-image'):
++    for command in ('mutate', 'check-image', 'check-full-image'):
+         p = sub.add_parser(command)
+         p.add_argument('directory')
+         p.add_argument('pid', type=int)
+@@ -136,8 +137,9 @@ def main():
+     args = parser.parse_args()
+     if args.command == 'mutate':
+         mutate(args.directory, args.pid, args.state_path)
+-    elif args.command == 'check-image':
+-        check_image(args.directory, args.pid, args.state_path)
++    elif args.command in ('check-image', 'check-full-image'):
++        check_image(args.directory, args.pid, args.state_path,
++                    full=args.command == 'check-full-image')
+     else:
+         verify_and_reset(args.pid, args.state_path)
+ 
+diff --git a/test/others/page-server-remote-parent/regression.sh b/test/others/page-server-remote-parent/regression.sh
+index 1b1eb259212b12f3e06c3a2964698b018867dc4b..50189bf1b03d862dbc59bfce97c1be6ef68957d7 100755
+--- a/test/others/page-server-remote-parent/regression.sh
++++ b/test/others/page-server-remote-parent/regression.sh
+@@ -5,7 +5,13 @@ set -euo pipefail
+ # shellcheck source=test/others/env.sh
+ source ../env.sh
+ 
+-CRIU_CMD=("${CRIU}" --no-default-config)
++CRIU_CMD=("${REMOTE_PARENT_CRIU:-$CRIU}" --no-default-config)
++EXPECT_FULL=${REMOTE_PARENT_EXPECT_FULL:-0}
++SINGLE_CASE=${REMOTE_PARENT_SINGLE_CASE:-0}
++case "$EXPECT_FULL:$SINGLE_CASE" in
++	0:0|0:1|1:1) ;;
++	*) echo "Full-image baseline requires REMOTE_PARENT_SINGLE_CASE=1" >&2; exit 2 ;;
++esac
+ ZDTM_DIR="../../zdtm/static"
+ IMAGE_TOOL="./generation_oracle.py"
+ PRE_DUMP_MODE="${PRE_DUMP_MODE:-splice}"
+@@ -255,9 +261,13 @@ run_remote_parent_regression() {
+ 		fail "pre-dump retained memory payload on the source"
+ 	[ "$remote_pre_bytes" -gt $((8 * 1024 * 1024)) ] ||
+ 		fail "page server did not receive the expected payload"
+-	assert_parent_pagemap_committed "$source_pre"
+-	if [ "$coverage_bytes" -le 0 ] || [ $((coverage_bytes * 64)) -ge "$remote_pre_bytes" ]; then
+-		fail "source-side coverage is not compact"
++	if [ "$EXPECT_FULL" -eq 0 ]; then
++		assert_parent_pagemap_committed "$source_pre"
++		if [ "$coverage_bytes" -le 0 ] || [ $((coverage_bytes * 64)) -ge "$remote_pre_bytes" ]; then
++			fail "source-side coverage is not compact"
++		fi
++	else
++		[ "$coverage_bytes" -eq 0 ] || fail "baseline unexpectedly retained source pagemaps"
+ 	fi
+ 
+ 	dirty_page_generation "$target_pre" "$base/toggle-address" ||
+@@ -268,15 +278,24 @@ run_remote_parent_regression() {
+ 		fail "remote-parent final local dump failed"
+ 	final_bytes=$(sum_pages_bytes "$final")
+ 	echo "remote-parent final pages bytes: $final_bytes"
+-	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+-		fail "final dump did not select the source parent pagemap"
+-	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
+-		fail "final image has incorrect generation placement"
+-	[ "$final_bytes" -gt 0 ] || fail "final dump contains no dirty-page payload"
+-	[ "$final_bytes" -le $((LOCAL_CONTROL_FINAL_BYTES * 4)) ] ||
+-		fail "remote-parent final dump is larger than the local control"
+-	[ $((final_bytes * 4)) -lt "$remote_pre_bytes" ] ||
+-		fail "remote-parent final dump fell back toward a full image"
++	if [ "$EXPECT_FULL" -eq 1 ]; then
++		run_image_tool check-full-image "$final" "$PID" "$ORACLE_STATE" ||
++			fail "unmodified baseline did not copy all selected pages"
++		[ $((final_bytes * 2)) -ge "$remote_pre_bytes" ] ||
++			fail "unmodified baseline unexpectedly produced a small final dump"
++	else
++		grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
++			fail "final dump did not select the source parent pagemap"
++		run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
++			fail "final image has incorrect generation placement"
++		[ "$final_bytes" -gt 0 ] || fail "final dump contains no dirty-page payload"
++		if [ "$SINGLE_CASE" -eq 0 ]; then
++			[ "$final_bytes" -le $((LOCAL_CONTROL_FINAL_BYTES * 4)) ] ||
++				fail "remote-parent final dump is larger than the local control"
++		fi
++		[ $((final_bytes * 4)) -lt "$remote_pre_bytes" ] ||
++			fail "remote-parent final dump fell back toward a full image"
++	fi
+ 
+ 	mkdir -p "$base/target-final"
+ 	cp -a "$final/." "$base/target-final/"
+@@ -533,14 +552,24 @@ MULTIROUND_PRE2_BYTES=0
+ MULTIROUND_COVERAGE_BYTES=0
+ MULTIROUND_FINAL_BYTES=0
+ 
+-run_local_parent_control
+-run_remote_parent_regression
+-run_remote_parent_multiround_regression
+-run_image_write_failure server
+-run_image_write_failure source
+-run_disconnect_failure transfer
+-run_disconnect_failure close
+-run_destination_coverage_failure
++if [ "$SINGLE_CASE" -eq 1 ]; then
++	run_remote_parent_regression
++else
++	run_local_parent_control
++	run_remote_parent_regression
++	run_remote_parent_multiround_regression
++	run_image_write_failure server
++	run_image_write_failure source
++	run_disconnect_failure transfer
++	run_disconnect_failure close
++	run_destination_coverage_failure
++fi
++
++if [ -n "${REMOTE_PARENT_RESULT:-}" ]; then
++	printf '{"expect_full":%s,"pre_bytes":%s,"coverage_bytes":%s,"final_bytes":%s,"restored_bytes_verified":true}\n' \
++		"$EXPECT_FULL" "$REMOTE_PARENT_PRE_BYTES" "$REMOTE_PARENT_COVERAGE_BYTES" \
++		"$REMOTE_PARENT_FINAL_BYTES" > "$REMOTE_PARENT_RESULT"
++fi
+ 
+ cat <<EOF
+ Remote-parent regression PASSED
+diff --git a/test/others/page-server-remote-parent/runc-smoke.sh b/test/others/page-server-remote-parent/runc-smoke.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c7fc141a4aa0b4905616c6e3132826c2391610b
+--- /dev/null
++++ b/test/others/page-server-remote-parent/runc-smoke.sh
+@@ -0,0 +1,193 @@
++#!/bin/bash
++# Run inside the isolated privileged CI test container. No production workload.
++set -euo pipefail
++if [ "$#" != 3 ]; then
++	echo "Usage: $0 BASELINE_CRIU CANDIDATE_CRIU EVIDENCE_DIR" >&2
++	exit 2
++fi
++BASELINE=$(readlink -f "$1")
++CANDIDATE=$(readlink -f "$2")
++RESULTS=$(mkdir -p "$3" && cd "$3" && pwd)
++HERE=$(cd "$(dirname "$0")" && pwd)
++RUNC=$(command -v runc)
++ORIGINAL_PATH=$PATH
++test "$BASELINE" != "$CANDIDATE"
++test -x "$BASELINE" && test -x "$CANDIDATE"
++"$RUNC" --version | tee "$RESULTS/runc-version.txt"
++uname -a > "$RESULTS/kernel.txt"
++cc -static -O2 -Wall -Wextra -Werror "$HERE/runc-workload.c" -o "$RESULTS/workload"
++PS_PID=
++SRC_ROOT=
++DST_ROOT=
++ID=
++failure_command=
++failure_line=
++cleanup() {
++	[ -z "$PS_PID" ] || { kill "$PS_PID" 2>/dev/null || true; wait "$PS_PID" 2>/dev/null || true; }
++	for root in "$SRC_ROOT" "$DST_ROOT"; do
++		[ -z "$root" ] || "$RUNC" --root "$root" delete -f "$ID" 2>/dev/null || true
++	done
++}
++on_exit() {
++	local status=$?
++	trap - EXIT
++	if [ "$status" -ne 0 ]; then
++		printf 'RUNC SMOKE FAIL: status=%s line=%s command=%s\n' "$status" "$failure_line" "$failure_command" >&2
++		# Keep actionable errors in the job log, even when artifact download fails.
++		local log count=0
++		while IFS= read -r -d '' log; do
++			printf '\n--- %s (last 40 lines) ---\n' "$log" >&2
++			tail -n 40 "$log" >&2 || true
++			count=$((count + 1))
++			[ "$count" -lt 12 ] || break
++		done < <(find "$RESULTS" -maxdepth 5 -type f -name '*.log' -print0)
++	fi
++	cleanup
++	exit "$status"
++}
++trap 'failure_command=$BASH_COMMAND; failure_line=$LINENO' ERR
++trap on_exit EXIT
++wait_file() {
++	for _ in $(seq 1 300); do [ ! -f "$1" ] || return 0; sleep 0.1; done
++	echo "Timed out waiting for $1" >&2; return 1
++}
++sum_images() {
++	python3 - "$1" "$2" <<'PY'
++import pathlib, sys
++print(sum(p.stat().st_size for p in pathlib.Path(sys.argv[1]).glob(sys.argv[2])))
++PY
++}
++for variant in baseline candidate; do
++	binary=$CANDIDATE
++	[ "$variant" != baseline ] || binary=$BASELINE
++	dir="$RESULTS/$variant"
++	# CRIU's pivot_root uses an existing /tmp on a read-only container root.
++	mkdir -p "$dir"/{bin,source/parent0,source/image,destination/parent0,destination/image,state,bundle/rootfs/state,bundle/rootfs/proc,bundle/rootfs/dev,bundle/rootfs/tmp}
++	# Modern runc ignores --criu. Both version and swrk use executable lookup.
++	ln -s "$binary" "$dir/bin/criu"
++	export PATH="$dir/bin:$ORIGINAL_PATH"
++	test "$(readlink -f "$(command -v criu)")" = "$binary"
++	criu --version > "$dir/criu-version.txt"
++	sha256sum "$binary" > "$dir/criu-binary.sha256"
++	criu --no-default-config check --feature mem_dirty_track
++	cp "$RESULTS/workload" "$dir/bundle/rootfs/workload"
++	python3 - "$dir" <<'PY'
++import json, pathlib, sys
++p = pathlib.Path(sys.argv[1])
++config = {
++    'ociVersion': '1.0.2', 'hostname': 'criu-smoke',
++    'annotations': {'org.criu.config': ''},
++    'process': {'terminal': False, 'user': {'uid': 0, 'gid': 0},
++                'args': ['/workload'], 'env': ['PATH=/'], 'cwd': '/',
++                'capabilities': {'bounding': [], 'effective': [], 'inheritable': [], 'permitted': [], 'ambient': []}},
++    'root': {'path': 'rootfs', 'readonly': True},
++    'mounts': [
++        {'destination': '/proc', 'type': 'proc', 'source': 'proc'},
++        {'destination': '/dev', 'type': 'tmpfs', 'source': 'tmpfs', 'options': ['nosuid', 'strictatime', 'mode=755', 'size=65536k']},
++        {'destination': '/state', 'type': 'bind', 'source': str(p / 'state'), 'options': ['rbind', 'rw']}
++    ],
++    'linux': {'namespaces': [{'type': n} for n in ('pid', 'network', 'ipc', 'uts', 'mount')]}
++}
++(p / 'bundle/config.json').write_text(json.dumps(config, indent=2) + '\n')
++PY
++	SRC_ROOT="$dir/source-runtime"
++	DST_ROOT="$dir/destination-runtime"
++	ID="local-final-$variant"
++	"$RUNC" --root "$SRC_ROOT" run -d --bundle "$dir/bundle" "$ID" </dev/null >/dev/null 2>"$dir/run.log"
++	wait_file "$dir/state/ready"
++	"$RUNC" --root "$SRC_ROOT" state "$ID" > "$dir/source-state.json"
++	port=$(python3 - <<'PY'
++import socket
++with socket.socket() as s:
++    s.bind(('127.0.0.1', 0))
++    print(s.getsockname()[1])
++PY
++)
++	criu --no-default-config page-server --images-dir "$dir/destination/parent0" --port "$port" --auto-dedup -v4 -o page-server.log &
++	PS_PID=$!
++	listening=0
++	for _ in $(seq 1 100); do
++		kill -0 "$PS_PID"
++		if [ -n "$(ss -H -ltn "sport = :$port")" ]; then listening=1; break; fi
++		sleep 0.05
++	done
++	test "$listening" = 1
++	# Exact topology of issue 2503, with an isolated deterministic workload.
++	"$RUNC" --root "$SRC_ROOT" checkpoint --pre-dump --page-server "127.0.0.1:$port" \
++		--image-path "$dir/source/parent0" "$ID" >"$dir/pre-dump.log" 2>&1
++	wait "$PS_PID"
++	PS_PID=
++	source_pages=$(sum_images "$dir/source/parent0" 'pages-*.img')
++	coverage=$(sum_images "$dir/source/parent0" 'pagemap-*.img')
++	pre_bytes=$(sum_images "$dir/destination/parent0" 'pages-*.img')
++	test "$source_pages" -eq 0
++	test "$pre_bytes" -ge 33554432
++	# Save receiver-owned byte hashes and preserve these payload-bearing maps.
++	(cd "$dir/destination/parent0"; sha256sum pagemap-*.img pages-*.img) > "$dir/receiver-before.sha256"
++	python3 - "$dir/source/parent0" "$dir/destination/parent0" <<'PY'
++import pathlib, shutil, sys
++src, dst = map(pathlib.Path, sys.argv[1:])
++for p in src.iterdir():
++    if p.name == 'parent' or p.name.startswith(('pagemap-', 'pages-', '.pagemap-')):
++        continue
++    if p.is_file():
++        shutil.copy2(p, dst / p.name)
++PY
++	(cd "$dir/destination/parent0"; sha256sum -c "$dir/receiver-before.sha256")
++	"$RUNC" --root "$SRC_ROOT" kill "$ID" USR1
++	wait_file "$dir/state/changed"
++	# Deliberately LOCAL final: do not add --page-server here.
++	"$RUNC" --root "$SRC_ROOT" checkpoint --image-path "$dir/source/image" \
++		--shell-job --tcp-established --parent-path ../parent0 "$ID" >"$dir/final-dump.log" 2>&1
++	final_bytes=$(sum_images "$dir/source/image" 'pages-*.img')
++	if [ "$variant" = candidate ]; then
++		test "$coverage" -gt 0
++		test "$final_bytes" -gt 0
++		test $((final_bytes * 4)) -lt "$pre_bytes"
++	else
++		test "$coverage" -eq 0
++		test $((final_bytes * 2)) -ge "$pre_bytes"
++	fi
++	# Same relative names at each endpoint preserve the final parent symlink.
++	cp -a "$dir/source/image/." "$dir/destination/image/"
++	test "$(readlink "$dir/destination/image/parent")" = ../parent0
++	"$RUNC" --root "$DST_ROOT" restore -d --bundle "$dir/bundle" \
++		--image-path "$dir/destination/image" --work-path "$dir/destination/image" \
++		--shell-job --tcp-established "$ID" </dev/null >/dev/null 2>"$dir/restore.log"
++	"$RUNC" --root "$DST_ROOT" state "$ID" > "$dir/restored-state.json"
++	# Independent host-side byte oracle, before the restored workload reports PASS.
++	python3 - "$dir" <<'PY'
++import json, pathlib, sys
++p = pathlib.Path(sys.argv[1])
++pid = json.loads((p / 'restored-state.json').read_text())['pid']
++address, length = (p / 'state/address').read_text().split()
++length = int(length)
++assert length == 32 * 1024 * 1024
++with open(f'/proc/{pid}/mem', 'rb', buffering=0) as mem:
++    mem.seek(int(address, 16))
++    actual = mem.read(length)
++assert len(actual) == length
++expected = bytearray((i * 17 + (i >> 12) * 31 + 73) % 251 for i in range(length))
++for i in range(4096 * 101, 4096 * 102):
++    expected[i] ^= 0x5a
++assert actual == expected, 'external restored-memory oracle failed'
++(p / 'external-oracle.txt').write_text(f'PASS {length} restored bytes including changed page\n')
++PY
++	"$RUNC" --root "$DST_ROOT" kill "$ID" USR2
++	wait_file "$dir/state/result"
++	grep -qx 'PASS 33554432 bytes including changed page' "$dir/state/result"
++	printf '{"variant":"%s","source_pages":%s,"coverage_bytes":%s,"pre_bytes":%s,"final_bytes":%s,"restored_bytes_verified":true,"external_oracle_verified":true}\n' \
++		"$variant" "$source_pages" "$coverage" "$pre_bytes" "$final_bytes" | tee "$dir/result.json"
++	cleanup
++	SRC_ROOT= DST_ROOT= ID=
++done
++python3 - "$RESULTS" <<'PY'
++import json, pathlib, sys
++p = pathlib.Path(sys.argv[1])
++b, c = [json.loads((p / v / 'result.json').read_text()) for v in ('baseline', 'candidate')]
++assert b['restored_bytes_verified'] and c['restored_bytes_verified']
++assert b['external_oracle_verified'] and c['external_oracle_verified']
++assert c['final_bytes'] * 4 < b['final_bytes']
++print(f"RUNC SMOKE PASS: baseline final {b['final_bytes']} B, candidate final {c['final_bytes']} B; both memory oracles passed")
++print('Single-host transport/topology smoke; not a migration throughput benchmark.')
++PY
+diff --git a/test/others/page-server-remote-parent/runc-workload.c b/test/others/page-server-remote-parent/runc-workload.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab697fd1c4846e30b423869a914def3869218edf
+--- /dev/null
++++ b/test/others/page-server-remote-parent/runc-workload.c
+@@ -0,0 +1,62 @@
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++#define LENGTH (32UL * 1024 * 1024)
++static volatile sig_atomic_t change, verify;
++static void handler(int sig) { if (sig == SIGUSR1) change = 1; else verify = 1; }
++static unsigned char expected(size_t i) { return (unsigned char)((i * 17 + (i >> 12) * 31 + 73) % 251); }
++static void mark(const char *name, const char *value) {
++	char path[128];
++	snprintf(path, sizeof(path), "/state/%s", name);
++	FILE *f = fopen(path, "w");
++	if (!f || fprintf(f, "%s\n", value) < 0 || fclose(f)) _exit(2);
++}
++int main(void) {
++	/* runc's diagnostic stderr belongs to the host. Replace inherited stdio
++	 * with this container's /dev/null so every workload fd is restorable. */
++	int nullfd = open("/dev/null", O_RDWR);
++	if (nullfd < 0) return 2;
++	for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++)
++		if (dup2(nullfd, fd) < 0) return 2;
++	if (nullfd > STDERR_FILENO && close(nullfd)) return 2;
++	if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) return 2;
++	unsigned char *p = mmap(NULL, LENGTH, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (p == MAP_FAILED || madvise(p, LENGTH, MADV_NOHUGEPAGE)) return 2;
++	struct sigaction sa = {.sa_handler = handler};
++	sigemptyset(&sa.sa_mask);
++	if (sigaction(SIGUSR1, &sa, NULL) || sigaction(SIGUSR2, &sa, NULL)) return 2;
++	for (size_t i = 0; i < LENGTH; i++) p[i] = expected(i);
++	char address[80];
++	snprintf(address, sizeof(address), "%p %lu", (void *)p, LENGTH);
++	mark("address", address);
++	mark("ready", "ready");
++	int generation = 0;
++	for (;;) {
++		if (change && !generation) {
++			/* One deliberately dirty page, surrounded by unchanged parent pages. */
++			for (size_t i = 4096 * 101; i < 4096 * 102; i++) p[i] ^= 0x5a;
++			generation = 1;
++			mark("changed", "changed");
++		}
++		if (verify) {
++			if (generation != 1) { mark("result", "FAIL generation"); return 1; }
++			for (size_t i = 0; i < LENGTH; i++) {
++				unsigned char want = expected(i);
++				if (i >= 4096 * 101 && i < 4096 * 102) want ^= 0x5a;
++				if (p[i] != want) { mark("result", "FAIL memory"); return 1; }
++			}
++			mark("result", "PASS 33554432 bytes including changed page");
++			for (;;) pause();
++		}
++		/* Polling prevents a signal arriving just before pause from losing a wakeup. */
++		usleep(20000);
++	}
++}

@@ -6,6 +6,11 @@ on:
       - 'validation/local-final-*'
       - 'local-final-core-candidate'
   workflow_dispatch:
+    inputs:
+      review_series:
+        description: Build each local-final review patch and run the focused integration path
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,6 +33,8 @@ jobs:
         run: |
           set -euxo pipefail
           bash -n scripts/ci/local-final-candidate.sh
+          bash -n scripts/ci/local-final-review-series.sh
+          (cd review/local-final && sha256sum --check patches.sha256)
           bash -n test/others/page-server-remote-parent/regression.sh
           bash -n test/others/page-server-remote-parent/compare-baseline.sh
           python3 -m py_compile test/others/page-server-remote-parent/*.py
@@ -46,11 +53,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          runner=scripts/ci/local-final-candidate.sh
+          if [ '${{ startsWith(github.ref_name, 'validation/local-final-series-') || inputs.review_series }}' = true ]; then
+            runner=scripts/ci/local-final-review-series.sh
+          fi
           sudo docker run --rm --privileged --userns=host --cgroupns=host \
             --tmpfs /run -v /lib/modules:/lib/modules \
             -v "$GITHUB_WORKSPACE:/criu" \
             -e CC='${{ matrix.compiler }}' -e HOSTCC='${{ matrix.compiler }}' \
-            criu-alpine bash scripts/ci/local-final-candidate.sh
+            criu-alpine bash "$runner"
       - name: Package validation evidence
         if: always()
         shell: bash
