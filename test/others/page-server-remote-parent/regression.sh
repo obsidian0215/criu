@@ -13,6 +13,11 @@ case "$PRE_DUMP_MODE" in
 	splice|read) ;;
 	*) echo "Invalid PRE_DUMP_MODE: $PRE_DUMP_MODE" >&2; exit 2 ;;
 esac
+CRIU_TEST_UNSAFE_INCREMENTAL_RETRY="${CRIU_TEST_UNSAFE_INCREMENTAL_RETRY:-0}"
+case "$CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" in
+	0|1) ;;
+	*) echo "Invalid CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" >&2; exit 2 ;;
+esac
 ORACLE_STATE=""
 WORK_DIR="remote-parent-regression.$$"
 PID=""
@@ -107,9 +112,8 @@ PY
 
 wait_page_server() {
 	local port="$1"
-	local i
 
-	for i in $(seq 1 100); do
+	for _ in $(seq 1 100); do
 		kill -0 "$PAGE_SERVER_PID" 2>/dev/null ||
 			fail "page server exited before accepting a connection"
 		if [ -n "$(ss -H -ltn "sport = :$port")" ]; then
@@ -406,6 +410,145 @@ assert_no_parent_pagemap() {
 	fi
 }
 
+image_checksums() {
+	local directory="$1"
+
+	(
+		cd "$directory"
+		sha256sum ./*.img
+	)
+}
+
+assert_images_unchanged() {
+	local directory="$1"
+	local checksums="$2"
+
+	image_checksums "$directory" | cmp -s "$checksums" - ||
+		fail "failed round or retry modified the intact parent: $directory"
+}
+
+run_remote_parent_retry_regression() {
+	local base="$WORK_DIR/remote-parent-retry"
+	local source_pre1="$base/source-pre1"
+	local target_pre1="$base/target-pre1"
+	local source_failed="$base/source-failed"
+	local target_failed="$base/target-failed"
+	local source_retry="$base/source-retry"
+	local target_retry="$base/target-retry"
+	local final="$base/final"
+	local port
+	local pre1_bytes
+	local retry_bytes
+	local final_bytes
+	local -a source_retry_parent=()
+	local -a target_retry_parent=()
+	local -a retry_placement=(--full)
+
+	echo "=== full retry after a failed second remote pre-dump ==="
+	mkdir -p "$source_pre1" "$target_pre1" "$source_failed" "$target_failed" \
+		"$source_retry" "$target_retry" "$final"
+	start_test
+	port=$(free_port)
+	start_page_server "$target_pre1" "$port"
+	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
+		-D "$source_pre1" -o dump.log -t "$PID" -v4 --track-mem \
+		--page-server --address 127.0.0.1 --port "$port" ||
+		fail "retry setup pre-dump failed"
+	finish_page_server "retry setup page server failed"
+	assert_parent_pagemap_committed "$source_pre1"
+	pre1_bytes=$(sum_pages_bytes "$target_pre1")
+	[ "$pre1_bytes" -gt $((8 * 1024 * 1024)) ] ||
+		fail "retry setup payload is unexpectedly small"
+	image_checksums "$source_pre1" >"$base/source-pre1.sha256"
+	image_checksums "$target_pre1" >"$base/target-pre1.sha256"
+
+	dirty_page_generation "$target_pre1" "$base/generations.json" ||
+		fail "could not dirty generation A before the failed second round"
+
+	# Fail after the receiver has accepted the second round and the source
+	# has reset soft-dirty bits, but before it publishes its new coverage.
+	# Receiver auto-dedup is deliberately disabled: it can destructively
+	# change old payloads, so those images are not a rollback-safe parent.
+	port=$(free_port)
+	start_page_server "$target_failed" "$port" --prev-images-dir ../target-pre1
+	if CRIU_TEST_FAIL_IMAGE=inventory LD_PRELOAD="$FAULT_LIBRARY" \
+		"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
+		-D "$source_failed" -o dump.log -t "$PID" -v4 --track-mem \
+		--prev-images-dir ../source-pre1 \
+		--page-server --address 127.0.0.1 --port "$port" \
+		2>"$base/source-stderr.log"; then
+		fail "second-round inventory write failure was ignored"
+	fi
+	finish_page_server "second-round destination failed during source-only fault"
+	grep -q TEST_FAULT "$base/source-stderr.log" ||
+		fail "second-round inventory fault injection did not execute"
+	run_image_tool check-image "$target_failed" "$PID" "$ORACLE_STATE" ||
+		fail "failed round did not transfer generation A before the inventory failure"
+	assert_no_parent_pagemap "$source_failed"
+	[ "$(count_pages_images "$source_failed")" -eq 0 ] ||
+		fail "failed round retained source payload"
+	assert_images_unchanged "$source_pre1" "$base/source-pre1.sha256"
+	assert_images_unchanged "$target_pre1" "$base/target-pre1.sha256"
+	kill -0 "$PID" 2>/dev/null || fail "failed second pre-dump did not resume workload"
+
+	# Coverage rollback does not roll back the kernel's soft-dirty reset.
+	# Even the intact first-round images are an unsafe incremental baseline:
+	# unchanged-since-failure A would be mistaken for generation 0 there.
+	# Safely recover with a FULL retry in fresh directories on both sides.
+	# Do NOT re-dirty A to hide that lost dirty history.
+	if [ "$CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" = 1 ]; then
+		echo "DIAGNOSTIC: attempting unsupported old-baseline incremental retry"
+		source_retry_parent=(--prev-images-dir ../source-pre1)
+		target_retry_parent=(--prev-images-dir ../target-pre1)
+		retry_placement=()
+	fi
+	port=$(free_port)
+	start_page_server "$target_retry" "$port" "${target_retry_parent[@]}"
+	"${CRIU_CMD[@]}" pre-dump --pre-dump-mode "$PRE_DUMP_MODE" \
+		-D "$source_retry" -o dump.log -t "$PID" -v4 --track-mem \
+		"${source_retry_parent[@]}" \
+		--page-server --address 127.0.0.1 --port "$port" ||
+		fail "post-failure retry failed"
+	finish_page_server "retry page server failed"
+	assert_parent_pagemap_committed "$source_retry"
+	run_image_tool check-image "$target_retry" "$PID" "$ORACLE_STATE" "${retry_placement[@]}" ||
+		fail "retry did not capture A; old-baseline incremental retries lose dirty history"
+	assert_images_unchanged "$source_pre1" "$base/source-pre1.sha256"
+	assert_images_unchanged "$target_pre1" "$base/target-pre1.sha256"
+	retry_bytes=$(sum_pages_bytes "$target_retry")
+	[ "$retry_bytes" -gt 0 ] || fail "retry contains no page payload"
+	if [ "$CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" = 0 ]; then
+		[ "$retry_bytes" -gt $((8 * 1024 * 1024)) ] ||
+			fail "safe full retry payload is unexpectedly small"
+		[ ! -e "$source_retry/parent" ] && [ ! -L "$source_retry/parent" ] ||
+			fail "safe source retry unexpectedly selected a parent"
+		[ ! -e "$target_retry/parent" ] && [ ! -L "$target_retry/parent" ] ||
+			fail "safe destination retry unexpectedly selected a parent"
+	fi
+
+	dirty_page_generation "$target_retry" "$base/generations.json" ||
+		fail "could not dirty generation B before the local final dump"
+	"${CRIU_CMD[@]}" dump -D "$final" -o dump.log -t "$PID" -v4 --track-mem \
+		--prev-images-dir ../source-retry || fail "post-retry local final dump failed"
+	grep -q "Using parent pagemap as remote coverage" "$final/dump.log" ||
+		fail "post-retry final dump did not select source coverage"
+	run_image_tool check-image "$final" "$PID" "$ORACLE_STATE" ||
+		fail "post-retry final image has incorrect generation placement"
+	final_bytes=$(sum_pages_bytes "$final")
+	[ "$final_bytes" -gt 0 ] || fail "post-retry final dump contains no page payload"
+	[ $((final_bytes * 4)) -lt "$pre1_bytes" ] ||
+		fail "post-retry final dump is not incremental"
+
+	mkdir -p "$base/target-final"
+	cp -a "$final/." "$base/target-final/"
+	rm -f "$base/target-final/parent"
+	ln -s ../target-retry "$base/target-final/parent"
+	"${CRIU_CMD[@]}" restore -D "$base/target-final" -o restore.log -v4 -d ||
+		fail "assembled retry destination chain failed to restore"
+	stop_test "failed second round, full retry, and local-final restore"
+	echo "RETRY-REGRESSION PASS: pre1=$pre1_bytes retry=$retry_bytes final=$final_bytes bytes"
+}
+
 run_image_write_failure() {
 	local side="$1"
 	local base="$WORK_DIR/failure-$side"
@@ -533,14 +676,27 @@ MULTIROUND_PRE2_BYTES=0
 MULTIROUND_COVERAGE_BYTES=0
 MULTIROUND_FINAL_BYTES=0
 
-run_local_parent_control
-run_remote_parent_regression
-run_remote_parent_multiround_regression
-run_image_write_failure server
-run_image_write_failure source
-run_disconnect_failure transfer
-run_disconnect_failure close
-run_destination_coverage_failure
+run_case() {
+	local label="$1"
+
+	shift
+	"$@"
+	echo "REMOTE-PARENT: PASS $PRE_DUMP_MODE $label"
+}
+
+run_case local-control run_local_parent_control
+run_case remote-parent run_remote_parent_regression
+run_case multiround run_remote_parent_multiround_regression
+if [ "$CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" = 1 ]; then
+	run_case unsafe-incremental-retry run_remote_parent_retry_regression
+else
+	run_case full-retry run_remote_parent_retry_regression
+fi
+run_case server-write-failure run_image_write_failure server
+run_case source-write-failure run_image_write_failure source
+run_case disconnect-transfer run_disconnect_failure transfer
+run_case disconnect-close run_disconnect_failure close
+run_case destination-coverage-rejection run_destination_coverage_failure
 
 cat <<EOF
 Remote-parent regression PASSED

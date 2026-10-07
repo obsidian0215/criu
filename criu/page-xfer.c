@@ -1226,7 +1226,7 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
  *	aux_iov: {A,1}{B,1}{C,2}*{C+3,1}*
  */
 
-unsigned long handle_faulty_iov(int pid, struct iovec *riov, unsigned long faulty_index, struct iovec *bufvec,
+static long handle_faulty_iov(int pid, struct iovec *riov, unsigned long faulty_index, struct iovec *bufvec,
 				struct iovec *aux_iov, unsigned long *aux_len)
 {
 	struct iovec dummy;
@@ -1240,11 +1240,21 @@ unsigned long handle_faulty_iov(int pid, struct iovec *riov, unsigned long fault
 	while (dummy.iov_len) {
 		bytes_read = process_vm_readv(pid, bufvec, 1, &dummy, 1, 0);
 		if (bytes_read == -1) {
+			if (errno == ESRCH)
+				return -ESRCH;
+			if (errno != EFAULT) {
+				pr_perror("process_vm_readv failed during iovec recovery");
+				return -1;
+			}
 			/* Handling faulty page read in faulty iov */
 			cnt_sub(CNT_PAGES_WRITTEN, 1);
 			dummy.iov_base += PAGE_SIZE;
 			dummy.iov_len -= PAGE_SIZE;
 			continue;
+		}
+		if (!bytes_read) {
+			pr_err("process_vm_readv made no progress during iovec recovery\n");
+			return -1;
 		}
 
 		/* If aux-iov can merge and expand or new entry required */
@@ -1340,9 +1350,16 @@ static long fill_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufve
 				start += 1;
 				continue;
 			}
-			total_read += handle_faulty_iov(pid, riov, start, bufvec, aux_iov, aux_len);
+			bytes_read = handle_faulty_iov(pid, riov, start, bufvec, aux_iov, aux_len);
+			if (bytes_read < 0)
+				return bytes_read;
+			total_read += bytes_read;
 			start += 1;
 			continue;
+		}
+		if (!bytes_read) {
+			pr_err("process_vm_readv made no progress\n");
+			return -1;
 		}
 
 		if (bytes_read > 0) {

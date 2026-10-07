@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Hybrid migration of private COW and shared pages; external byte oracle."""
+import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 from socket import AF_INET, SOCK_STREAM, socket as Socket
 import subprocess
@@ -74,6 +76,43 @@ def dirty_private_pages(pid, address, length, page_size):
             if entry & (1 << 55)]
 
 
+def private_huge_kb(smaps, address, length):
+    """Return a lower bound in kB for anonymous huge pages in the tested range."""
+    huge_kb = 0
+    outside = None
+    for line in smaps.splitlines():
+        mapping = re.match(r'^([0-9a-f]+)-([0-9a-f]+)\s+(\S+)\s+', line)
+        if mapping:
+            start, end = (int(value, 16) for value in mapping.group(1, 2))
+            overlap = max(0, min(end, address + length) - max(start, address))
+            outside = end - start - overlap if overlap and mapping[3].endswith('p') else None
+        elif outside is not None and line.startswith('AnonHugePages:'):
+            # smaps counters cover the entire VMA. If it extends beyond the
+            # workload, discount all outside bytes to avoid attributing an
+            # unrelated huge page to the tested private range.
+            huge_kb += max(0, int(line.split()[1]) * 1024 - outside) // 1024
+    return huge_kb
+
+
+def thp_snapshot(capture, pids, address, length):
+    return {'capture': capture, 'processes': [
+        {'pid': pid, 'private_huge_kb': private_huge_kb(
+            Path(f'/proc/{pid}/smaps').read_text(), address, length)}
+        for pid in pids]}
+
+
+def thp_status(requested, snapshots):
+    if not requested:
+        return 'NOT_REQUESTED'
+    # Require evidence in both tested processes at every capture, including
+    # the incremental rounds after COW mutations. Startup-only THP is weaker.
+    exercised = len(snapshots) == 3 and all(
+        len(snapshot['processes']) == 2 and all(
+            process['private_huge_kb'] > 0 for process in snapshot['processes'])
+        for snapshot in snapshots)
+    return 'PASS' if exercised else 'SKIP'
+
+
 def verify_dirty_capture(directory, pid, address, length, page_size, dirty):
     flags = [None] * (length // page_size)
     for entry in image_entries(directory, pid):
@@ -107,6 +146,8 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
     server = None
     process = None
     criu = [str(ROOT / 'criu/criu'), '--no-default-config']
+    # Deliberately client/final-only: receiver auto-dedup modifies older
+    # destination payloads and is not covered by source metadata rollback.
     extras = (['--compress'] if compressed else []) + (['--auto-dedup'] if dedup else [])
     with (base / 'workload.log').open('w') as log:
         try:
@@ -119,11 +160,9 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
             pids = [parent, child]
             if process.pid != parent:
                 raise RuntimeError('unexpected workload identity')
-            huge_kb = sum(int(line.split()[1]) for line in Path(f'/proc/{parent}/smaps').read_text().splitlines()
-                          if line.startswith('AnonHugePages:'))
-            print(f'{label}: AnonHugePages={huge_kb} kB', flush=True)
             payloads = []
             dirty_evidence = []
+            thp_evidence = []
             for iteration in (1, 2):
                 source = base / f'source-{iteration}'
                 target = base / f'target-{iteration}'
@@ -144,6 +183,9 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
                     if iteration == 2:
                         command += ['--prev-images-dir', '../source-1']
                     with (base / f'client-{iteration}.log').open('w') as client_log:
+                        if thp:
+                            thp_evidence.append(thp_snapshot(f'pre-dump-{iteration}', pids,
+                                                             private, private_size))
                         client = subprocess.Popen(command, stdout=client_log, stderr=client_log, env=environment)
                         try:
                             connection, _ = listener.accept()
@@ -184,6 +226,8 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
             final = base / 'final'
             final.mkdir()
             final_dirty = {pid: dirty_private_pages(pid, private, private_size, page_size) for pid in pids}
+            if thp:
+                thp_evidence.append(thp_snapshot('final-dump', pids, private, private_size))
             run(criu + ['dump', '-t', str(parent), '-D', str(final), '-o', 'dump.log', '-v4',
                         '--track-mem', '--prev-images-dir', '../source-2'] + extras,
                 base / 'final-command.log', environment)
@@ -236,16 +280,23 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
                 memory(pid, shared, bytes(shared_expected))
             memory(child, shared + 3 * page_size, value=b'Z')
             memory(parent, shared + 3 * page_size, expected=b'Z')
-            result = {'case': label, 'status': 'PASS', 'pre_payloads': payloads,
+            huge_status = thp_status(thp, thp_evidence)
+            result = {'case': label, 'status': 'SKIP' if huge_status == 'SKIP' else 'PASS',
+                      'bytes_status': 'PASS', 'thp_status': huge_status, 'pre_payloads': payloads,
                       'final_payload': final_payload, 'private_bytes_checked': private_size * 2,
-                      'shared_bytes_checked': shared_size * 2, 'huge_kb_before': huge_kb,
-                      'thp_exercised': thp and huge_kb > 0, 'restored_sharing_verified': True, 'shared_strategy': shared_strategy,
+                      'shared_bytes_checked': shared_size * 2, 'thp_evidence': thp_evidence,
+                      'thp_exercised': huge_status == 'PASS', 'restored_sharing_verified': True,
+                      'shared_strategy': shared_strategy,
+                      'dedup_scope': 'client-final-only' if dedup else 'disabled',
                       'shared_predump_coverage_counts': shared_counts,
                       'dirty_capture': dirty_evidence, 'final_capture': final_capture,
                       'predump_payload_ratio': payloads[1] / payloads[0],
                       'final_payload_ratio': final_payload / payloads[0]}
             (base / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
             print(json.dumps(result), flush=True)
+            if huge_status == 'SKIP':
+                print(f'SKIP: {label}: THP not proven in both tested private mappings at every capture; '
+                      'restored bytes and sharing PASS', flush=True)
             return result
         finally:
             if server is not None and server.poll() is None:
@@ -262,6 +313,10 @@ def case(work, executable, mode, compressed=False, thp=False, dedup=False):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--require-thp', action='store_true',
+                        help='fail unless THP is observed in both private mappings before every capture')
+    args = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError('run this regression as root on an isolated CRIU test host')
     work = Path(tempfile.mkdtemp(prefix='shared-regression.', dir=HERE))
@@ -282,7 +337,12 @@ def main():
     results.append(case(work, executable, 'read', thp=True))
     results.append(case(work, executable, 'splice', dedup=True))
     (work / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-    print('SHARED-REGRESSION PASSED', flush=True)
+    if any(result['thp_status'] == 'SKIP' for result in results):
+        if args.require_thp:
+            raise RuntimeError('required THP coverage was not observed; see results.json')
+        print('SHARED-REGRESSION BYTES PASSED; THP SKIPPED', flush=True)
+    else:
+        print('SHARED-REGRESSION PASSED', flush=True)
 
 
 if __name__ == '__main__':

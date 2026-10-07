@@ -1,0 +1,253 @@
+# Temporary validation-branch workflow; do not include in the upstream patch.
+name: Remote-parent focused validation
+
+on:
+  push:
+    branches:
+      - 'validation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-parent-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    name: Remote parent (${{ matrix.compiler }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+      HOSTCC: ${{ matrix.compiler }}
+      ARTIFACT_DIR: ${{ runner.temp }}/remote-parent-validation
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout validation revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Record validation environment
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          {
+            printf 'Revision: '; git rev-parse HEAD
+            uname -a
+            cat /etc/os-release
+            printf 'Compiler: %s\n' "$CC"
+            printf 'THP enabled: '; cat /sys/kernel/mm/transparent_hugepage/enabled || true
+            printf 'THP defrag: '; cat /sys/kernel/mm/transparent_hugepage/defrag || true
+          } 2>&1 | tee "$ARTIFACT_DIR/environment.log"
+
+      - name: Install build and runtime dependencies
+        id: dependencies
+        timeout-minutes: 15
+        run: |
+          {
+            sudo contrib/dependencies/apt-packages.sh
+            sudo contrib/apt-install clang gcc-multilib
+            "$CC" --version
+            make --version
+          } 2>&1 | tee "$ARTIFACT_DIR/dependencies.log"
+
+      - name: Install lint tools
+        id: lint_tools
+        run: |
+          {
+            sudo contrib/apt-install shellcheck
+            /usr/bin/python3 -m pip install --user ruff codespell
+          } 2>&1 | tee "$ARTIFACT_DIR/lint-tools.log"
+
+      - name: Run repository and focused lint
+        id: lint
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          {
+            status=0
+            make -k lint || status=1
+            ruff check --config=scripts/ruff.toml test/others/page-server-remote-parent/*.py || status=1
+            shellcheck -x test/others/page-server-remote-parent/regression.sh || status=1
+            exit "$status"
+          } 2>&1 | tee "$ARTIFACT_DIR/lint.log"
+
+      - name: Build CRIU
+        id: build
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: |
+          make -j4 CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/build.log"
+
+      - name: Run unit tests
+        id: unittest
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          make unittest CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/unittest.log"
+
+      - name: Run splice remote-parent regression
+        id: splice
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          # Keep runner tokens and unrelated variables out of checkpointed workloads.
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            CC="$CC" HOSTCC="$HOSTCC" PYTHONUNBUFFERED=1 \
+            make -C test/others/page-server-remote-parent regression KEEP_WORK_DIR=1 PRE_DUMP_MODE=splice \
+            CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/regression-splice.log"
+
+      - name: Run read remote-parent regression
+        id: read
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          # Keep runner tokens and unrelated variables out of checkpointed workloads.
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            CC="$CC" HOSTCC="$HOSTCC" PYTHONUNBUFFERED=1 \
+            make -C test/others/page-server-remote-parent regression KEEP_WORK_DIR=1 PRE_DUMP_MODE=read \
+            CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/regression-read.log"
+
+      - name: Run shared-memory regression
+        id: shared
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          # Keep runner tokens and unrelated variables out of checkpointed workloads.
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            CC="$CC" HOSTCC="$HOSTCC" PYTHONUNBUFFERED=1 \
+            make -C test/others/page-server-remote-parent shared-regression KEEP_WORK_DIR=1 \
+            CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/regression-shared.log"
+
+      - name: Run process-vm-readv fault regression
+        id: read_fault
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          # Keep runner tokens and unrelated variables out of checkpointed workloads.
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            CC="$CC" HOSTCC="$HOSTCC" PYTHONUNBUFFERED=1 \
+            make -C test/others/page-server-remote-parent read-fault-regression KEEP_WORK_DIR=1 \
+            CC="$CC" HOSTCC="$HOSTCC" 2>&1 | tee "$ARTIFACT_DIR/regression-read_fault.log"
+
+      - name: Retain work diagnostics and summarize cases
+        if: always()
+        env:
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          LINT_TOOLS_OUTCOME: ${{ steps.lint_tools.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          UNITTEST_OUTCOME: ${{ steps.unittest.outcome }}
+          SPLICE_OUTCOME: ${{ steps.splice.outcome }}
+          READ_OUTCOME: ${{ steps.read.outcome }}
+          SHARED_OUTCOME: ${{ steps.shared.outcome }}
+          READ_FAULT_OUTCOME: ${{ steps.read_fault.outcome }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          sudo dmesg > "$ARTIFACT_DIR/dmesg.log" 2>&1 || true
+          sudo python3 - "$ARTIFACT_DIR" "$GITHUB_STEP_SUMMARY" "$CC" \
+            "$DEPENDENCIES_OUTCOME" "$LINT_TOOLS_OUTCOME" "$LINT_OUTCOME" "$BUILD_OUTCOME" "$UNITTEST_OUTCOME" \
+            "$SPLICE_OUTCOME" "$READ_OUTCOME" "$SHARED_OUTCOME" "$READ_FAULT_OUTCOME" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import shutil
+          import sys
+
+          output = Path(sys.argv[1])
+          output.mkdir(parents=True, exist_ok=True)
+          suite = Path('test/others/page-server-remote-parent')
+          workdirs = sorted(directory for pattern in (
+              'remote-parent-regression.*', 'shared-regression.*', 'read-fault-regression.*'
+          ) for directory in suite.glob(pattern) if directory.is_dir())
+          # Retain complete text diagnostics. Raw process memory and environment
+          # images are deliberately never uploaded. Only these image types are
+          # safe metadata, capped at 64 MiB total and 8 MiB per file.
+          metadata_remaining = 64 * 1024 * 1024
+          manifest = []
+          case_lines = []
+          read_fault_cases = set()
+          collection_errors = []
+          for directory in workdirs:
+              for source in sorted(directory.rglob('*')):
+                  if not source.is_file() or source.is_symlink():
+                      continue
+                  relative = source.relative_to(suite)
+                  try:
+                      size = source.stat().st_size
+                      text_diagnostic = source.suffix in ('.log', '.json', '.txt', '.sha256', '.smaps')
+                      metadata_image = source.name == 'inventory.img' or source.match('pagemap-*.img')
+                      retain = text_diagnostic or (
+                          metadata_image and size <= min(8 * 1024 * 1024, metadata_remaining))
+                      if retain:
+                          target = output / 'work' / relative
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copyfile(source, target)
+                          if metadata_image:
+                              metadata_remaining -= size
+                      manifest.append({'path': str(relative), 'bytes': size, 'retained': retain})
+                      if source.name == 'result.json':
+                          result = json.loads(source.read_text())
+                          label = result.get('case', str(relative.parent))
+                          status = result.get('status', 'UNREPORTED')
+                          detail = ''
+                          if 'bytes_status' in result:
+                              detail = f" (bytes {result['bytes_status']}; THP {result.get('thp_status', 'UNREPORTED')})"
+                          case_lines.append(f'{status}: {directory.name.split(".")[0]}/{label}{detail}')
+                          if directory.name.startswith('read-fault-regression.'):
+                              read_fault_cases.add((str(status), str(label)))
+                  except (OSError, ValueError, TypeError) as error:
+                      collection_errors.append(f'{relative}: {error}')
+          (output / 'work-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          # Workload stdout/PIDs live outside the retained work directories.
+          for pattern in ('compress_pages00.out*', 'compress_pages00.pid*'):
+              for source in sorted(Path('test/zdtm/static').glob(pattern)):
+                  if source.is_file() and not source.is_symlink():
+                      shutil.copyfile(source, output / source.name)
+          for log in sorted(output.glob('regression-*.log')):
+              for line in log.read_text(errors='replace').splitlines():
+                  marker = re.match(r'^(REMOTE-PARENT|READ-FAULT): (PASS|SKIP|FAIL)\s+(.*)$', line)
+                  if marker:
+                      if marker[1] != 'READ-FAULT' or (marker[2], marker[3]) not in read_fault_cases:
+                          case_lines.append(line)
+                  elif line.startswith(('SKIP:', 'FAIL:')):
+                      case_lines.append(line)
+          outcomes = dict(zip(('Dependencies', 'Lint tools', 'Lint', 'Build', 'Unit tests',
+                               'Remote parent (splice)', 'Remote parent (read)', 'Shared memory',
+                               'Read faults'), sys.argv[4:]))
+          lines = [f'## Remote-parent validation ({sys.argv[3]})', '']
+          for stage, outcome in outcomes.items():
+              lines.append(f'- {stage}: {outcome or "not run"}')
+          lines.extend(['', '### Case results', ''])
+          if case_lines:
+              lines.extend(f'- {line}' for line in dict.fromkeys(case_lines))
+          else:
+              lines.append('- No completed case results; inspect the stage logs.')
+          lines.extend(['', 'THP/compression SKIPs are reported separately; they are not full coverage passes.',
+                        '', 'Artifacts contain complete stage/test logs, JSON evidence, work-file manifests,',
+                        'and bounded pagemap/inventory metadata. Raw memory, core, and environment images',
+                        'are excluded. These diagnostics are not a restorable checkpoint.', ''])
+          if collection_errors:
+              lines.extend(['### Diagnostic collection errors', ''])
+              lines.extend(f'- {error}' for error in collection_errors)
+          summary = '\n'.join(lines)
+          (output / 'summary.md').write_text(summary)
+          with Path(sys.argv[2]).open('a') as destination:
+              destination.write(summary)
+          print(summary)
+          PY
+          sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
+
+      - name: Upload complete logs and bounded work diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_DIR }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

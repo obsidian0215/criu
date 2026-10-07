@@ -396,6 +396,7 @@ run_non_shardable_tests() {
 			PRE_DUMP_MODE="$predump_mode" make -C test/others/page-server-remote-parent regression
 		done
 		make -C test/others/page-server-remote-parent shared-regression
+		make -C test/others/page-server-remote-parent read-fault-regression
 	else
 		echo "Skipping remote-parent tests: memory dirty tracking unavailable"
 	fi

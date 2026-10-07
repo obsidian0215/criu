@@ -1,6 +1,12 @@
 name: Run code linter
 
-on: [push, pull_request]
+on:
+  push:
+    branches-ignore:
+      - 'validation/**'
+    tags:
+      - '**'
+  pull_request:
 
 # Cancel any preceding run on the pull request.
 concurrency:
