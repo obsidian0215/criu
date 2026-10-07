@@ -153,7 +153,7 @@ jobs:
           READ_FAULT_OUTCOME: ${{ steps.read_fault.outcome }}
         run: |
           mkdir -p "$ARTIFACT_DIR"
-          sudo dmesg > "$ARTIFACT_DIR/dmesg.log" 2>&1 || true
+          sudo dmesg 2>&1 | tee "$ARTIFACT_DIR/dmesg.log" >/dev/null || true
           sudo python3 - "$ARTIFACT_DIR" "$GITHUB_STEP_SUMMARY" "$CC" \
             "$DEPENDENCIES_OUTCOME" "$LINT_TOOLS_OUTCOME" "$LINT_OUTCOME" "$BUILD_OUTCOME" "$UNITTEST_OUTCOME" \
             "$SPLICE_OUTCOME" "$READ_OUTCOME" "$SHARED_OUTCOME" "$READ_FAULT_OUTCOME" <<'PY'
@@ -252,6 +252,167 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: remote-parent-${{ matrix.compiler }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_DIR }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  unsafe-baseline-diagnostic:
+    name: Unsupported old-baseline retry diagnostic (GCC)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      CC: gcc
+      HOSTCC: gcc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare diagnostic artifacts
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/remote-parent-unsafe-diagnostic"
+          mkdir -p "$ARTIFACT_DIR"
+          printf 'ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
+      - name: Checkout validation revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install diagnostic dependencies
+        timeout-minutes: 15
+        run: |
+          {
+            sudo contrib/dependencies/apt-packages.sh
+            sudo contrib/apt-install gcc-multilib
+            git rev-parse HEAD
+            uname -a
+            gcc --version
+          } 2>&1 | tee "$ARTIFACT_DIR/dependencies.log"
+
+      - name: Build diagnostic CRIU
+        id: build
+        run: |
+          make -j4 CC=gcc HOSTCC=gcc 2>&1 | tee "$ARTIFACT_DIR/build.log"
+
+      - name: Reproduce and classify unsupported retries
+        id: diagnostic
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          cat > "$ARTIFACT_DIR/classify-diagnostic.py" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          mode, raw_status, tee_status, directory = sys.argv[1:]
+          output = Path(directory)
+          lines = (output / f'unsafe-{mode}.log').read_text(errors='replace').splitlines()
+          expected = [
+              'DIAGNOSTIC: attempting unsupported old-baseline incremental retry',
+              'FAIL: Page 0: flags 1, expected 4',
+              'FAIL: retry did not capture A; old-baseline incremental retries lose dirty history',
+          ]
+          prerequisite_cases = [f'REMOTE-PARENT: PASS {mode} {case}'
+                                for case in ('local-control', 'remote-parent', 'multiround')]
+          unexpected_failures = [line for line in lines
+                                 if line.startswith('FAIL:') and line not in expected]
+          confirmed = (int(raw_status) != 0 and int(tee_status) == 0 and
+                       all(marker in lines for marker in expected + prerequisite_cases) and
+                       not unexpected_failures)
+          outcome = 'EXPECTED_LIMITATION_CONFIRMED' if confirmed else 'UNEXPECTED_DIAGNOSTIC_RESULT'
+          result = {'mode': mode, 'raw_exit_status': int(raw_status),
+                    'log_capture_exit_status': int(tee_status), 'outcome': outcome,
+                    'feature_supported': False,
+                    'expected_markers': {marker: marker in lines for marker in expected},
+                    'prerequisite_cases': {marker: marker in lines for marker in prerequisite_cases},
+                    'unexpected_failures': unexpected_failures}
+          (output / f'unsafe-{mode}-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(f'{mode}: {outcome}; raw regression exit={raw_status}')
+          sys.exit(0 if confirmed else 1)
+          PY
+          status=0
+          for mode in splice read; do
+            set +e
+            sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+              CC=gcc HOSTCC=gcc PYTHONUNBUFFERED=1 CRIU_TEST_UNSAFE_INCREMENTAL_RETRY=1 \
+              make -C test/others/page-server-remote-parent regression KEEP_WORK_DIR=1 \
+              PRE_DUMP_MODE="$mode" CC=gcc HOSTCC=gcc 2>&1 | tee "$ARTIFACT_DIR/unsafe-$mode.log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            python3 "$ARTIFACT_DIR/classify-diagnostic.py" "$mode" \
+              "${pipeline_status[0]}" "${pipeline_status[1]}" "$ARTIFACT_DIR" || status=1
+          done
+          exit "$status"
+
+      - name: Retain and summarize unsupported-retry diagnostics
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostic.outcome }}
+        run: |
+          sudo dmesg 2>&1 | tee "$ARTIFACT_DIR/dmesg.log" >/dev/null || true
+          sudo python3 - "$ARTIFACT_DIR" "$GITHUB_STEP_SUMMARY" "$BUILD_OUTCOME" "$DIAGNOSTIC_OUTCOME" <<'PY'
+          import json
+          from pathlib import Path
+          import shutil
+          import sys
+
+          output = Path(sys.argv[1])
+          suite = Path('test/others/page-server-remote-parent')
+          remaining = 64 * 1024 * 1024
+          manifest = []
+          errors = []
+          for directory in sorted(suite.glob('remote-parent-regression.*')):
+              if not directory.is_dir() or directory.is_symlink():
+                  continue
+              for source in sorted(directory.rglob('*')):
+                  if not source.is_file() or source.is_symlink():
+                      continue
+                  relative = source.relative_to(suite)
+                  try:
+                      size = source.stat().st_size
+                      diagnostic = source.suffix in ('.log', '.json', '.txt', '.sha256', '.smaps')
+                      metadata = source.name == 'inventory.img' or source.match('pagemap-*.img')
+                      retained = diagnostic or (metadata and size <= min(8 * 1024 * 1024, remaining))
+                      if retained:
+                          target = output / 'work' / relative
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copyfile(source, target)
+                          if metadata:
+                              remaining -= size
+                      manifest.append({'path': str(relative), 'bytes': size, 'retained': retained})
+                  except OSError as error:
+                      errors.append(f'{relative}: {error}')
+          (output / 'work-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          lines = ['## Unsupported old-baseline retry diagnostic', '',
+                   f'- Build: {sys.argv[3]}', f'- Diagnostic classification: {sys.argv[4]}', '']
+          for mode in ('splice', 'read'):
+              result = output / f'unsafe-{mode}-result.json'
+              if result.exists():
+                  result = json.loads(result.read_text())
+                  lines.append(f"- {mode}: {result['outcome']}; raw regression exit {result['raw_exit_status']}")
+              else:
+                  lines.append(f'- {mode}: no completed diagnostic classification')
+          lines.extend(['', 'EXPECTED_LIMITATION_CONFIRMED means the unsupported retry failed exactly as expected.',
+                        'It is not a supported-retry pass. Safe full-retry validation is in the separate focused jobs.',
+                        'Any unexpected success, different failure, missing prerequisite, or log-capture error fails this job.',
+                        'Artifacts exclude raw process-memory, core, and environment images.', ''])
+          if errors:
+              lines.extend(['Diagnostic collection errors:'] + errors)
+          summary = '\n'.join(lines)
+          (output / 'summary.md').write_text(summary)
+          with Path(sys.argv[2]).open('a') as destination:
+              destination.write(summary)
+          print(summary)
+          PY
+          sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR"
+
+      - name: Upload unsupported-retry diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remote-parent-unsafe-gcc-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.ARTIFACT_DIR }}/
           if-no-files-found: error
           retention-days: 7

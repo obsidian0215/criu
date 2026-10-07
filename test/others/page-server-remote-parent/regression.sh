@@ -520,10 +520,12 @@ run_remote_parent_retry_regression() {
 	if [ "$CRIU_TEST_UNSAFE_INCREMENTAL_RETRY" = 0 ]; then
 		[ "$retry_bytes" -gt $((8 * 1024 * 1024)) ] ||
 			fail "safe full retry payload is unexpectedly small"
-		[ ! -e "$source_retry/parent" ] && [ ! -L "$source_retry/parent" ] ||
+		if [ -e "$source_retry/parent" ] || [ -L "$source_retry/parent" ]; then
 			fail "safe source retry unexpectedly selected a parent"
-		[ ! -e "$target_retry/parent" ] && [ ! -L "$target_retry/parent" ] ||
+		fi
+		if [ -e "$target_retry/parent" ] || [ -L "$target_retry/parent" ]; then
 			fail "safe destination retry unexpectedly selected a parent"
+		fi
 	fi
 
 	dirty_page_generation "$target_retry" "$base/generations.json" ||
