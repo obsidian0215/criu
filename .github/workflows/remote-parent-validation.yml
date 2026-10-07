@@ -25,11 +25,16 @@ jobs:
     env:
       CC: ${{ matrix.compiler }}
       HOSTCC: ${{ matrix.compiler }}
-      ARTIFACT_DIR: ${{ runner.temp }}/remote-parent-validation
     defaults:
       run:
         shell: bash
     steps:
+      - name: Prepare validation diagnostics
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/remote-parent-validation"
+          mkdir -p "$ARTIFACT_DIR"
+          printf 'ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
       - name: Checkout validation revision
         uses: actions/checkout@v7
         with:
