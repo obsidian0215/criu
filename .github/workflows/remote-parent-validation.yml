@@ -106,7 +106,7 @@ jobs:
         id: baseline
         if: ${{ !cancelled() && matrix.compiler == 'gcc' && steps.dependencies.outcome == 'success' }}
         env:
-          BASELINE_SHA: b77ae4538639dccd98c593b483cd63335d559f62
+          BASELINE_SHA: 6a8bebe685c26139a13bf50eeedd5faaa28a8684
         run: |
           {
             git fetch --no-tags --depth=1 origin "$BASELINE_SHA"
@@ -115,17 +115,20 @@ jobs:
             git -C "$RUNNER_TEMP/criu-upstream-baseline" rev-parse HEAD
           } 2>&1 | tee "$ARTIFACT_DIR/upstream-baseline-build.log"
 
-      - name: Build and unit-test each earlier commit (GCC)
+      - name: Build and unit-test published earlier commits (GCC)
         id: per_commit
         if: ${{ !cancelled() && matrix.compiler == 'gcc' && steps.dependencies.outcome == 'success' }}
         timeout-minutes: 15
         run: |
-          git fetch --no-tags --depth=3 origin "$GITHUB_SHA"
+          revisions=(cdb2d474d6f5db684718c8306cf5f4c26750e0b7 19f1103a79b95ba2a57a4a59820cbc7faa73848b)
+          for revision in "${revisions[@]}"; do
+            git fetch --no-tags --depth=1 origin "$revision"
+          done
           expected_trees=(aabb8292a0adc83d934081a1fdaabc68d482aaf3 906fd24cf63db33231117b8f1c825f55d8611ee2)
           status=0
           for index in 0 1; do
             number=$((index + 1))
-            revision=$(git rev-parse "HEAD~$((2 - index))")
+            revision="${revisions[$index]}"
             tree=$(git rev-parse "$revision^{tree}")
             if [ "$tree" != "${expected_trees[$index]}" ]; then
               printf 'Unexpected source tree for commit %s: %s\n' "$number" "$tree"

@@ -1231,7 +1231,7 @@ static long handle_faulty_iov(int pid, struct iovec *riov, unsigned long faulty_
 {
 	struct iovec dummy;
 	ssize_t bytes_read;
-	unsigned long final_read_cnt = 0;
+	long final_read_cnt = 0;
 
 	/* Handling Case 3-Part 3.2*/
 	dummy.iov_base = riov[faulty_index].iov_base;
@@ -1241,10 +1241,10 @@ static long handle_faulty_iov(int pid, struct iovec *riov, unsigned long faulty_
 		bytes_read = process_vm_readv(pid, bufvec, 1, &dummy, 1, 0);
 		if (bytes_read == -1) {
 			if (errno == ESRCH)
-				return -ESRCH;
+				return -errno;
 			if (errno != EFAULT) {
-				pr_perror("process_vm_readv failed during iovec recovery");
-				return -1;
+				pr_perror("process_vm_readv failed while recovering faulty iov");
+				return -errno;
 			}
 			/* Handling faulty page read in faulty iov */
 			cnt_sub(CNT_PAGES_WRITTEN, 1);
@@ -1343,7 +1343,7 @@ static long fill_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufve
 			}
 			if (errno != EFAULT) {
 				pr_perror("process_vm_readv failed");
-				return -1;
+				return -errno;
 			}
 			/* Handling Case 1*/
 			if (riov[start].iov_len == PAGE_SIZE) {
