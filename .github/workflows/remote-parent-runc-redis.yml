@@ -1,0 +1,118 @@
+name: Remote-parent runc Redis integration
+run-name: runc Redis / ce3bae79250eb22f4a1af0360b14a53d0464753b
+
+# Intended for a standalone orphan branch, without shared source history.
+# Push this workflow-only branch once to run the fixed CRIU snapshot.
+on:
+  push:
+    branches:
+      - validation/runc-redis-isolated-20261026
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-parent-runc-redis-ce3bae79250e
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: runc 1.4.3 / Redis / CRIU remote parent
+    runs-on: ubuntu-24.04
+    if: github.repository == 'obsidian0215/criu'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: obsidian0215/criu
+          ref: ce3bae79250eb22f4a1af0360b14a53d0464753b
+          persist-credentials: false
+
+      - name: Verify exact source commit
+        run: |
+          test "$(git rev-parse HEAD)" = ce3bae79250eb22f4a1af0360b14a53d0464753b
+          git log -1 --format='commit=%H%ncommitted=%cI%nsubject=%s'
+          uname -a
+          cat /etc/os-release
+
+      - name: Install CRIU build and Redis dependencies
+        run: |
+          sudo contrib/apt-install \
+            build-essential pkg-config libprotobuf-dev libprotobuf-c-dev \
+            protobuf-c-compiler protobuf-compiler python3-protobuf \
+            libnl-3-dev libnl-route-3-dev libnet-dev libcap-dev uuid-dev \
+            liblz4-dev libaio-dev libbsd-dev libelf-dev libgnutls28-dev \
+            libseccomp2 redis-server curl
+          /usr/bin/python3 -c 'import google.protobuf'
+
+      - name: Install pinned runc 1.4.3
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            -o runc.amd64 \
+            https://github.com/opencontainers/runc/releases/download/v1.4.3/runc.amd64
+          echo 'f6ae8efc0fa40079e1475e97cbe9d1bd3f106a28d6af78a11d9f1bd565515e60  runc.amd64' \
+            | sha256sum --check --status
+          sudo install -m 0755 runc.amd64 /usr/local/bin/runc
+
+      - name: Build CRIU
+        run: |
+          make -j4
+          test -x criu/criu
+
+      - name: Record dependencies and test kernel capabilities
+        run: |
+          {
+            echo "tested_sha=$(git rev-parse HEAD)"
+            uname -a
+            /usr/local/bin/runc --version
+            /usr/bin/redis-server --version
+            ./criu/criu --version
+            /usr/bin/python3 --version
+            dpkg-query -W -f='${binary:Package}=${Version}\n' \
+              redis-server python3-protobuf libprotobuf-c1 libseccomp2 || true
+            sha256sum /usr/local/bin/runc /usr/bin/redis-server ./criu/criu
+            id
+          } | tee environment.log
+          set -o pipefail
+          sudo ./criu/criu check --feature mem_dirty_track 2>&1 | tee -a environment.log
+
+      - name: Run existing runc Redis integration target
+        run: |
+          set -o pipefail
+          sudo env \
+            RUNC=/usr/local/bin/runc \
+            REDIS_SERVER=/usr/bin/redis-server \
+            CRIU="$PWD/criu/criu" \
+            make -C test/others/page-server-remote-parent runc-redis-regression \
+            2>&1 | tee integration.log
+
+      - name: Collect test logs and structured results
+        if: always()
+        run: |
+          mkdir -p evidence
+          sudo /usr/bin/python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          base = Path('test/others/page-server-remote-parent')
+          names = {'commands.json', 'result.json', 'results.json', 'rootfs-files.json'}
+          for run in base.glob('runc-redis-regression.*'):
+              for source in run.rglob('*'):
+                  if source.is_file() and (source.name in names or source.suffix == '.log'):
+                      destination = Path('evidence') / source.relative_to(base)
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(source, destination)
+          PY
+          sudo chown -R "$(id -u):$(id -g)" evidence
+
+      - name: Upload results without memory-image payloads
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-parent-runc-redis-ce3bae79250e
+          path: |
+            environment.log
+            integration.log
+            evidence/
+          if-no-files-found: warn
+          retention-days: 30
